@@ -1,0 +1,26 @@
+# ---- 依赖 ----
+node_modules/
+
+# ---- ESP-IDF 构建产物（可重新生成，勿提交）----
+firmware/s3eye_imu_idf/build/
+firmware/s3eye_imu_idf/sdkconfig.old
+firmware/s3eye_imu_idf/managed_components/
+firmware/s3eye_imu_idf/dependencies.lock
+
+# ---- 运行时数据（真实采集数据，本地保留）----
+data/*.ndjson
+data/records.*.ndjson
+recordings/*.csv
+
+# ---- 临时/调试文件 ----
+*.log
+_*.log
+_idf*.log
+server.log
+test/.test-config.json
+test/.test-data/
+
+# ---- 系统文件 ----
+Thumbs.db
+Desktop.ini
+.DS_Store
