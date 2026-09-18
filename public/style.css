@@ -114,6 +114,7 @@ body {
 .tag { font-size: 11.5px; font-weight: 650; color: var(--dim); background: #f1f4f9; padding: 4px 11px; border-radius: 999px; }
 .tag-ok { background: #e9f9ef; color: var(--ok); }
 .tag-warn { background: #fff7e6; color: var(--warn); }
+.tag-sim { background: #fdeaea; color: #b91c1c; }
 .hint { font-size: 12px; color: var(--dim); margin: 12px 0 0; }
 .hint b { color: var(--ink2); }
 
@@ -253,6 +254,69 @@ select { appearance: none; padding: 8px 32px 8px 12px; border: 1px solid var(--l
 .log .ts { color: #64748b; margin-right: 8px; }
 
 .foot { text-align: center; font-size: 12px; color: var(--dim); margin-top: 22px; }
+
+/* ---------------- 分页导航 ---------------- */
+.pagenav {
+  display: flex; gap: 5px; margin: 16px 0 0; padding: 5px;
+  background: #e9eef7; border-radius: 13px; width: fit-content; max-width: 100%;
+  overflow-x: auto;
+}
+.pagetab {
+  padding: 9px 20px; border-radius: 9px; font-size: 13.5px; color: #5b6472;
+  text-decoration: none; white-space: nowrap; cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.pagetab:hover { background: rgba(255,255,255,.65); }
+.pagetab.on {
+  background: #fff; color: var(--primary); font-weight: 500;
+  box-shadow: 0 1px 3px rgba(15,23,42,.09);
+}
+
+/* 页面切换：只显示当前页 */
+.page { display: none; }
+.page.on { display: block; }
+
+.placeholder {
+  margin-top: 12px; padding: 22px 18px; border: 1px dashed #d5dde9; border-radius: 12px;
+  color: #8a94a6; font-size: 13px; text-align: center; line-height: 1.7;
+}
+
+/* ---------------- 远程采集页 ---------------- */
+.collect-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0 6px; }
+.req-id { font-size: 12px; color: var(--dim); font-family: Consolas, monospace; }
+
+.steps { list-style: none; margin: 14px 0 0; padding: 0; }
+.steps li {
+  position: relative; padding: 0 0 18px 28px; font-size: 13px; color: var(--dim);
+  border-left: 2px solid var(--line); margin-left: 7px; line-height: 1.5;
+}
+.steps li:last-child { border-left-color: transparent; padding-bottom: 2px; }
+.steps li::before {
+  content: ""; position: absolute; left: -8px; top: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: #fff; border: 2px solid var(--line);
+}
+.steps li.done { color: var(--ink2); }
+.steps li.done::before { background: var(--ok); border-color: var(--ok); }
+.steps li.active { color: var(--primary); font-weight: 500; }
+.steps li.active::before { background: var(--primary); border-color: var(--primary); }
+.steps li.fail { color: var(--bad); }
+.steps li.fail::before { background: var(--bad); border-color: var(--bad); }
+.steps .st-time { float: right; font-size: 11.5px; color: var(--dim); font-family: Consolas, monospace; }
+
+.badge-sim {
+  background: #fdeaea; color: #b91c1c; border: 1px solid #f5b5b5;
+  padding: 3px 10px; border-radius: 7px; font-size: 12px; font-weight: 500;
+}
+.obs-empty { padding: 20px; color: #8a94a6; font-size: 13px; text-align: center; }
+.obs-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.obs-item { background: #f6f8fc; border-radius: 10px; padding: 12px 8px; text-align: center; }
+.obs-item .k { font-size: 12px; color: var(--dim); }
+.obs-item .v { font-size: 19px; font-weight: 500; margin-top: 5px; }
+.obs-meta { margin-top: 14px; font-size: 12px; color: var(--dim); line-height: 2; }
+.obs-meta code { background: #f1f4f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; }
+.obs-check { display: inline-block; margin-right: 10px; }
+.obs-check.ok { color: var(--ok); }
+.obs-check.no { color: var(--bad); }
 
 @media (max-width: 940px) {
   .grid { grid-template-columns: 1fr; }

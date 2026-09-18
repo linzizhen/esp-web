@@ -48,6 +48,10 @@ const DEFAULT_CONFIG = {
   offlineAfterMs: 15000, // 超过该时间仍无任何数据 => 判定设备已移除，清空并重新扫描
   wifiTimeoutMs: 8000,   // WiFi 上报的心跳超时
   historyMax: 600,       // 前端图表的历史点数上限（由后端下发限制）
+  // ---- 远程采集（第 2 周）----
+  mockDevice: false,     // true = 模拟板端（服务端自答回执与观测），仅供无板联调；
+                         //        所有模拟结果都会带 simulated 标记，绝不冒充实物命令
+  collectTimeoutMs: 8000,// 下发采集命令后，多久没等到新观测判超时
   // ---- 持久化存储（作业要求：VPS 原始记录可查）----
   storageEnabled: true,  // 是否把每一帧真实数据落盘为 NDJSON，便于核对"一帧观测对应一条记录"
   storageMaxMb: 32,       // 单个记录文件超过该大小后滚动归档
@@ -138,6 +142,7 @@ const state = {
   seq: null,            // 板端自增序号（用于核对不丢帧）
   fields: {},           // 最新的真实字段值 { key: number }
   wifiSource: null,     // WiFi 上报来源 { ip }
+  reportPaused: false,  // 周期上报是否被远程命令暂停（命令通道保持可用）
 };
 
 let port = null;            // 当前 SerialPort 实例
@@ -270,6 +275,172 @@ function broadcast(obj) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 远程采集请求（第 2 周）：请求 → 设备回执 → 新观测                    */
+/*                                                                     */
+/* 证明「是新采集、不是库里旧值」的四条证据：                            */
+/*   ① request_id 回环：服务端生成 → 下发 → 板端原样回传；               */
+/*      库里旧记录没有这个 id，物理上无法冒充                            */
+/*   ② 板端 seq 严格递增：观测的 seq 必须大于下发前的 seq                 */
+/*   ③ 时间先后：观测到达时刻必须晚于下发时刻                            */
+/*   ④ 前端只认 request_id：只展示带该 id 的观测，绝不读库里最后一条       */
+/* ------------------------------------------------------------------ */
+const REQUESTS = new Map();          // request_id -> request
+const REQUEST_KEEP = 50;             // 内存中保留最近 N 条
+const collectTimeoutMs = () => config.collectTimeoutMs || 8000;   // 下发后多久没等到新观测 → 超时
+let requestCounter = 0;
+
+function newRequestId() {
+  requestCounter = (requestCounter % 9999) + 1;
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `req-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}-${String(requestCounter).padStart(4, '0')}`;
+}
+
+function publicRequest(r) {
+  return {
+    request_id: r.request_id,
+    device_id: r.device_id,
+    status: r.status,                 // submitted|dispatched|acked|completed|failed|timeout
+    simulated: !!r.simulated,
+    created_at: r.created_at,
+    dispatched_at: r.dispatched_at || null,
+    acked_at: r.acked_at || null,
+    completed_at: r.completed_at || null,
+    timeout_at: r.timeout_at || null,
+    ack_status: r.ack_status || null,
+    seq_before: r.seq_before ?? null,
+    seq_observed: r.seq_observed ?? null,
+    observation: r.observation || null,
+    error: r.error || null,
+    note: r.note || null,
+  };
+}
+
+function pushRequest(r) { broadcast({ type: 'collect', request: publicRequest(r) }); }
+
+function trimRequests() {
+  while (REQUESTS.size > REQUEST_KEEP) REQUESTS.delete(REQUESTS.keys().next().value);
+}
+
+function recentRequests(n = 20) {
+  return [...REQUESTS.values()].slice(-n).reverse().map(publicRequest);
+}
+
+/* 通过命令通道下发一行命令（当前实现：串口）。返回是否写出成功。 */
+function sendCommand(obj) {
+  if (config.mockDevice) return false;       // 模拟模式不走真实通道
+  if (!port || !port.isOpen) return false;
+  try {
+    port.write(JSON.stringify(obj) + '\n', (err) => {
+      if (err) stats.lastError = String(err.message || err);
+    });
+    stats.cmdSent = (stats.cmdSent || 0) + 1;
+    return true;
+  } catch (e) {
+    stats.lastError = String(e.message || e);
+    return false;
+  }
+}
+
+/* 创建一次采集请求并下发 */
+function createCollectRequest() {
+  const r = {
+    request_id: newRequestId(),
+    device_id: state.deviceId || null,
+    status: 'submitted',
+    created_at: Date.now(),
+    seq_before: state.seq ?? null,
+    simulated: false,
+  };
+  REQUESTS.set(r.request_id, r);
+  trimRequests();
+  pushRequest(r);
+
+  const sent = sendCommand({ cmd: 'collect_once', request_id: r.request_id });
+  if (sent) {
+    r.status = 'dispatched';
+    r.dispatched_at = Date.now();
+    r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
+  } else if (config.mockDevice) {
+    // 模拟板端：明确标注 simulated，绝不冒充实物命令
+    r.simulated = true;
+    r.status = 'dispatched';
+    r.dispatched_at = Date.now();
+    r.note = '模拟模式：未走真实串口，由服务端自答回执与观测（仅供联调/演示）';
+    r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
+    mockDeviceReply(r.request_id);
+  } else {
+    r.status = 'failed';
+    r.error = '命令通道不可用（串口未打开）';
+    r.note = '请先在「记录与设备」页连接设备；或在 config.json 打开 mockDevice 用模拟模式联调';
+  }
+  pushRequest(r);
+  return r;
+}
+
+/* 模拟板端：先回执，再给一条带 request_id 的观测（明确标注模拟） */
+function mockDeviceReply(request_id) {
+  setTimeout(() => onDeviceAck(request_id, 'received', state.seq, true), 300);
+  setTimeout(() => {
+    const r = REQUESTS.get(request_id);
+    if (!r || r.status === 'completed' || r.status === 'timeout') return;
+    const f = state.fields || {};
+    const obsFields = {
+      acc_x_g: f.acc_x_g ?? null, acc_y_g: f.acc_y_g ?? null, acc_z_g: f.acc_z_g ?? null,
+      temp_c: f.temp_c ?? null,
+    };
+    onObservation(request_id, obsFields, Date.now(), (state.seq || 0) + 1, true);
+  }, 900);
+}
+
+/* 板端回执 */
+function onDeviceAck(request_id, status, seq, simulated) {
+  const r = REQUESTS.get(request_id);
+  if (!r) return;
+  if (r.status === 'completed' || r.status === 'timeout' || r.status === 'failed') return;
+  r.status = 'acked';
+  r.acked_at = Date.now();
+  r.ack_status = status || 'received';
+  if (simulated) r.simulated = true;
+  if (typeof seq === 'number') r.ack_seq = seq;
+  pushRequest(r);
+}
+
+/* 收到带 request_id 的观测 —— 这才是「新采集」的实证 */
+function onObservation(request_id, fields, recvTs, seqOverride, simulated) {
+  const r = REQUESTS.get(request_id);
+  if (!r) return;
+  if (r.status === 'completed' || r.status === 'timeout') return;
+  if (r.timer) { clearTimeout(r.timer); r.timer = null; }
+
+  const seq = typeof seqOverride === 'number' ? seqOverride
+    : (typeof state.seq === 'number' ? state.seq : null);
+  const dispatched = r.dispatched_at || r.created_at;
+  const checks = {
+    arrived_after_dispatch: recvTs >= dispatched,
+    seq_increased: (r.seq_before == null || seq == null) ? null : seq > r.seq_before,
+  };
+
+  r.status = 'completed';
+  r.completed_at = recvTs;
+  r.seq_observed = seq;
+  r.observation = { recv_ts: recvTs, seq, fields, checks };
+  if (simulated) r.simulated = true;
+  pushRequest(r);
+}
+
+/* 超时：不把旧值标成本次完成，也不判定硬件故障 */
+function onRequestTimeout(request_id) {
+  const r = REQUESTS.get(request_id);
+  if (!r || r.status === 'completed') return;
+  r.timer = null;
+  r.status = 'timeout';
+  r.timeout_at = Date.now();
+  r.note = '未在限定时间内收到本次新观测。超时≠硬件故障，也不代表旧值有效。';
+  pushRequest(r);
+}
+
 function pushStatus(reason) {
   broadcast({
     type: 'status',
@@ -286,6 +457,7 @@ function pushStatus(reason) {
     boardTs: state.boardTs,     // 板端时间戳（毫秒 UTC）
     boardIso: state.boardIso,
     seq: state.seq,
+    reportPaused: !!state.reportPaused,
     stale: isStale(),
     stalePolicy: config.stalePolicy,
     config: {
@@ -447,6 +619,13 @@ function handleLine(line, source) {
     try {
       const obj = JSON.parse(trimmed);
       if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        // 板端回执（远程采集）：单独处理，不当作传感数据，直接返回
+        if (obj.type === 'ack') {
+          stats.linesValid++;
+          pushRaw(trimmed, true);
+          onDeviceAck(obj.request_id, obj.status, obj.seq);
+          return;
+        }
         const n = {};
         for (const [k, v] of Object.entries(obj)) {
           if (META_KEYS.has(k) || META_NUMERIC_KEYS.has(k)) meta[k] = v;
@@ -494,6 +673,11 @@ function handleLine(line, source) {
   state.fields = disp;
   pushRaw(trimmed, true);
 
+  // 远程采集：帧里带 request_id 即本次请求的「新观测」（数据本身照常落盘）
+  if (typeof others.request_id === 'string' && others.request_id) {
+    onObservation(others.request_id, disp, recvTs, state.seq);
+  }
+
   // 持久化：一帧真实观测 -> 一条记录（含板端时间与服务端接收时间，用于时间核对）
   storageSeq++;
   const skew = (state.boardTs != null) ? (state.boardTs - recvTs) : null;
@@ -521,6 +705,7 @@ function handleLine(line, source) {
     board_ts: state.boardTs,
     board_iso: state.boardIso,
     seq: state.seq,
+    reportPaused: !!state.reportPaused,
     skew_ms: skew,
     fields: disp,
   });
@@ -776,6 +961,7 @@ const server = http.createServer(async (req, res) => {
       boardTs: state.boardTs,
       boardIso: state.boardIso,
       seq: state.seq,
+      reportPaused: !!state.reportPaused,
       fields: state.fields,
       stale: isStale(),
       stalePolicy: config.stalePolicy,
@@ -889,6 +1075,46 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // ---- 远程采集：创建一次请求并下发 ----
+  if (p === '/api/collect' && req.method === 'POST') {
+    const r = createCollectRequest();
+    return json(res, 200, { ok: r.status !== 'failed', request: publicRequest(r) });
+  }
+
+  // ---- 远程采集：最近请求列表（页面刷新后恢复显示）----
+  if (p === '/api/collect' && req.method === 'GET') {
+    return json(res, 200, {
+      mockDevice: !!config.mockDevice,
+      channel: { portOpen: !!(port && port.isOpen), cmdSent: stats.cmdSent || 0 },
+      timeoutMs: collectTimeoutMs(),
+      requests: recentRequests(20),
+    });
+  }
+
+  // ---- 远程采集：查询单个请求 ----
+  if (p.startsWith('/api/collect/') && req.method === 'GET') {
+    const id = decodeURIComponent(p.slice('/api/collect/'.length));
+    const r = REQUESTS.get(id);
+    if (!r) return json(res, 404, { error: 'request not found' });
+    return json(res, 200, { request: publicRequest(r) });
+  }
+
+  // ---- 周期上报开关（暂停 / 恢复；命令通道保持）----
+  if (p === '/api/report' && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const action = body.action === 'resume' ? 'resume' : 'pause';
+    const ok = sendCommand({ cmd: action });
+    if (ok) state.reportPaused = (action === 'pause');
+    pushStatus('report');
+    return json(res, 200, {
+      ok,
+      action,
+      reportPaused: !!state.reportPaused,
+      note: ok ? null : (config.mockDevice ? '模拟模式：未走真实串口' : '命令通道不可用（串口未打开）'),
+    });
+  }
+
   // ---- 波特率探测 ----
   if (p === '/api/probe' && req.method === 'POST') {
     let body = {};
@@ -992,7 +1218,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET') return json(res, 200, config);
     let body = {};
     try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
-    for (const k of ['baudRate', 'portPath', 'autoDetect', 'autoReconnect', 'staleAfterMs', 'wifiTimeoutMs', 'expectedDeviceId', 'storageEnabled', 'stalePolicy']) {
+    for (const k of ['baudRate', 'portPath', 'autoDetect', 'autoReconnect', 'staleAfterMs', 'wifiTimeoutMs', 'expectedDeviceId', 'storageEnabled', 'stalePolicy', 'collectTimeoutMs', 'mockDevice']) {
       if (body[k] !== undefined) config[k] = body[k];
     }
     saveConfig();
@@ -1057,9 +1283,14 @@ wss.on('connection', (ws) => {
     boardTs: state.boardTs,
     boardIso: state.boardIso,
     seq: state.seq,
+    reportPaused: !!state.reportPaused,
     fields: state.fields,
     raw: rawLog.slice(-60),
     meta: { units: config.fieldUnits, labels: config.fieldLabels, historyMax: config.historyMax },
+    // 远程采集：刷新页面后恢复请求列表与模拟模式标记
+    requests: recentRequests(10),
+    mockDevice: !!config.mockDevice,
+    collectTimeoutMs: collectTimeoutMs(),
   }));
   pushStatus('client');
 });

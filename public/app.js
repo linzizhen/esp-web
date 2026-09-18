@@ -35,10 +35,17 @@ const els = {
 
   deviceSelect: $('deviceSelect'), limitSelect: $('limitSelect'),
   btnQuery: $('btnQuery'), btnCsv: $('btnCsv'), recordsTable: $('recordsTable'),
+
+  // 远程采集（第 2 周）
+  collectMode: $('collectMode'), collectChannel: $('collectChannel'),
+  collectReqId: $('collectReqId'), collectSteps: $('collectSteps'),
+  collectNote: $('collectNote'), collectObs: $('collectObs'), collectSim: $('collectSim'),
+  btnCollect: $('btnCollect'), btnReportToggle: $('btnReportToggle'),
 };
 
 // ---------------------------------------------------------------- 状态
 const S = {
+  page: 'live',
   connected: false,
   live: false,
   stale: false,
@@ -501,11 +508,158 @@ function smooth(data, n) {
 }
 
 function frame() {
-  if (needDraw) { needDraw = false; drawMainChart(); }
+  // 只在「实时监控」页绘制：其他页面画布不可见（尺寸为 0）。
+  // 切回实时页时 showPage() 会把 needDraw 置回 true，立即补画。
+  if (needDraw && S.page === 'live') { needDraw = false; drawMainChart(); }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 window.addEventListener('resize', () => { needDraw = true; });
+
+// ---------------------------------------------------------------- 远程采集（第 2 周）
+// 核心原则：只展示带 request_id 的新观测，绝不拿数据库里的旧值冒充本次结果。
+let COLLECT = { current: null, mockDevice: false, reportPaused: false, timeoutMs: 8000 };
+
+const pad2 = (n) => String(n).padStart(2, '0');
+function fmtClock(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+}
+
+function renderCollectMode() {
+  if (!els.collectMode) return;
+  if (COLLECT.mockDevice) {
+    els.collectMode.textContent = '模拟模式';
+    els.collectMode.className = 'tag tag-sim';
+  } else if (S.portOpen) {
+    els.collectMode.textContent = '命令通道就绪';
+    els.collectMode.className = 'tag tag-ok';
+  } else {
+    els.collectMode.textContent = '命令通道不可用';
+    els.collectMode.className = 'tag tag-warn';
+  }
+  if (els.btnReportToggle) {
+    els.btnReportToggle.textContent = COLLECT.reportPaused ? '恢复周期上报' : '暂停周期上报';
+  }
+  if (els.collectChannel) {
+    els.collectChannel.textContent = COLLECT.mockDevice
+      ? '⚠ 模拟模式已开启：命令不经过真实串口，回执与观测由服务端自答（仅供联调，不代表实物执行）。'
+      : (S.portOpen
+        ? `命令通道：USB 串口 · 超时阈值 ${COLLECT.timeoutMs} ms`
+        : '串口未打开，无法下发命令。请到「记录与设备」页连接设备。');
+  }
+}
+
+function renderCollect(req) {
+  if (!els.collectSteps) return;
+  if (!req) {
+    els.collectReqId.textContent = '—';
+    els.collectSteps.innerHTML = '';
+    els.collectNote.textContent = '';
+    els.collectObs.innerHTML = '<div class="obs-empty">尚未发起采集请求。</div>';
+    els.collectSim.classList.add('hidden');
+    return;
+  }
+  COLLECT.current = req;
+  els.collectReqId.textContent = req.request_id;
+  els.collectSim.classList.toggle('hidden', !req.simulated);
+
+  const row = (label, ts, cls, extra) =>
+    `<li class="${cls}"><span class="st-time">${ts ? fmtClock(ts) : ''}</span>${escHtml(label)}${extra ? ' · ' + escHtml(extra) : ''}</li>`;
+
+  const rows = [];
+  rows.push(row('已提交请求', req.created_at, 'done'));
+  rows.push(row('已下发到设备', req.dispatched_at, req.dispatched_at ? 'done' : (req.status === 'failed' ? 'fail' : ''), req.error || ''));
+  rows.push(row('设备已接收（回执）', req.acked_at, req.acked_at ? 'done' : '', req.ack_status ? 'ack=' + req.ack_status : ''));
+  if (req.status === 'completed') rows.push(row('完成 · 收到本次新观测', req.completed_at, 'done'));
+  else if (req.status === 'timeout') rows.push(row('超时 · 未收到新观测', req.timeout_at, 'fail'));
+  else if (req.status === 'failed') rows.push(row('失败', req.created_at, 'fail'));
+  else rows.push(row('等待本次新观测…', null, 'active'));
+
+  els.collectSteps.innerHTML = rows.join('');
+  els.collectNote.textContent = req.note || '';
+
+  const o = req.observation;
+  if (!o) {
+    els.collectObs.innerHTML = (req.status === 'timeout' || req.status === 'failed')
+      ? '<div class="obs-empty">本次<b>没有</b>收到新观测 —— 不会用数据库里的旧值代替。</div>'
+      : '<div class="obs-empty">尚未收到本次新观测…</div>';
+    return;
+  }
+  const f = o.fields || {};
+  const num = (v) => (typeof v === 'number' ? v.toFixed(3) : (v == null ? '—' : v));
+  const ck = o.checks || {};
+  const mk = (label, key) => ck[key] === true
+    ? `<span class="obs-check ok">✓ ${label}</span>`
+    : ck[key] === false ? `<span class="obs-check no">✗ ${label}</span>` : '';
+  els.collectObs.innerHTML = `
+    <div class="obs-grid">
+      <div class="obs-item"><div class="k">X 轴</div><div class="v">${num(f.acc_x_g)} g</div></div>
+      <div class="obs-item"><div class="k">Y 轴</div><div class="v">${num(f.acc_y_g)} g</div></div>
+      <div class="obs-item"><div class="k">Z 轴</div><div class="v">${num(f.acc_z_g)} g</div></div>
+    </div>
+    <div class="obs-meta">
+      观测到达：<code>${fmtClock(o.recv_ts)}</code>　板端序号：<code>${o.seq == null ? '—' : o.seq}</code>　request_id：<code>${escHtml(req.request_id)}</code><br>
+      ${mk('到达晚于下发', 'arrived_after_dispatch')}
+      ${mk('序号递增（确为新采样）', 'seq_increased')}
+      ${req.simulated ? '<span class="obs-check no">⚠ 模拟数据，非实物执行</span>' : ''}
+    </div>`;
+}
+
+async function doCollect() {
+  if (!els.btnCollect) return;
+  els.btnCollect.disabled = true;
+  els.btnCollect.textContent = '下发中…';
+  try {
+    const j = await (await fetch('/api/collect', { method: 'POST' })).json();
+    if (j && j.request) renderCollect(j.request);
+  } catch (_) { /* 交给 WS 推送 */ }
+  setTimeout(() => {
+    els.btnCollect.disabled = false;
+    els.btnCollect.textContent = '采集一次最新数据';
+  }, 600);
+}
+
+async function loadCollect() {
+  try {
+    const j = await (await fetch('/api/collect')).json();
+    COLLECT.mockDevice = !!j.mockDevice;
+    COLLECT.timeoutMs = j.timeoutMs || 8000;
+    if (j.requests && j.requests.length) renderCollect(j.requests[0]);
+    renderCollectMode();
+  } catch (_) { /* 忽略 */ }
+}
+
+if (els.btnCollect) els.btnCollect.onclick = doCollect;
+if (els.btnReportToggle) els.btnReportToggle.onclick = async () => {
+  const action = COLLECT.reportPaused ? 'resume' : 'pause';
+  els.btnReportToggle.disabled = true;
+  try {
+    const j = await (await fetch('/api/report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })).json();
+    if (j.ok) COLLECT.reportPaused = !!j.reportPaused;
+    else if (j.note) els.collectChannel.textContent = j.note;
+  } catch (_) { /* 忽略 */ }
+  els.btnReportToggle.disabled = false;
+  renderCollectMode();
+};
+
+// ---------------------------------------------------------------- 分页路由
+// 单页应用 + hash 路由：地址栏 #live / #collect / #records，刷新不丢页面。
+const PAGES = ['live', 'collect', 'records'];
+function showPage(name) {
+  if (!PAGES.includes(name)) name = 'live';
+  S.page = name;
+  document.querySelectorAll('.page').forEach((el) => el.classList.toggle('on', el.dataset.page === name));
+  document.querySelectorAll('.pagetab').forEach((el) => el.classList.toggle('on', el.dataset.page === name));
+  needDraw = true;   // 回到实时页时立即重画（隐藏期间画布尺寸为 0）
+}
+window.addEventListener('hashchange', () => showPage(location.hash.slice(1)));
+showPage(location.hash.slice(1) || 'live');
 
 // ---------------------------------------------------------------- 原始日志
 function appendRaw(ts, text, ok) {
@@ -764,6 +918,12 @@ function connect() {
       }
       (m.raw || []).forEach((r) => appendRaw(r.ts, r.text, r.ok));
       if (m.fields && Object.keys(m.fields).length) renderSample(m.fields, m.lastDataAt);
+      // 远程采集：恢复请求列表 / 模拟模式标记
+      COLLECT.mockDevice = !!m.mockDevice;
+      COLLECT.timeoutMs = m.collectTimeoutMs || 8000;
+      COLLECT.reportPaused = !!m.reportPaused;
+      if (m.requests && m.requests.length) renderCollect(m.requests[0]);
+      renderCollectMode();
       renderStatus();
       return;
     }
@@ -779,11 +939,14 @@ function connect() {
       S.boardTs = m.boardTs || S.boardTs; S.boardIso = m.boardIso || S.boardIso;
       S.seq = m.seq ?? S.seq;
       S.stale = !!m.stale;
+      S.reportPaused = !!m.reportPaused;
+      COLLECT.reportPaused = !!m.reportPaused;
       if (m.config) {
         els.chkAuto.checked = !!m.config.autoReconnect;
         els.baudSelect.value = String(m.config.baudRate || 115200);
       }
       renderStatus();
+      renderCollectMode();
       return;
     }
 
@@ -797,6 +960,12 @@ function connect() {
       S.lastDataAt = m.ts || Date.now();
       renderSample(m.fields || {}, m.ts);
       renderStatus();
+      return;
+    }
+
+    // 远程采集：请求状态变化（创建/下发/回执/完成/超时）
+    if (m.type === 'collect') {
+      renderCollect(m.request);
       return;
     }
 
@@ -832,6 +1001,8 @@ function connect() {
 loadPorts();
 setInterval(loadPorts, 4000);
 renderStatus();
+loadCollect();
+renderCollectMode();
 connect();
 
 })();

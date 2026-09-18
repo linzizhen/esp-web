@@ -77,12 +77,14 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 ├── .gitignore                # 排除构建产物 / 依赖 / 运行时数据
 ├── scripts/
 │   └── idfwrap.py            # ESP-IDF 构建/烧录封装（自动注入工具链环境）
+├── docs/
+│   └── week2-remote-collect.md  # 第 2 周：远程采集协议、状态图、时序图、实测记录
 ├── data/                     # NDJSON 原始记录（持久化存储，运行后生成）
 ├── recordings/               # 录制导出的 CSV（运行后生成）
 ├── public/
-│   ├── index.html            # 监控页面（三轴 IMU 面板、原始记录查询、未更新提示）
+│   ├── index.html            # 监控页面（分页：实时监控 / 远程采集 / 记录与设备）
 │   ├── style.css
-│   └── app.js                # WebSocket 接收、卡片渲染、Canvas 绘制（含滑动平均）、记录查询
+│   └── app.js                # WebSocket 接收、卡片渲染、Canvas 绘制（含滑动平均）、记录查询、分页路由
 ├── firmware/
 │   ├── s3eye_imu_idf/        # ★ 当前使用：ESP-IDF 工程（QMA7981 三轴 + 10Hz 上报 + 校准）
 │   │   ├── CMakeLists.txt
@@ -181,7 +183,11 @@ temperature:26.5 humidity:58.2
 | GET | `/api/records?device=&limit=&since=&until=` | 查询 VPS 落盘的真实记录（一帧观测一条） |
 | GET | `/api/devices` | 列出所有出现过的设备（计数、首次/末次出现） |
 | GET | `/api/records.csv?device=&limit=` | 导出原始记录为 CSV（BOM） |
-| WS | `/ws` | 实时推送 `sample` / `status` / `raw` / `cleared` / `stale` / `hello` |
+| POST | `/api/collect` | **远程采集**：创建一次采集请求并下发到开发板，返回 `request_id` |
+| GET | `/api/collect` | **远程采集**：最近请求列表（页面刷新后恢复显示）+ 通道状态 + `mockDevice` |
+| GET | `/api/collect/:id` | **远程采集**：查询单个请求的完整状态 |
+| POST | `/api/report` | **周期上报开关**：`{action:'pause'\|'resume'}`（命令通道保持可用） |
+| WS | `/ws` | 实时推送 `sample` / `status` / `raw` / `cleared` / `stale` / `hello` / `collect` |
 
 ## 六之一、ESP32-S3-EYE 专项说明
 
@@ -225,6 +231,55 @@ Windows 的串口是独占的。平台正占着 COM4 时，Arduino IDE 打不开
 2. 是 0 → 先点「释放串口」，再用 Arduino IDE 打开串口监视器看有没有 `chip=ESP32-S3` 之类的启动横幅
 3. 串口监视器有输出、平台没有 → 检查是不是忘了关串口监视器（它会独占串口）
 4. 串口监视器也没输出 → USB CDC On Boot 没开，或固件没烧进去
+
+## 六之三、远程采集（第 2 周）
+
+Web 页「**远程采集**」标签页可向开发板**下发一次立即采集命令**，并追踪这条请求的执行结果。
+
+### 为什么能证明是「新采集」
+
+页面**不读数据库的最后一条**当结果，只认**带本次 `request_id` 的观测**——
+数据库里的旧记录根本没有这个 id，物理上无法冒充。四条证据：
+
+1. **`request_id` 回环**：服务端生成 → 下发 → 板端原样回传
+2. **板端 `seq` 严格递增**：证明是新采样，不是重发旧帧
+3. **时间先后**：观测到达时刻晚于命令下发时刻
+4. **页面只认 id**：超时则明确显示「本次没有收到新观测」，**绝不回退显示旧值**
+
+界面上 1~3 会逐条打勾展示。
+
+### 协议（叠加在现有串口之上，未改底层）
+
+```jsonc
+// 下行
+{"cmd":"collect_once","request_id":"req-..."}
+{"cmd":"pause"} / {"cmd":"resume"} / {"cmd":"ping"}
+// 上行
+{"type":"ack","request_id":"req-...","seq":926,"status":"received"}
+{"device":"...","seq":927,"request_id":"req-...","acc_x_g":...}   // 观测 = 数据帧 + request_id
+```
+
+> 观测帧就是普通数据帧多带一个 `request_id`，落盘/展示/历史查询全部复用，无需新增解析分支。
+
+### 状态机
+
+`已提交 → 已下发 → 设备已接收 → 完成`，异常分支 `超时` / `失败`。
+**超时 ≠ 硬件故障**，也不代表旧值有效。
+
+### 当堂验证（一键复现）
+
+1. 点「**暂停周期上报**」→ 曲线停止刷新，命令通道保持
+2. 保持暂停，点「**采集一次最新数据**」→ 应收到**新观测**（带 `request_id`，seq 递增）
+3. 改变开发板姿态后再次采集 → 数值随姿态变化
+4. 关闭/断开设备后采集 → 等待后**超时**，观测区为空
+5. 连续点击多次 → 每次独立 `request_id`，各自采样
+
+### 模拟模式（无板联调）
+
+`config.json` 里 `mockDevice: true` 可让服务端自答回执与观测。
+**所有模拟结果都带 `simulated` 标记**，界面显示红色「模拟」徽章，绝不冒充实物命令。
+
+> 完整说明（含状态图、时序图、实测记录）见 [`docs/week2-remote-collect.md`](docs/week2-remote-collect.md)。
 
 ## 七、排查：板子插上了但没数据
 
