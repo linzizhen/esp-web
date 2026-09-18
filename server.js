@@ -371,9 +371,13 @@ function createCollectRequest() {
     r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
     mockDeviceReply(r.request_id);
   } else {
-    r.status = 'failed';
+    // 命令通道不可用（设备关闭 / 串口未连接）：
+    // 不伪造完成，也不立刻判死 —— 按作业要求「请求等待 / 超时」处理，
+    // 但立刻给出原因提示，避免用户干等。
+    r.status = 'submitted';
     r.error = '命令通道不可用（串口未打开）';
-    r.note = '请先在「记录与设备」页连接设备；或在 config.json 打开 mockDevice 用模拟模式联调';
+    r.note = '已提交，但命令通道不可用（设备关闭或串口未连接），将按超时处理。超时≠硬件故障。';
+    r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
   }
   pushRequest(r);
   return r;

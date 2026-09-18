@@ -3,7 +3,7 @@
   "host": "0.0.0.0",
   "baudRate": 115200,
   "portPath": "COM4",
-  "autoDetect": false,
+  "autoDetect": true,
   "autoReconnect": true,
   "scanIntervalMs": 2500,
   "parseMode": "auto",
