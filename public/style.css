@@ -177,6 +177,23 @@ body {
 
 /* ---------------- 曲线 ---------------- */
 #mainChart { width: 100%; height: 240px; display: block; }
+.chart-legend { display: flex; align-items: center; gap: 8px; }
+.chart-legend .lg {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 5px;
+  font-size: 11px; font-weight: 500; color: #fff; line-height: 1;
+}
+.chart-legend .lg-x { background: #e24b4a; }
+.chart-legend .lg-y { background: #639922; }
+.chart-legend .lg-z { background: #378add; }
+.chart-legend .mini-select { min-width: 84px; }
+.chart-legend .mini-btn {
+  font: inherit; font-size: 12px; line-height: 1; color: #5b6472;
+  background: #f3f5f9; border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 10px; cursor: pointer; white-space: nowrap;
+}
+.chart-legend .mini-btn:hover { background: #e9edf4; }
+.chart-legend .mini-btn.on { background: #eef2ff; border-color: #c7d2fe; color: var(--primary); font-weight: 500; }
 .mini-select {
   appearance: none; padding: 7px 30px 7px 12px; border: 1px solid var(--line); border-radius: 10px;
   background: #fff url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' fill='none' stroke='%237b8798' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>") no-repeat right 9px center;

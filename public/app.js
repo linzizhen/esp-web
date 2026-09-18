@@ -23,7 +23,8 @@ const els = {
   mDeviceId: $('mDeviceId'), mMac: $('mMac'), mTransport: $('mTransport'),
   boardTime: $('boardTime'), recvTime: $('recvTime'), skew: $('skew'), lastUpdate: $('lastUpdate'),
 
-  chartField: $('chartField'), mainChart: $('mainChart'), chartHint: $('chartHint'),
+  chartUnit: $('chartUnit'), chartRange: $('chartRange'), mainChart: $('mainChart'), chartHint: $('chartHint'),
+  btnChartAC: $('btnChartAC'), btnChartPause: $('btnChartPause'),
 
   portSelect: $('portSelect'), baudSelect: $('baudSelect'),
   btnConnect: $('btnConnect'), btnDisconnect: $('btnDisconnect'), btnRefresh: $('btnRefresh'),
@@ -75,6 +76,17 @@ function fmtNum(v) {
   if (a !== 0 && (a < 0.01 || a >= 100000)) return v.toExponential(2);
   if (Number.isInteger(v)) return String(v);
   return v.toFixed(a < 10 ? 2 : a < 100 ? 1 : 0);
+}
+
+/* 坐标轴刻度格式化：按量程选小数位，避免出现 1.76e-3 / 1.13e-5 这类
+ * 科学计数法（刻度看着像坏了），同时把 -0.00 归一成 0.00 */
+function fmtAxis(v, span) {
+  if (!Number.isFinite(v)) return '';
+  const s = Math.abs(span);
+  const d = s >= 10 ? 0 : s >= 1 ? 1 : s >= 0.1 ? 2 : s >= 0.01 ? 3 : 4;
+  let out = v.toFixed(d);
+  if (/^-0(\.0+)?$/.test(out)) out = out.slice(1);
+  return out;
 }
 const escHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const labelOf = (k) => (S.meta.labels && S.meta.labels[k]) || k;
@@ -272,45 +284,29 @@ function clearAllData() {
   els.imuTag.className = 'tag';
   els.levelDot.style.left = '50%';
   els.levelDot.style.top = '50%';
-  els.chartField.innerHTML = '<option value="">—</option>';
-  els.chartField.dataset.sig = '';
-  els.chartHint.textContent = '选择字段查看其真实历史曲线。';
+  els.chartHint.textContent = '三轴加速度实时曲线（X 红 / Y 绿 / Z 蓝），窗口 10 秒。点「去直流」可把三条曲线叠到同一水平线，便于对比波形。数据由本组设备实时上报，页面未写死任何值。';
   needDraw = true;
 }
 
 // ---------------------------------------------------------------- 采样入库 + 渲染
-function renderSample(fields) {
+function renderSample(fields, ts) {
   renderImu(fields);
 
+  // 暂停时冻结波形：不再往历史缓冲追加，曲线停在当前画面（其他面板照常实时）
+  if (CHART_PAUSED) return;
+
+  // 用服务端采样时刻作横轴（比浏览器接收时刻稳），无则退回本地时间
+  const t = Number.isFinite(ts) ? ts : Date.now();
   for (const [k, v] of Object.entries(fields)) {
     if (typeof v !== 'number' || !Number.isFinite(v)) continue;
     if (!S.history.has(k)) S.history.set(k, []);
     const arr = S.history.get(k);
-    arr.push({ t: Date.now(), v });
+    arr.push({ t, v });
     const max = S.meta.historyMax || 600;
     if (arr.length > max) arr.splice(0, arr.length - max);
     if (!S.order.includes(k)) S.order.push(k);
   }
 
-  // 同步曲线下拉框（含三轴字段）
-  const cur = els.chartField.value;
-  const numeric = S.order.filter((k) => S.history.has(k));
-  const sig = numeric.join(',');
-  if (els.chartField.dataset.sig !== sig) {
-    els.chartField.dataset.sig = sig;
-    els.chartField.innerHTML = numeric
-      .map((k) => `<option value="${k}">${escHtml(labelOf(k))}${unitOf(k) ? ' (' + unitOf(k) + ')' : ''}</option>`)
-      .join('') || '<option value="">—</option>';
-    if (cur && numeric.includes(cur)) els.chartField.value = cur;
-    else if (numeric.length) {
-      // 默认优先选加速度字段（acc_*_g 优先），避免被其他数值字段抢占
-      const pref = numeric.find((k) => k === 'acc_z_g')
-        || numeric.find((k) => k === 'acc_x_g')
-        || numeric.find((k) => k.startsWith('acc_'))
-        || numeric[0];
-      els.chartField.value = pref;
-    }
-  }
   needDraw = true;
 }
 
@@ -329,13 +325,54 @@ function fitCanvas(canvas) {
   return { ctx, w, h };
 }
 
+// 三轴曲线颜色（红/绿/蓝，与卡片图例一致）
+const AXIS_COLOR = { x: '#e24b4a', y: '#639922', z: '#378add' };
+
+// 「去直流」模式：减去各轴窗口均值，三条曲线叠在同一水平线上，
+// 便于像示波器那样对比三轴波形（绝对值仍在卡片左上角照常显示）。默认开启。
+let CHART_AC = true;
+// 波形暂停：冻结曲线（停止往历史缓冲里追加），其他面板继续实时刷新
+let CHART_PAUSED = false;
+// 去直流基准 / 量程的平滑跟随状态。窗口每滑动一帧，中位数与分位数都会小幅跳变，
+// 直接拿来定标会让整幅画面抖动，这里做慢速跟随（指数平滑）。
+const DC_REF = {};
+const RANGE_SMOOTH = {};
+
 function drawMainChart() {
-  const field = els.chartField.value;
+  const unit = els.chartUnit ? els.chartUnit.value : 'g';
+  const suffix = unit === 'ms2' ? 'ms2' : 'g';
   const { ctx, w, h } = fitCanvas(els.mainChart);
   ctx.clearRect(0, 0, w, h);
 
-  const arr = field ? S.history.get(field) : null;
-  if (!arr || arr.length < 2) {
+  // 只取最近 WINDOW 个点。参照老师的示波器（缓冲仅 3.1s、X 轴约 -9s~0s），
+  // 窗口取 10 秒（10Hz → 100 点），曲线不会被密集的点堆成一团。
+  const WINDOW = 100;
+  // 三轴历史（三者同帧上报，时间轴一致）。
+  // 关键：先对「整段历史」做 9 点滑动平均，再截取显示窗口。
+  // 若只对窗口内数据做因果滑动平均，窗口最左侧（最旧）的点会因为
+  // 之前的样本已移出窗口而平滑不足，原噪声裸露、幅度看着变大
+  // —— 同一段数据在不同位置观感不一致，就是这个原因。
+  const series = ['x', 'y', 'z'].map((ax) => {
+    const full = S.history.get('acc_' + ax + '_' + suffix) || [];
+    const smFull = smooth(full.map((p) => p.v), 9);
+    const start = Math.max(0, full.length - WINDOW);
+    const arr = full.slice(start);
+    const sm = smFull.slice(start);
+    if (CHART_AC && sm.length) {
+      // 用中位数作直流基准（比均值稳）；再做慢速跟随，
+      // 否则窗口滑动时中位数跳变会让整条曲线上下抖
+      const sorted = [...sm].sort((a, b) => a - b);
+      const raw = sorted[Math.floor(sorted.length / 2)];
+      const key = ax + '_' + suffix;
+      const prev = DC_REF[key];
+      const ref = prev == null ? raw : prev + 0.12 * (raw - prev);
+      DC_REF[key] = ref;
+      for (let i = 0; i < sm.length; i++) sm[i] -= ref;
+    }
+    return { ax, n: full.length, lastAbs: arr.length ? arr[arr.length - 1].v : 0, pts: arr.map((p, i) => ({ t: p.t, v: sm[i] })) };
+  }).filter((s) => s.pts.length >= 2);
+
+  if (!series.length) {
     ctx.fillStyle = '#9aa5b5';
     ctx.font = '13px "Microsoft YaHei", sans-serif';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -343,29 +380,46 @@ function drawMainChart() {
     return;
   }
 
-  // 加速度数据做 3 点滑动平均，滤除传感器固有高频噪声（QMA7981 14-bit ±2g
-  // 噪声约 ±0.015g），静止曲线更平滑，但不丢失真实运动趋势。
-  const isAcc = field.startsWith('acc_');
-  const raw = arr.map(p => p.v);
-  const smoothed = isAcc ? smooth(raw, 3) : raw;
-  const pts = arr.map((p, i) => ({ t: p.t, v: smoothed[i] }));
-
-  const padL = 58, padR = 14, padT = 16, padB = 26;
+  const padL = 58, padR = 14, padT = 18, padB = 26;
   const cw = w - padL - padR, ch = h - padT - padB;
 
-  let min = Infinity, max = -Infinity;
-  for (const p of pts) { if (p.v < min) min = p.v; if (p.v > max) max = p.v; }
-  if (min === max) { const d = Math.abs(min) * 0.05 || 1; min -= d; max += d; }
-  const pd = (max - min) * 0.12;
-  min -= pd; max += pd;
-  // 加速度字段加最小 Y 轴跨度 0.5g，避免自动缩放过度放大正常噪声
-  if (isAcc && max - min < 0.5) {
-    const mid = (min + max) / 2;
-    min = mid - 0.25; max = mid + 0.25;
+  // Y 轴量程：默认「自动」——量程随波形自适应，静止平稳、剧烈晃动撑满；
+  // 也可锁定固定档位（±0.5g / ±1g / ±2g）。
+  const rangeSel = els.chartRange ? els.chartRange.value : 'auto';
+  let min, max;
+  if (rangeSel !== 'auto') {
+    const half = Number(rangeSel) * (unit === 'ms2' ? 9.80665 : 1);
+    min = -half; max = half;
+  } else {
+    // 自动：取 2%~98% 分位定标，偶发尖峰不参与；量程会随晃动幅度自适应扩大，
+    // 剧烈晃动也能撑满画面且不削顶。
+    const vals = [];
+    for (const s of series) for (const p of s.pts) vals.push(p.v);
+    vals.sort((a, b) => a - b);
+    const pick = (f) => vals[Math.min(vals.length - 1, Math.max(0, Math.round((vals.length - 1) * f)))];
+    min = pick(0.02); max = pick(0.98);
+    if (!Number.isFinite(min) || !Number.isFinite(max)) { min = -1; max = 1; }
+    if (min === max) { const d = Math.abs(min) * 0.05 || 1; min -= d; max += d; }
+    const pd = (max - min) * 0.15;
+    min -= pd; max += pd;
+    // 最小跨度 0.8g：静止时噪声只占约 2.5%（画面很稳），
+    // 轻微晃动约 25%（可见但不过度），剧烈晃动仍会自动扩量程撑满。
+    const minSpan = unit === 'ms2' ? 8 : 0.8;
+    if (max - min < minSpan) { const mid = (min + max) / 2; min = mid - minSpan / 2; max = mid + minSpan / 2; }
+
+    // 量程慢速跟随：窗口滑动时 2%~98% 分位会小幅跳变，
+    // 直接定标会让整幅画面抖动，这里做指数平滑跟随。
+    const rk = 'r_' + suffix + (CHART_AC ? '_ac' : '');
+    const pr = RANGE_SMOOTH[rk];
+    if (pr) { min = pr.min + 0.2 * (min - pr.min); max = pr.max + 0.2 * (max - pr.max); }
+    RANGE_SMOOTH[rk] = { min, max };
   }
 
-  const t0 = pts[0].t, t1 = pts[pts.length - 1].t || (t0 + 1);
-  const X = (t) => padL + ((t - t0) / (t1 - t0 || 1)) * cw;
+  const t0 = series[0].pts[0].t;
+  let t1 = t0;
+  for (const s of series) t1 = Math.max(t1, s.pts[s.pts.length - 1].t);
+  if (t1 <= t0) t1 = t0 + 1;
+  const X = (t) => padL + ((t - t0) / (t1 - t0)) * cw;
   const Y = (v) => padT + ch - ((v - min) / (max - min)) * ch;
 
   ctx.font = '11px Consolas, monospace';
@@ -377,42 +431,61 @@ function drawMainChart() {
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
     ctx.fillStyle = '#8a94a6';
-    ctx.fillText(fmtNum(v), padL - 8, y);
+    ctx.fillText(fmtAxis(v, max - min), padL - 8, y);
   }
 
+  // X 轴：相对时间（-10s … 现在）+ 竖向网格，与老师示波器的 -9s~0s 一致
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-  for (let i = 0; i <= 4; i++) {
-    const t = t0 + ((t1 - t0) * i) / 4;
+  const spanMs = t1 - t0;
+  for (let i = 0; i <= 5; i++) {
+    const t = t0 + (spanMs * i) / 5;
+    const x = X(t);
+    if (i > 0 && i < 5) {
+      ctx.strokeStyle = '#f2f5fa'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ch); ctx.stroke();
+    }
+    const secs = Math.round((t1 - t) / 1000);
     ctx.fillStyle = '#8a94a6';
-    ctx.fillText(fmtTime(t).slice(0, 8), X(t), padT + ch + 7);
+    ctx.fillText(secs <= 0 ? '现在' : `-${secs}s`, x, padT + ch + 7);
   }
 
-  const grad = ctx.createLinearGradient(0, padT, 0, padT + ch);
-  grad.addColorStop(0, 'rgba(79,70,229,.20)');
-  grad.addColorStop(1, 'rgba(79,70,229,0)');
-  ctx.beginPath();
-  ctx.moveTo(X(pts[0].t), Y(pts[0].v));
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(X(pts[i].t), Y(pts[i].v));
-  ctx.save();
-  ctx.lineTo(X(pts[pts.length - 1].t), padT + ch);
-  ctx.lineTo(X(pts[0].t), padT + ch);
-  ctx.closePath(); ctx.fillStyle = grad; ctx.fill(); ctx.restore();
+  // 三条曲线（各自颜色）——用二次贝塞尔画平滑曲线（穿过相邻点中点），
+  // 比直线段折线视觉上更柔顺，接近示波器观感
+  for (const s of series) {
+    const c = AXIS_COLOR[s.ax];
+    const n = s.pts.length;
+    ctx.beginPath();
+    ctx.moveTo(X(s.pts[0].t), Y(s.pts[0].v));
+    if (n === 2) {
+      ctx.lineTo(X(s.pts[1].t), Y(s.pts[1].v));
+    } else {
+      for (let i = 1; i < n - 1; i++) {
+        const cx = X(s.pts[i].t), cy = Y(s.pts[i].v);
+        const nx = X(s.pts[i + 1].t), ny = Y(s.pts[i + 1].v);
+        ctx.quadraticCurveTo(cx, cy, (cx + nx) / 2, (cy + ny) / 2);
+      }
+      ctx.lineTo(X(s.pts[n - 1].t), Y(s.pts[n - 1].v));
+    }
+    ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.stroke();
+    const last = s.pts[n - 1];
+    ctx.beginPath(); ctx.arc(X(last.t), Y(last.v), 3.2, 0, Math.PI * 2);
+    ctx.fillStyle = c; ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+  }
 
-  ctx.beginPath();
-  ctx.moveTo(X(pts[0].t), Y(pts[0].v));
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(X(pts[i].t), Y(pts[i].v));
-  ctx.strokeStyle = '#4f46e5'; ctx.lineWidth = 2; ctx.lineJoin = 'round';
-  ctx.stroke();
-
-  const last = pts[pts.length - 1];
-  ctx.beginPath(); ctx.arc(X(last.t), Y(last.v), 3.5, 0, Math.PI * 2);
-  ctx.fillStyle = '#4f46e5'; ctx.fill();
-  ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.6; ctx.stroke();
-
+  // 左上角：三轴当前绝对值读数（去直流模式下仍显示绝对值）+ 采样点数
   ctx.textAlign = 'left'; ctx.textBaseline = 'top';
   ctx.font = '12px "Microsoft YaHei", sans-serif';
-  ctx.fillStyle = '#4b5563';
-  ctx.fillText(`${labelOf(field)}${unitOf(field) ? ' / ' + unitOf(field) : ''}  ·  ${arr.length} 个真实采样点${isAcc ? '（已平滑）' : ''}`, padL + 2, 1);
+  let lx = padL + 2;
+  for (const s of series) {
+    const txt = `${s.ax.toUpperCase()} ${fmtNum(s.lastAbs)}`;
+    ctx.fillStyle = AXIS_COLOR[s.ax];
+    ctx.fillText(txt, lx, 2);
+    lx += ctx.measureText(txt).width + 14;
+  }
+  ctx.fillStyle = CHART_PAUSED ? '#e24b4a' : '#9aa5b5';
+  ctx.fillText(`· 最近 ${series[0].pts.length} 点${CHART_AC ? ' · 去直流' : ''}${CHART_PAUSED ? ' · 已暂停' : ''}`, lx, 2);
 }
 
 /* 滑动平均：仅用历史值（因果滤波），窗口=n 点时噪声幅度降低约 √n 倍 */
@@ -486,7 +559,24 @@ els.chkAuto.onchange = () => fetch('/api/config', {
   method: 'POST', headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ autoReconnect: els.chkAuto.checked }),
 });
-els.chartField.onchange = () => { needDraw = true; };
+els.chartUnit.onchange = () => { needDraw = true; };
+els.chartRange.onchange = () => { needDraw = true; };
+// 去直流开关：三轴叠到同一水平线，便于对比波形（默认开）
+els.btnChartAC.classList.toggle('on', CHART_AC);
+els.btnChartAC.textContent = CHART_AC ? '去直流 · 开' : '去直流';
+els.btnChartAC.onclick = () => {
+  CHART_AC = !CHART_AC;
+  els.btnChartAC.classList.toggle('on', CHART_AC);
+  els.btnChartAC.textContent = CHART_AC ? '去直流 · 开' : '去直流';
+  needDraw = true;
+};
+// 波形暂停/继续
+els.btnChartPause.onclick = () => {
+  CHART_PAUSED = !CHART_PAUSED;
+  els.btnChartPause.classList.toggle('on', CHART_PAUSED);
+  els.btnChartPause.textContent = CHART_PAUSED ? '继续' : '暂停';
+  needDraw = true;
+};
 
 // 水平归零：把当前 X/Y 记为水平基准；再点一次清除
 els.btnLevelZero.onclick = () => {
@@ -673,7 +763,7 @@ function connect() {
         els.baudSelect.value = String(m.config.baudRate || 115200);
       }
       (m.raw || []).forEach((r) => appendRaw(r.ts, r.text, r.ok));
-      if (m.fields && Object.keys(m.fields).length) renderSample(m.fields);
+      if (m.fields && Object.keys(m.fields).length) renderSample(m.fields, m.lastDataAt);
       renderStatus();
       return;
     }
@@ -704,8 +794,8 @@ function connect() {
       S.expectedDeviceId = m.expectedDeviceId || S.expectedDeviceId;
       S.boardTs = m.board_ts != null ? m.board_ts : S.boardTs;
       S.boardIso = m.board_iso || S.boardIso; S.seq = m.seq ?? S.seq;
-      S.lastDataAt = m.recv_ts || Date.now();
-      renderSample(m.fields || {});
+      S.lastDataAt = m.ts || Date.now();
+      renderSample(m.fields || {}, m.ts);
       renderStatus();
       return;
     }

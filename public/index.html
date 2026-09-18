@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ESP32-S3-EYE 三轴传感器监控</title>
-<link rel="stylesheet" href="/style.css?v=3" />
+<link rel="stylesheet" href="/style.css?v=5" />
 </head>
 <body>
 <div class="app">
@@ -79,11 +79,25 @@
     <!-- 趋势曲线 -->
     <section class="card chart-card">
       <div class="card-head">
-        <h2>趋势曲线</h2>
-        <select id="chartField" class="mini-select"><option value="">—</option></select>
+        <h2>趋势曲线 · 三轴</h2>
+        <div class="chart-legend">
+          <span class="lg lg-x">X</span><span class="lg lg-y">Y</span><span class="lg lg-z">Z</span>
+          <button id="btnChartPause" class="mini-btn" type="button" title="暂停/继续波形刷新（其他面板仍实时）">暂停</button>
+          <button id="btnChartAC" class="mini-btn on" type="button" title="去直流：减去各轴均值，三条曲线叠在同一水平线上，便于对比波形">去直流</button>
+          <select id="chartRange" class="mini-select" title="Y 轴量程：自动=按波形自适应（推荐）；固定档位可锁死刻度">
+            <option value="auto" selected>自动</option>
+            <option value="0.5">±0.5g</option>
+            <option value="1">±1g</option>
+            <option value="2">±2g</option>
+          </select>
+          <select id="chartUnit" class="mini-select" title="切换单位">
+            <option value="g">g</option>
+            <option value="ms2">m/s²</option>
+          </select>
+        </div>
       </div>
       <canvas id="mainChart" height="240"></canvas>
-      <p id="chartHint" class="hint">选择字段查看其真实历史曲线。</p>
+      <p id="chartHint" class="hint">三轴加速度实时曲线（X 红 / Y 绿 / Z 蓝），窗口 10 秒。点「去直流」可把三条曲线叠到同一水平线，便于对比波形。数据由本组设备实时上报，页面未写死任何值。</p>
     </section>
 
     <!-- 原始记录 -->
@@ -152,6 +166,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=5"></script>
+<script src="/app.js?v=17"></script>
 </body>
 </html>
