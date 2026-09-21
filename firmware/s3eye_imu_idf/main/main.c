@@ -345,22 +345,27 @@ static bool http_get(const char *path, char *buf, size_t cap)
     if (!c) return false;
 
     buf[0] = '\0';
-    esp_err_t err = esp_http_client_open(c, 0);
-    if (err != ESP_OK) {
-        esp_http_client_cleanup(c);
-        return false;
+    bool ok = false;
+    if (esp_http_client_open(c, 0) == ESP_OK) {
+        int len = esp_http_client_fetch_headers(c);
+        int status = esp_http_client_get_status_code(c);
+        if (status == 200) {
+            size_t want = cap - 1;
+            if (len > 0 && (size_t)len < want) want = (size_t)len;
+            /* 循环读直到读满或对端关闭：单次 read 可能只返回一部分 */
+            size_t got = 0;
+            while (got < want) {
+                int n = esp_http_client_read(c, buf + got, want - got);
+                if (n <= 0) break;
+                got += (size_t)n;
+            }
+            buf[got] = '\0';
+            ok = true;
+        }
+        esp_http_client_close(c);
     }
-    int len = esp_http_client_fetch_headers(c);
-    int status = esp_http_client_get_status_code(c);
-    if (status == 200) {
-        size_t want = cap - 1;
-        if (len > 0 && (size_t)len < want) want = (size_t)len;
-        int n = esp_http_client_read(c, buf, want);
-        buf[n > 0 ? n : 0] = '\0';
-    }
-    esp_http_client_close(c);
     esp_http_client_cleanup(c);
-    return (status == 200);
+    return ok;
 }
 
 /* ===================== 本地反馈（LED + LCD）与按键（第 3 周） =====================
@@ -950,14 +955,34 @@ static void poll_task(void *arg)
     snprintf(path, sizeof(path), "/api/cmd?device=%s", APP_DEVICE_ID);
 
     static char resp[512];
+    int fail_streak = 0;
+    int64_t last_dbg = 0;
+    uint32_t got_cmds = 0;
+
     while (1) {
         if (!wifi_wait(0)) {                  /* WiFi 没连上就不轮询 */
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        if (http_get(path, resp, sizeof(resp)) && strstr(resp, "\"cmd\"")) {
-            ESP_LOGI(TAG, "WiFi 取到命令: %s", resp);
-            handle_command(resp);
+        if (http_get(path, resp, sizeof(resp))) {
+            if (fail_streak >= 5) {
+                ESP_LOGI(TAG, "WiFi 下行已恢复（此前连续失败 %d 次）", fail_streak);
+            }
+            fail_streak = 0;
+            if (strstr(resp, "\"cmd\"")) {    /* 有命令才处理 */
+                got_cmds++;
+                ESP_LOGI(TAG, "WiFi 取到命令: %s", resp);
+                handle_command(resp);
+            }
+        } else if (++fail_streak == 5) {
+            /* 只报一次，避免刷屏；但把排查线索给全 */
+            ESP_LOGW(TAG, "WiFi 取命令连续失败 %d 次 —— 检查 APP_SERVER_HOST=%s:%d 是否可达、"
+                          "电脑防火墙是否放行该端口", fail_streak, APP_SERVER_HOST, APP_SERVER_PORT);
+        }
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - last_dbg > 60000) {         /* 每分钟一条心跳，便于确认通道活着 */
+            last_dbg = now;
+            ESP_LOGD(TAG, "WiFi 下行轮询中：累计取到命令 %lu 条", (unsigned long)got_cmds);
         }
         vTaskDelay(pdMS_TO_TICKS(CMD_POLL_INTERVAL_MS));
     }
