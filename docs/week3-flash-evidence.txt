@@ -58,6 +58,24 @@
     connected=True  live=True  transport=serial  deviceId=S3EYE-GROUP01  seq=980
   字段：acc_x_g=-0.319  acc_y_g=-0.5109  acc_z_g=...（真实 IMU 读数，持续刷新）
 
+【实物命令通道测试（直接向板子发送命令并读取回执）】
+
+  发送 {"cmd":"viewer_ack","request_id":"help-selftest-001"}   ← 此时板子处于空闲态
+    → {"type":"ack","request_id":"help-selftest-001","seq":1514,"status":"no_active_help"}
+    ★ 板端【拒绝】显示「对方已收到」—— 当堂验证硬指标② 在实物上成立
+
+  发送 {"cmd":"ping","request_id":"selftest-ping"}
+    → {"type":"ack","request_id":"selftest-ping","seq":1526,"status":"pong"}
+
+  发送 {"cmd":"help_reset","request_id":"selftest-reset"}
+    → {"type":"ack","request_id":"selftest-reset","seq":1536,"status":"idle"}
+
+  发送 {"cmd":"collect_once","request_id":"selftest-collect"}
+    → {"type":"ack","request_id":"selftest-collect","seq":1546,"status":"received"}
+    → 观测帧 {"device":"S3EYE-GROUP01","seq":1547,"request_id":"selftest-collect",
+              "acc_x_g":-0.3198,"acc_y_g":-0.5...,...}
+    ★ 第 2 周远程采集功能无回归；seq 严格递增 1546→1547，证明是新采样
+
 【尚需人工完成的动作（需按下板上按键）】
   · 按一下功能键 → 板端 LED 快闪 + 屏幕红底「求助已发送 / 等待回应」；网页出现求助
   · 网页点「我已收到」 → 板端 LED 慢闪 + 屏幕绿底「对方已收到」；网页显示"板端已确认"

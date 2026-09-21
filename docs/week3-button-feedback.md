@@ -198,7 +198,18 @@ I (200)  app_init: App version: fe028d8                  ← 与提交一致
 ```
 
 服务端同时确认：`connected=True  live=True  transport=serial  deviceId=S3EYE-GROUP01`，
-数据帧 seq 持续递增。完整日志见 [`week3-flash-evidence.txt`](week3-flash-evidence.txt)。
+数据帧 seq 持续递增。
+
+**实物命令通道测试**（直接向板子发命令并读回执）：
+
+| 发送 | 板端回执 | 结论 |
+|------|----------|------|
+| `viewer_ack`（板子空闲） | `status:"no_active_help"` | ★ 板端**拒绝**显示「对方已收到」——硬指标②在实物上成立 |
+| `ping` | `status:"pong"` | 命令通道正常 |
+| `help_reset` | `status:"idle"` | 正常 |
+| `collect_once` | `received` + 观测帧 seq **1546→1547** | 第 2 周功能无回归 |
+
+完整日志见 [`week3-flash-evidence.txt`](week3-flash-evidence.txt)。
 
 ### 待人工补验（需按下板上按键）
 
