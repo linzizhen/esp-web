@@ -57,6 +57,8 @@ const S = {
   live: false,
   stale: false,
   portOpen: false,
+  wifiDownlink: false,   // 板端正通过 WiFi 轮询取命令（拔掉 USB 也能下发）
+  downlinkKind: null,    // 'serial' | 'wifi' | null
   transport: null,
   device: null,
   deviceId: null,
@@ -534,13 +536,21 @@ function fmtClock(ts) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
 }
 
+/* 当前可用的下行通道：串口优先，其次 WiFi 轮询（拔掉 USB 也能下发） */
+function downlinkLabel() {
+  if (S.portOpen) return 'USB 串口';
+  if (S.wifiDownlink) return 'WiFi 轮询';
+  return null;
+}
+
 function renderCollectMode() {
   if (!els.collectMode) return;
+  const kind = downlinkLabel();
   if (COLLECT.mockDevice) {
     els.collectMode.textContent = '模拟模式';
     els.collectMode.className = 'tag tag-sim';
-  } else if (S.portOpen) {
-    els.collectMode.textContent = '命令通道就绪';
+  } else if (kind) {
+    els.collectMode.textContent = '命令通道就绪 · ' + kind;
     els.collectMode.className = 'tag tag-ok';
   } else {
     els.collectMode.textContent = '命令通道不可用';
@@ -550,11 +560,15 @@ function renderCollectMode() {
     els.btnReportToggle.textContent = COLLECT.reportPaused ? '恢复周期上报' : '暂停周期上报';
   }
   if (els.collectChannel) {
-    els.collectChannel.textContent = COLLECT.mockDevice
-      ? '⚠ 模拟模式已开启：命令不经过真实串口，回执与观测由服务端自答（仅供联调，不代表实物执行）。'
-      : (S.portOpen
-        ? `命令通道：USB 串口 · 超时阈值 ${COLLECT.timeoutMs} ms`
-        : '串口未打开，无法下发命令。请到「记录与设备」页连接设备。');
+    if (COLLECT.mockDevice) {
+      els.collectChannel.textContent = '⚠ 模拟模式已开启：命令不经过真实串口，回执与观测由服务端自答（仅供联调，不代表实物执行）。';
+    } else if (S.portOpen) {
+      els.collectChannel.textContent = `命令通道：USB 串口 · 超时阈值 ${COLLECT.timeoutMs} ms`;
+    } else if (S.wifiDownlink) {
+      els.collectChannel.textContent = `命令通道：WiFi 轮询（板端定期来取命令）· 超时阈值 ${COLLECT.timeoutMs} ms —— 已拔掉 USB 也能下发。`;
+    } else {
+      els.collectChannel.textContent = '命令通道不可用：串口未打开，且开发板未通过 WiFi 来取命令。请连接设备，或检查固件的 WiFi 凭据。';
+    }
   }
 }
 
@@ -670,9 +684,15 @@ const HELP_STATUS_TEXT = {
 
 function renderHelpChannel() {
   if (!els.helpChannel) return;
-  els.helpChannel.textContent = HELP.channelReady
-    ? '命令通道：USB 串口就绪 —— 回应会真实下发到开发板，板端会回执确认。'
-    : '⚠ 命令通道不可用（串口未打开）：此时点「我已收到」不会送达开发板，板端不会显示「对方已收到」。请到「记录与设备」页连接设备。';
+  const d = HELP.data || {};
+  const kind = HELP.channelReady ? (d.channelKind || (S.portOpen ? 'serial' : null)) : null;
+  if (kind === 'serial') {
+    els.helpChannel.textContent = '命令通道：USB 串口就绪 —— 回应会真实下发到开发板，板端会回执确认。';
+  } else if (kind === 'wifi') {
+    els.helpChannel.textContent = '命令通道：WiFi 轮询就绪 —— 回应会被开发板取走并回执确认（无需 USB 线）。';
+  } else {
+    els.helpChannel.textContent = '⚠ 命令通道不可用（串口未打开，开发板也未通过 WiFi 来取命令）：此时点「我已收到」不会送达开发板，板端不会显示「对方已收到」。';
+  }
 }
 
 function renderHelp(h) {
@@ -1055,6 +1075,8 @@ function connect() {
       clearAllData();
       S.connected = !!m.connected; S.live = !!m.live; S.transport = m.transport || null;
       S.portOpen = !!m.portOpen;
+      S.wifiDownlink = !!m.wifiDownlink;
+      S.downlinkKind = m.downlinkKind || null;
       S.device = m.device || null; S.deviceId = m.deviceId || null; S.deviceMac = m.deviceMac || null;
       S.deviceVerified = m.deviceVerified ?? null; S.expectedDeviceId = m.expectedDeviceId || null;
       S.lastDataAt = m.lastDataAt || null; S.boardTs = m.boardTs || null;
@@ -1081,6 +1103,8 @@ function connect() {
     if (m.type === 'status') {
       S.connected = !!m.connected; S.live = !!m.live; S.transport = m.transport || S.transport;
       S.portOpen = m.portOpen !== undefined ? !!m.portOpen : S.portOpen;
+      S.wifiDownlink = m.wifiDownlink !== undefined ? !!m.wifiDownlink : S.wifiDownlink;
+      S.downlinkKind = m.downlinkKind !== undefined ? m.downlinkKind : S.downlinkKind;
       S.device = m.device !== undefined ? m.device : S.device;
       S.deviceId = m.deviceId || S.deviceId; S.deviceMac = m.deviceMac || S.deviceMac;
       S.deviceVerified = m.deviceVerified ?? S.deviceVerified;

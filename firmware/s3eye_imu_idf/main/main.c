@@ -330,6 +330,39 @@ static bool http_upload(const char *body)
     return http_post("/api/data", body);
 }
 
+/* HTTP GET，把响应体读进 buf（带截断保护）。返回 true = HTTP 200。 */
+static bool http_get(const char *path, char *buf, size_t cap)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d%s", APP_SERVER_HOST, APP_SERVER_PORT, path);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 2000,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return false;
+
+    buf[0] = '\0';
+    esp_err_t err = esp_http_client_open(c, 0);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(c);
+        return false;
+    }
+    int len = esp_http_client_fetch_headers(c);
+    int status = esp_http_client_get_status_code(c);
+    if (status == 200) {
+        size_t want = cap - 1;
+        if (len > 0 && (size_t)len < want) want = (size_t)len;
+        int n = esp_http_client_read(c, buf, want);
+        buf[n > 0 ? n : 0] = '\0';
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    return (status == 200);
+}
+
 /* ===================== 本地反馈（LED + LCD）与按键（第 3 周） =====================
  *
  * 闭环设计（与网页/服务端配合）：
@@ -902,6 +935,34 @@ static void cmd_task(void *arg)
     }
 }
 
+/* ---------------------- WiFi 下行：命令轮询（第 3 周补充） ----------------------
+ * 板端是纯 HTTP 客户端，服务端无法主动连它。因此由板端定期来取：
+ *   GET /api/cmd?device=<APP_DEVICE_ID>  →  有命令则返回该命令，没有则返回 {}
+ * 取到后走与串口命令【完全相同】的 handle_command()，回执照旧经上行回传。
+ *
+ * 为什么不会重复执行：串口在线时服务端只写串口、队列为空，
+ * 这里取到的永远是 {}，因此两条通道互不干扰。
+ * ------------------------------------------------------------------ */
+static void poll_task(void *arg)
+{
+    (void)arg;
+    char path[128];
+    snprintf(path, sizeof(path), "/api/cmd?device=%s", APP_DEVICE_ID);
+
+    static char resp[512];
+    while (1) {
+        if (!wifi_wait(0)) {                  /* WiFi 没连上就不轮询 */
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        if (http_get(path, resp, sizeof(resp)) && strstr(resp, "\"cmd\"")) {
+            ESP_LOGI(TAG, "WiFi 取到命令: %s", resp);
+            handle_command(resp);
+        }
+        vTaskDelay(pdMS_TO_TICKS(CMD_POLL_INTERVAL_MS));
+    }
+}
+
 void app_main(void)
 {
     /* NVS（WiFi 需要） */
@@ -945,6 +1006,8 @@ void app_main(void)
 
     /* 启动远程命令接收任务（下行通道，与上报共用同一 USB 串口） */
     xTaskCreate(cmd_task, "cmd", 4096, NULL, 5, NULL);
+    /* 启动 WiFi 命令轮询任务（串口不在线时的下行兜底通道） */
+    xTaskCreate(poll_task, "poll", 4096, NULL, 4, NULL);
 
     int64_t last = 0;
     while (1) {

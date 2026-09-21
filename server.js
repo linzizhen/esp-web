@@ -309,6 +309,7 @@ function publicRequest(r) {
     completed_at: r.completed_at || null,
     timeout_at: r.timeout_at || null,
     ack_status: r.ack_status || null,
+    channel: r.channel || null,       // serial | wifi —— 命令走的是哪条下行通道
     seq_before: r.seq_before ?? null,
     seq_observed: r.seq_observed ?? null,
     observation: r.observation || null,
@@ -327,20 +328,71 @@ function recentRequests(n = 20) {
   return [...REQUESTS.values()].slice(-n).reverse().map(publicRequest);
 }
 
-/* 通过命令通道下发一行命令（当前实现：串口）。返回是否写出成功。 */
-function sendCommand(obj) {
+/* ------------------------------------------------------------------ */
+/* 下行命令：两条通道                                                    */
+/*                                                                     */
+/*   ① 串口（首选，低延迟）：板子插着 USB 时直接写串口                    */
+/*   ② WiFi 轮询（兜底）：板子是纯 HTTP 客户端，服务端连不上它，           */
+/*      因此把命令放进队列，等板端 GET /api/cmd 来取（默认 400ms 一次）   */
+/*                                                                     */
+/* 两者互斥：串口在线时只写串口、队列为空，板端来取也拿不到东西，         */
+/* 因此不会重复执行。板子拔掉 USB 后，闭环仍能完整跑通。                  */
+/* ------------------------------------------------------------------ */
+const CMD_QUEUE_MAX = 20;
+const CMD_TTL_MS = 15000;      // 超过 15s 没被取走就作废，避免陈旧命令突然执行
+const cmdQueue = [];           // { id, obj, device, queued_at, ttl }
+let cmdSeq = 0;
+
+function queueCommand(obj, device) {
+  const item = { id: ++cmdSeq, obj, device: device || null, queued_at: Date.now(), ttl: CMD_TTL_MS };
+  cmdQueue.push(item);
+  while (cmdQueue.length > CMD_QUEUE_MAX) cmdQueue.shift();
+  return item;
+}
+
+function dropExpiredCommands() {
+  const now = Date.now();
+  while (cmdQueue.length && now - cmdQueue[0].queued_at > cmdQueue[0].ttl) cmdQueue.shift();
+}
+
+/* 板端来取命令：返回一条匹配本设备的命令，没有则 null */
+function takeCommand(device) {
+  dropExpiredCommands();
+  if (!cmdQueue.length) return null;
+  const i = cmdQueue.findIndex((c) => !c.device || !device || c.device === device);
+  if (i < 0) return null;
+  return cmdQueue.splice(i, 1)[0];
+}
+
+/* WiFi 下行是否"活着"：板端最近 2 秒内来取过命令 */
+function wifiDownlinkActive() {
+  return !!stats.lastCmdPollAt && (Date.now() - stats.lastCmdPollAt) < 2000;
+}
+
+/* 下发一行命令。
+ * 返回 true = 【当前确实能送达】（串口写出成功，或板端正通过 WiFi 轮询来取）。
+ * 串口不在线时命令仍会入队，这样板端一旦上线就能取走，不会丢；
+ * 但若板端当前并未轮询，则返回 false —— 调用方据此如实提示"未送达"，
+ * 绝不在没有任何送达证据时声称已下发。 */
+function sendCommand(obj, device) {
   if (config.mockDevice) return false;       // 模拟模式不走真实通道
-  if (!port || !port.isOpen) return false;
-  try {
-    port.write(JSON.stringify(obj) + '\n', (err) => {
-      if (err) stats.lastError = String(err.message || err);
-    });
-    stats.cmdSent = (stats.cmdSent || 0) + 1;
-    return true;
-  } catch (e) {
-    stats.lastError = String(e.message || e);
-    return false;
+  if (port && port.isOpen) {
+    try {
+      port.write(JSON.stringify(obj) + '\n', (err) => {
+        if (err) stats.lastError = String(err.message || err);
+      });
+      stats.cmdSent = (stats.cmdSent || 0) + 1;
+      stats.cmdViaSerial = (stats.cmdViaSerial || 0) + 1;
+      return true;
+    } catch (e) {
+      stats.lastError = String(e.message || e);
+      return false;
+    }
   }
+  // 串口不在线 → 入队，等板端经 WiFi 来取
+  queueCommand(obj, device);
+  stats.cmdViaWifi = (stats.cmdViaWifi || 0) + 1;
+  return wifiDownlinkActive();
 }
 
 /* 创建一次采集请求并下发 */
@@ -357,10 +409,11 @@ function createCollectRequest() {
   trimRequests();
   pushRequest(r);
 
-  const sent = sendCommand({ cmd: 'collect_once', request_id: r.request_id });
+  const sent = sendCommand({ cmd: 'collect_once', request_id: r.request_id }, r.device_id);
   if (sent) {
     r.status = 'dispatched';
     r.dispatched_at = Date.now();
+    r.channel = (port && port.isOpen) ? 'serial' : 'wifi';
     r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
   } else if (config.mockDevice) {
     // 模拟板端：明确标注 simulated，绝不冒充实物命令
@@ -375,8 +428,8 @@ function createCollectRequest() {
     // 不伪造完成，也不立刻判死 —— 按作业要求「请求等待 / 超时」处理，
     // 但立刻给出原因提示，避免用户干等。
     r.status = 'submitted';
-    r.error = '命令通道不可用（串口未打开）';
-    r.note = '已提交，但命令通道不可用（设备关闭或串口未连接），将按超时处理。超时≠硬件故障。';
+    r.error = '命令通道不可用（串口未打开，开发板也未在轮询）';
+    r.note = '已提交，但命令尚未送达设备（串口未打开、开发板也未通过 WiFi 取命令）。命令已入队，若开发板在 15 秒内上线会被取走；否则按超时处理。超时≠硬件故障。';
     r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
   }
   pushRequest(r);
@@ -492,12 +545,16 @@ function publicHelp() {
     seq: help.seq,
     ack_sent_at: help.ack_sent_at,
     ack_channel_ok: help.ack_channel_ok,
+    ack_channel: help.ack_channel || null,   // serial | wifi
     ack_delivered: help.ack_delivered,
     cancelled_at: help.cancelled_at,
     note: help.note,
     history: help.history.slice(-HELP_KEEP),
     mockDevice: !!config.mockDevice,
-    channelReady: !!(port && port.isOpen),
+    // 下行是否可用：串口在线，或板端正通过 WiFi 轮询来取命令
+    channelReady: !!(port && port.isOpen) || wifiDownlinkActive(),
+    channelKind: (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null),
+    pendingCommands: cmdQueue.length,
   };
 }
 
@@ -543,9 +600,10 @@ function createHelpAck() {
     return { ok: false, note: '当前没有待回应的求助。' };
   }
   const rid = help.help_id || `help-${Date.now()}`;
-  const ok = sendCommand({ cmd: 'viewer_ack', request_id: rid });
+  const ok = sendCommand({ cmd: 'viewer_ack', request_id: rid }, help.device_id);
   help.ack_sent_at = Date.now();
   help.ack_channel_ok = ok;
+  help.ack_channel = ok ? ((port && port.isOpen) ? 'serial' : 'wifi') : null;
   if (ok) {
     help.status = 'acknowledged';
     help.ack_delivered = null;   // 等板端回执
@@ -558,7 +616,7 @@ function createHelpAck() {
     helpLog('ack_mock', rid);
   } else {
     help.status = 'received';    // 未送达 → 状态不前进
-    help.note = '⚠ 回应未送达设备：命令通道不可用（串口未打开）。板端不会显示「对方已收到」。';
+    help.note = '⚠ 回应尚未送达设备（串口未打开，开发板也未在轮询）。命令已入队，若开发板在 15 秒内上线会被取走；在此之前板端不会显示「对方已收到」。';
     helpLog('ack_failed', rid);
   }
   pushHelp();
@@ -571,7 +629,7 @@ function createHelpCancel() {
     return { ok: false, note: '当前没有进行中的求助。' };
   }
   const rid = help.help_id || `help-${Date.now()}`;
-  const ok = sendCommand({ cmd: 'help_cancel', request_id: rid });
+  const ok = sendCommand({ cmd: 'help_cancel', request_id: rid }, help.device_id);
   help.status = 'cancelled';
   help.active = false;
   help.cancelled_at = Date.now();
@@ -615,6 +673,8 @@ function pushStatus(reason) {
     connected: state.connected,
     live: state.live,           // true=实时流动；false=停采保留（保留旧值旧时间）
     portOpen: !!(port && port.isOpen),
+    wifiDownlink: wifiDownlinkActive(),   // 板端正通过 WiFi 轮询取命令
+    downlinkKind: (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null),
     transport: state.transport,
     device: state.device,
     deviceId: state.deviceId,   // 设备身份标识（核对数据来自本组设备）
@@ -1231,6 +1291,11 @@ const server = http.createServer(async (req, res) => {
       hints.push('串口已打开但没收到数据。请确认固件已烧录、开发板在运行、且输出用的是 Serial.println()（必须换行）。');
     }
 
+    // 下行通道检查：串口不在线时，只能靠板端经 WiFi 轮询来取命令
+    if (!(port && port.isOpen) && !wifiDownlinkActive()) {
+      hints.push(`串口未打开，且开发板尚未通过 WiFi 来取命令（GET /api/cmd）。此时远程采集/求助回应只会排队等待。请确认固件已填 WiFi 凭据（app_config.h），且能访问本机 ${config.httpPort} 端口（注意放行防火墙）。`);
+    }
+
     return json(res, 200, {
       runtime: { node: process.version, platform: process.platform, arch: process.arch },
       serialportVersion: (() => { try { return require('serialport/package.json').version; } catch (_) { return 'unknown'; } })(),
@@ -1246,6 +1311,16 @@ const server = http.createServer(async (req, res) => {
       lastError: stats.lastError,
       lastOpenError: stats.lastOpenError,
       recording: { active: recording.active, rows: recording.rows.length },
+      downlink: {
+        serial: !!(port && port.isOpen),
+        wifiPolling: wifiDownlinkActive(),
+        lastPollAt: stats.lastCmdPollAt || null,
+        pollCount: stats.cmdPollCount || 0,
+        pollDevice: stats.cmdPollDevice || null,
+        queued: cmdQueue.length,
+        sentViaSerial: stats.cmdViaSerial || 0,
+        sentViaWifi: stats.cmdViaWifi || 0,
+      },
       hints,
     });
   }
@@ -1260,7 +1335,13 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/collect' && req.method === 'GET') {
     return json(res, 200, {
       mockDevice: !!config.mockDevice,
-      channel: { portOpen: !!(port && port.isOpen), cmdSent: stats.cmdSent || 0 },
+      channel: {
+        portOpen: !!(port && port.isOpen),
+        wifiDownlink: wifiDownlinkActive(),   // 板端正通过 WiFi 来取命令
+        kind: (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null),
+        cmdSent: stats.cmdSent || 0,
+        pending: cmdQueue.length,
+      },
       timeoutMs: collectTimeoutMs(),
       requests: recentRequests(20),
     });
@@ -1279,15 +1360,28 @@ const server = http.createServer(async (req, res) => {
     let body = {};
     try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
     const action = body.action === 'resume' ? 'resume' : 'pause';
-    const ok = sendCommand({ cmd: action });
+    const ok = sendCommand({ cmd: action }, state.deviceId || null);
     if (ok) state.reportPaused = (action === 'pause');
     pushStatus('report');
     return json(res, 200, {
       ok,
       action,
       reportPaused: !!state.reportPaused,
+      channel: ok ? ((port && port.isOpen) ? 'serial' : 'wifi') : null,
       note: ok ? null : (config.mockDevice ? '模拟模式：未走真实串口' : '命令通道不可用（串口未打开）'),
     });
+  }
+
+  // ---- 下行命令轮询（WiFi 通道，第 3 周补充）----
+  // 板端是纯 HTTP 客户端，服务端连不上它，因此由板端定期来取：
+  //   GET /api/cmd?device=S3EYE-GROUP01  →  有命令则返回该命令对象，没有则返回 {}
+  if (p === '/api/cmd' && req.method === 'GET') {
+    const device = (url.searchParams.get('device') || '').trim() || null;
+    stats.lastCmdPollAt = Date.now();
+    stats.cmdPollCount = (stats.cmdPollCount || 0) + 1;
+    stats.cmdPollDevice = device;
+    const item = takeCommand(device);
+    return json(res, 200, item ? item.obj : {});
   }
 
   // ---- 教学求助（第 3 周）：查询当前状态 ----
@@ -1476,6 +1570,8 @@ wss.on('connection', (ws) => {
     connected: state.connected,
     live: state.live,
     portOpen: !!(port && port.isOpen),
+    wifiDownlink: wifiDownlinkActive(),
+    downlinkKind: (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null),
     transport: state.transport,
     device: state.device,
     deviceId: state.deviceId,
@@ -1503,6 +1599,16 @@ wss.on('connection', (ws) => {
 /* ------------------------------------------------------------------ */
 /* 心跳 / 超时检测                                                     */
 /* ------------------------------------------------------------------ */
+
+/* 下行通道变化时主动推送：板端开始 / 停止经 WiFi 轮询取命令 */
+let lastDownlinkKind = null;
+setInterval(() => {
+  const kind = (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null);
+  if (kind !== lastDownlinkKind) {
+    lastDownlinkKind = kind;
+    pushStatus('downlink');
+  }
+}, 2000);
 
 setInterval(() => {
   const now = Date.now();

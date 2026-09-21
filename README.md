@@ -198,6 +198,7 @@ temperature:26.5 humidity:58.2
 | POST | `/api/report` | **周期上报开关**：`{action:'pause'\|'resume'}`（命令通道保持可用） |
 | GET | `/api/help` | **教学求助**：当前求助状态 + 命令通道状态 |
 | POST | `/api/help` | **教学求助**：`{action:'ack'\|'cancel'\|'reset'}` 查看者回应 / 取消 / 复位 |
+| GET | `/api/cmd?device=` | **下行命令轮询（WiFi 通道）**：开发板定期来取待执行命令；无命令返回 `{}` |
 | WS | `/ws` | 实时推送 `sample` / `status` / `raw` / `cleared` / `stale` / `hello` / `collect` / `help` |
 
 ## 六之一、ESP32-S3-EYE 专项说明
@@ -342,6 +343,47 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 
 > 完整说明（含板端与服务端状态图、时序图、实测记录、迁移说明）见
 > [`docs/week3-button-feedback.md`](docs/week3-button-feedback.md)。
+
+## 六之五、WiFi 下行通道（拔掉 USB 也能下发命令）
+
+开发板是**纯 HTTP 客户端**——只会主动往服务端 POST，服务端连不上它。
+所以下行（服务端 → 板）原本只能走 USB 串口，**拔掉 USB 后「远程采集」和「求助回应」就送不到板子**。
+
+现在补上了第二条下行通道：**板端定期来取命令**。
+
+```
+板端每 400ms：GET http://<服务器>:8080/api/cmd?device=S3EYE-GROUP01
+   → 有命令返回该命令（如 {"cmd":"collect_once","request_id":"..."}）
+   → 没有返回 {}
+板端取到后走与串口命令【完全相同】的处理逻辑，回执照旧经上行回传
+```
+
+### 两条下行通道如何共存
+
+| 情况 | 走哪条 | 说明 |
+|------|--------|------|
+| 串口已连接 | **USB 串口**（优先） | 低延迟；队列为空，板端来取只会拿到 `{}` |
+| 串口未连接、板端在轮询 | **WiFi 轮询** | 延迟约 400ms |
+| 两者都不可用 | 命令**入队等待** | 15 秒内板端上线就能取走；否则作废，请求按超时处理 |
+
+**不会重复执行**：串口在线时服务端只写串口、不写队列，板端来取永远是空的。
+
+### 诚实性保证（不变）
+
+- 命令**入队 ≠ 已送达**。只有「串口写出成功」或「板端确实在轮询」才算可送达；
+- 否则如实提示"尚未送达设备"，**绝不声称对方已收到**；
+- 板端回执 `ack_shown` 回来后，才把 `ack_delivered` 置为 true。
+
+### 要真正用起来，需要两件事
+
+1. **填 WiFi 凭据**：`firmware/s3eye_imu_idf/main/app_config.h` 里的
+   `APP_WIFI_SSID` / `APP_WIFI_PASS`（现在是占位符），然后重新烧录；
+2. **放行防火墙**：服务器电脑允许 8080 入站，板子才能 POST 进来、取走命令。
+
+改完就可以**拔掉 USB 线**，完整跑通「实时数据 + 远程采集 + 教学求助」闭环。
+`APP_SERVER_HOST` 填服务器电脑的局域网 IP；轮询间隔由 `CMD_POLL_INTERVAL_MS` 控制（默认 400ms）。
+
+> 点「诊断」按钮可查看下行状态：`downlink: {serial, wifiPolling, queued, sentViaSerial, sentViaWifi}`。
 
 ## 七、排查：板子插上了但没数据
 

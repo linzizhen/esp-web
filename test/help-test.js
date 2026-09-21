@@ -117,6 +117,31 @@ const HELP = (extra) => Object.assign({
     const rec = await jget('/api/records?limit=20');
     ok(!(rec.rows || []).some((x) => x.fields && x.fields.help_id), '未落盘为传感记录');
 
+    console.log('— ⑦ WiFi 下行：拔掉 USB 也能下发命令 —');
+    // ③⑤ 在"通道不可用"时也会把命令入队（防止丢失），先排空残留
+    let drained = 0;
+    for (let i = 0; i < 8; i++) {
+      const c = await jget('/api/cmd?device=S3EYE-GROUP01');
+      if (!c.cmd) break;
+      drained++;
+    }
+    ok(drained > 0, `通道不可用时命令仍入队、不丢失（排空 ${drained} 条残留）`);
+    const c0 = await jget('/api/cmd?device=S3EYE-GROUP01');
+    ok(!c0.cmd, '队列空时轮询返回空对象');
+    const cr = await jpost('/api/collect', {});
+    ok(cr.request && cr.request.channel === 'wifi', '串口不在线时，采集命令走 WiFi 队列（channel=wifi）');
+    ok(cr.request && cr.request.status === 'dispatched', '状态推进到 dispatched');
+    const c1 = await jget('/api/cmd?device=S3EYE-GROUP01');
+    ok(c1.cmd === 'collect_once' && c1.request_id === cr.request.request_id, '板端取到 collect_once，request_id 一致');
+    const c2 = await jget('/api/cmd?device=S3EYE-GROUP01');
+    ok(!c2.cmd, '再取一次为空 —— 不会重复执行');
+    await jpost('/api/data', HELP({ help_id: 'help-test-0003', seq: 110 }));
+    await sleep(150);
+    const ar = await jpost('/api/help', { action: 'ack' });
+    ok(ar.ok === true && ar.help.ack_channel === 'wifi', '求助回应入队，通道标注为 wifi');
+    const c3 = await jget('/api/cmd?device=S3EYE-GROUP01');
+    ok(c3.cmd === 'viewer_ack' && c3.request_id === 'help-test-0003', '板端取到 viewer_ack，help_id 一致');
+
     console.log(`\n结果：通过 ${pass} / 失败 ${fail}`);
   } catch (e) {
     console.error('测试异常：', e);

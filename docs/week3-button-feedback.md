@@ -77,6 +77,12 @@
 | GET | `/api/help` | 当前求助状态 + 命令通道状态 |
 | POST | `/api/help` | `{"action":"ack"｜"cancel"｜"reset"}` |
 
+> **下行通道有两条**：`viewer_ack` / `help_cancel` 与采集命令一样 —— 串口在线时走 USB 串口；
+> 串口不在线时，板端每 400ms `GET /api/cmd?device=...` 来取（**WiFi 轮询**）。
+> 因此**拔掉 USB 线，求助闭环依然完整**（这正是"独立网络"要求的落地）。
+> 命令**入队 ≠ 已送达**：只有串口写出成功、或板端确实在轮询，才认为可送达；
+> 否则如实提示"尚未送达设备"，绝不声称对方已收到。
+
 ---
 
 ## 四、状态机
@@ -229,7 +235,8 @@ I (200)  app_init: App version: fe028d8                  ← 与提交一致
 | `firmware/s3eye_imu_idf/main/main.c` | 新增 `led_init/led_write`（GPIO3 开漏）、`lcd_init/lcd_fill/lcd_draw_zh/lcd_draw_ascii/lcd_show_*`（ST7789）、`utf8_next()`、`btn_init/btn_task`（ADC 自适应校准 + 去抖）、求助状态机 `on_button_press/send_help_event/new_help_id`、`ui_task`（LED 闪烁 + 屏幕刷新）；`handle_command()` 增加 `viewer_ack/help_cancel/help_reset`；`http_upload` 抽出为通用 `http_post()` |
 | `firmware/s3eye_imu_idf/main/lcd_font.h` | **自动生成**的点阵字模（中文 32×32 × 25 字 + ASCII 8×16） |
 | `firmware/s3eye_imu_idf/tools/gen_font.py` | 字模生成脚本（PIL + simhei），同时输出预览图 |
-| `server.js` | 求助模块：`help` 状态、`publicHelp/pushHelp/onHelpEvent/createHelpAck/createHelpCancel/onHelpAck/resetHelp`；`handleLine()` 增加 `type:"help"` 分支；`onDeviceAck()` 把 `help-*` 路由到求助模块；路由 `GET/POST /api/help`；WS hello 带 `help` |
+| `server.js` | 求助模块：`help` 状态、`publicHelp/pushHelp/onHelpEvent/createHelpAck/createHelpCancel/onHelpAck/resetHelp`；`handleLine()` 增加 `type:"help"` 分支；`onDeviceAck()` 把 `help-*` 路由到求助模块；路由 `GET/POST /api/help`；WS hello 带 `help`。**另补 WiFi 下行通道**：命令队列 + `GET /api/cmd`（板端轮询取命令），`sendCommand()` 串口优先、否则入队，只有确认可送达才返回成功 |
+| `firmware/.../main/main.c` | 新增 `http_get()` 与 `poll_task()`（每 `CMD_POLL_INTERVAL_MS` 取一次命令，复用同一个 `handle_command()`） |
 | `public/index.html` | 新增 `#help` 分页 + 导航红点徽章 |
 | `public/app.js` | `renderHelp/renderHelpChannel/helpAction/loadHelp`；`PAGES` 增加 `help`；WS 处理 `help` 消息 |
 | `public/style.css` | `.tab-badge`、`.help-alert`（中性/警示/成功三态） |
