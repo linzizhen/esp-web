@@ -186,7 +186,21 @@ sequenceDiagram
 事件历史：received → ack_failed → cancelled → received → ack_mock → reset → received → ack_delivered
 ```
 
-### 待实物验证（需烧录新固件后）
+### 烧录与开机实测（已通过）
+
+固件已烧录到 COM4（966736 字节，哈希校验通过）。开机日志确认三个新子系统全部就绪：
+
+```
+I (1503) gpio: GPIO[3]| OutputEn: 1| OpenDrain: 1        ← LED 开漏模式生效（不会烧）
+I (1625) S3EYE: LCD 初始化完成（240x240 ST7789, SPI3）   ← 屏幕 OK
+I (2226) S3EYE: 按键 ADC 校准：空闲=4095，判定阈值<3595   ← 按键 OK
+I (200)  app_init: App version: fe028d8                  ← 与提交一致
+```
+
+服务端同时确认：`connected=True  live=True  transport=serial  deviceId=S3EYE-GROUP01`，
+数据帧 seq 持续递增。完整日志见 [`week3-flash-evidence.txt`](week3-flash-evidence.txt)。
+
+### 待人工补验（需按下板上按键）
 
 | 步骤 | 预期 |
 |------|------|
