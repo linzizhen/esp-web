@@ -233,6 +233,7 @@ I (200)  app_init: App version: fe028d8                  ← 与提交一致
 | `public/index.html` | 新增 `#help` 分页 + 导航红点徽章 |
 | `public/app.js` | `renderHelp/renderHelpChannel/helpAction/loadHelp`；`PAGES` 增加 `help`；WS 处理 `help` 消息 |
 | `public/style.css` | `.tab-badge`、`.help-alert`（中性/警示/成功三态） |
+| `test/help-test.js` | 第 3 周自动化测试（18 项，独立端口 8097）：状态不前进 / 回执确认 / 不污染数据链路 |
 | `docs/week3-button-feedback.md` | 本文档 |
 
 ---

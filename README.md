@@ -15,15 +15,19 @@ npm start          # 等价于 node server.js
 
 启动后浏览器访问 <http://localhost:8080>
 
-### 2. 烧录固件到 ESP32
+### 2. 烧录固件到 ESP32-S3-EYE
 
-用 Arduino IDE 打开 `firmware/esp32_monitor.ino`：
+本项目当前使用 **ESP-IDF 工程** `firmware/s3eye_imu_idf/`（Arduino 草稿为早期版本，已不用）。
+先填好 `firmware/s3eye_imu_idf/main/app_config.h`（WiFi / 服务器 IP / 设备 ID），然后：
 
-- 选择开发板（ESP32 Dev Module / ESP32-S3 / ESP32-C3 等）
-- 选择端口，波特率 **115200**
-- 点击上传
+```bash
+npm run firmware:build     # 编译
+npm run firmware:flash     # 编译并烧录到 COM4
+npm run firmware:monitor   # 串口监视（Ctrl+] 退出）
+```
 
-**无需外接任何传感器**即可看到数据（使用芯片内部温度传感器、霍尔传感器、ADC 引脚）。
+> 烧录前请在网页点「**释放串口**」——Windows 串口是独占的。
+> 这三个脚本走 `scripts/idfwrap.py`，它已处理好 MSYS 与 ESP-IDF Python 环境，无需手动 export。
 
 ### 3. 接线（可选）
 
@@ -108,6 +112,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── parse-test.js         # 通用解析：JSON / 键值 / 中文键
     ├── storage-test.js       # 持久化 + 查询 + 停采保留
     ├── ws-test.js            # WebSocket sample/stale/cleared 推送结构
+    ├── help-test.js          # 第 3 周：教学求助闭环（状态不前进 / 回执确认 / 不污染数据链路）
     └── listen.js COM4 25     # 原样监听某串口 N 秒，看板子在发什么
 ```
 
@@ -373,6 +378,7 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 node test/e2e-test.js      # 数据链路：空状态 / 上报解析 / 离线清空 / 非法报文过滤
 node test/feature-test.js  # 诊断接口 / 录制导出 / CSV 内容
 node test/parse-test.js    # 通用解析：JSON / 键值 / 中文键 / 误解析防护
+node test/help-test.js     # 第 3 周：教学求助闭环（自带服务，独立端口 8097，18 项）
 node test/listen.js COM4 25  # 原样监听某个串口 25 秒，看板子到底在发什么
 ```
 

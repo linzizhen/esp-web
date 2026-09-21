@@ -197,7 +197,7 @@ HOST=0.0.0.0 PORT=8080 npm start
 
 ---
 
-## 7. 自检脚本（共 84 项，全部通过）
+## 7. 自检脚本（共 102 项，全部通过）
 
 ```bash
 # 需先在 8080 启动服务：npm start
@@ -210,6 +210,7 @@ node test/storage-test.js     # 19 项  落盘 + 查询 + 停采保留
 node test/ws-test.js          #  9 项  WebSocket sample/stale/cleared 推送结构
 node test/acceptance-test.js  # 12 项  全链路验收：固件形状数据→落盘→页面→停采
 node test/verify-test.js      #  6 项  本组设备身份校验（本组/非本组/关闭校验）
+node test/help-test.js        # 18 项  第 3 周教学求助闭环（状态不前进 / 回执确认 / 不污染数据链路）
 ```
 
 ---
@@ -369,7 +370,7 @@ node test/verify-test.js      #  6 项  本组设备身份校验（本组/非本
 | 发现 | 原因 | 改进 |
 |------|------|------|
 | 加了 `REQUIRES esp_adc esp_lcd ...` 后 `esp_timer.h` 找不到 | main 组件的默认依赖被显式 `REQUIRES` 覆盖 | 撤销 `REQUIRES`，main 自动获得全部组件 |
-| 编译期 `CreateProcess failed`（ccache 无法被 ninja 拉起） | 构建缓存启用了 ccache，但该环境下无法派生子进程 | `idf.py -DCCACHE_ENABLE=0 reconfigure` 关闭 ccache 后编译通过（实测 0xec050 字节） |
+| 编译期 `CreateProcess failed`（ccache 无法被 ninja 拉起） | 手工经 PowerShell `export.ps1` 准备环境时，ninja 拉不起 ccache | 改用项目自带的 `npm run firmware:build`（`scripts/idfwrap.py`）即正常。该问题只出现在手工 export 的路径上；实测编译产物 0xec050 字节 |
 | 网页可能"谎报"对方已收到 | 原设计只看点击动作 | 增加**板端回执** `ack_shown` → `ack_delivered` 三态（等待/是/否），界面明确区分 |
 
 ### 10.8 向个人项目迁移（确认/取消机制）
