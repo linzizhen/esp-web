@@ -42,15 +42,26 @@
 
 ## 0.1 提交前个人必改项（每人必做，改完即可运行）
 
-**A. 板端固件** `firmware/s3eye_imu_idf/main/app_config.h`：
+**A. 板端固件** —— WiFi 密码**不要**写进 `app_config.h`（该文件会提交到仓库）。
+复制模板，把真实值填进本地私密文件：
+
+```bash
+cd firmware/s3eye_imu_idf/main
+cp app_config.local.h.example app_config.local.h
+```
+
+然后编辑 `app_config.local.h`（已被 `.gitignore` 忽略，不会提交）：
 
 ```c
-#define APP_WIFI_SSID   "你的WiFi名称"      // ← 改成能上网的 WiFi
+#define APP_WIFI_SSID   "你的WiFi名称"      // ← 必须是 2.4GHz，ESP32-S3 不支持 5GHz
 #define APP_WIFI_PASS   "你的WiFi密码"      // ← WiFi 密码
-#define APP_SERVER_HOST "192.168.1.20"     // ← 运行 server.js 的电脑 / VPS 的 IP（启动服务后控制台会打印局域网访问地址）
+#define APP_SERVER_HOST "10.1.41.112"      // ← 运行 server.js 的电脑 IP（局域网内可达）
 #define APP_SERVER_PORT 8080               // ← 与服务端端口一致
 #define APP_DEVICE_ID   "S3EYE-GROUP01"    // ← 本组独立编号（各组必须不同）
 ```
+
+> `app_config.h` 会自动 include 这个本地文件并覆盖默认占位符；
+> 没有这个文件时用占位符编译（此时只能走 USB 串口）。
 
 **B. 服务端** `config.json`：
 

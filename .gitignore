@@ -7,6 +7,9 @@ firmware/s3eye_imu_idf/sdkconfig.old
 firmware/s3eye_imu_idf/managed_components/
 firmware/s3eye_imu_idf/dependencies.lock
 
+# ---- 本地私密配置（含真实 WiFi 密码，绝不提交）----
+firmware/s3eye_imu_idf/main/app_config.local.h
+
 # ---- 运行时数据（真实采集数据，本地保留）----
 data/*.ndjson
 data/records.*.ndjson

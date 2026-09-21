@@ -18,7 +18,16 @@ npm start          # 等价于 node server.js
 ### 2. 烧录固件到 ESP32-S3-EYE
 
 本项目当前使用 **ESP-IDF 工程** `firmware/s3eye_imu_idf/`（Arduino 草稿为早期版本，已不用）。
-先填好 `firmware/s3eye_imu_idf/main/app_config.h`（WiFi / 服务器 IP / 设备 ID），然后：
+
+先填配置 —— **WiFi 密码不要写进 `app_config.h`**（该文件会提交到仓库），
+复制模板到本地私密文件（已被 `.gitignore` 忽略）：
+
+```bash
+cd firmware/s3eye_imu_idf/main
+cp app_config.local.h.example app_config.local.h   # 然后编辑它，填 WiFi / 服务器 IP / 设备 ID
+```
+
+然后：
 
 ```bash
 npm run firmware:build     # 编译
@@ -376,8 +385,9 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 
 ### 要真正用起来，需要两件事
 
-1. **填 WiFi 凭据**：`firmware/s3eye_imu_idf/main/app_config.h` 里的
-   `APP_WIFI_SSID` / `APP_WIFI_PASS`（现在是占位符），然后重新烧录；
+1. **填 WiFi 凭据**：复制 `firmware/s3eye_imu_idf/main/app_config.local.h.example` 为
+   `app_config.local.h`（已被 `.gitignore` 忽略，密码不会进仓库），填入
+   `APP_WIFI_SSID` / `APP_WIFI_PASS`，然后重新烧录；
 2. **放行防火墙**：服务器电脑允许 8080 入站，板子才能 POST 进来、取走命令。
 
 改完就可以**拔掉 USB 线**，完整跑通「实时数据 + 远程采集 + 教学求助」闭环。
