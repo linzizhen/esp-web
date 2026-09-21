@@ -41,6 +41,13 @@ const els = {
   collectReqId: $('collectReqId'), collectSteps: $('collectSteps'),
   collectNote: $('collectNote'), collectObs: $('collectObs'), collectSim: $('collectSim'),
   btnCollect: $('btnCollect'), btnReportToggle: $('btnReportToggle'),
+
+  // 教学求助（第 3 周）
+  helpBadge: $('helpBadge'), helpTag: $('helpTag'), helpAlert: $('helpAlert'),
+  helpTitle: $('helpTitle'), helpDesc: $('helpDesc'),
+  btnHelpAck: $('btnHelpAck'), btnHelpCancel: $('btnHelpCancel'), btnHelpReset: $('btnHelpReset'),
+  helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
+  helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
 };
 
 // ---------------------------------------------------------------- 状态
@@ -648,9 +655,149 @@ if (els.btnReportToggle) els.btnReportToggle.onclick = async () => {
   renderCollectMode();
 };
 
+// ---------------------------------------------------------------- 教学求助（第 3 周）
+// 原则：网页只显示「服务端确认过」的事实。
+//   · 没收到服务端的求助事件 → 一律显示「暂无求助」，绝不凭空显示"对方已收到"
+//   · 点「我已收到」后若命令通道不可用 → 明确提示"未送达"，不谎称对方已收到
+let HELP = { data: null, channelReady: false };
+
+const HELP_STATUS_TEXT = {
+  idle: '暂无求助',
+  received: '收到求助 · 等待回应',
+  acknowledged: '已回应',
+  cancelled: '已取消',
+};
+
+function renderHelpChannel() {
+  if (!els.helpChannel) return;
+  els.helpChannel.textContent = HELP.channelReady
+    ? '命令通道：USB 串口就绪 —— 回应会真实下发到开发板，板端会回执确认。'
+    : '⚠ 命令通道不可用（串口未打开）：此时点「我已收到」不会送达开发板，板端不会显示「对方已收到」。请到「记录与设备」页连接设备。';
+}
+
+function renderHelp(h) {
+  if (!els.helpTag) return;
+  HELP.data = h || null;
+  const d = h || {};
+  const st = d.status || 'idle';
+
+  els.helpTag.textContent = HELP_STATUS_TEXT[st] || '暂无求助';
+  els.helpTag.className = 'tag' + (st === 'received' ? ' tag-warn' : st === 'acknowledged' ? ' tag-ok' : '');
+
+  // 导航上的红点：有待回应的求助时提示
+  if (els.helpBadge) els.helpBadge.classList.toggle('hidden', st !== 'received');
+
+  // 告警区
+  let cls = 'help-alert', icon = '·', title = '当前没有求助';
+  let desc = '佩戴者按下开发板上的功能键后，这里会显示求助，并提示你回应。';
+  if (st === 'received') {
+    cls += ' warn'; icon = '!';
+    title = '收到求助 · 请回应';
+    desc = '佩戴者已在板端按键，板端 LED 快闪、屏幕显示「求助已发送」。点「我已收到」把回应送回开发板。';
+  } else if (st === 'acknowledged') {
+    cls += ' ok'; icon = '✓';
+    if (d.ack_delivered === true) {
+      title = '已回应 · 板端已确认';
+      desc = '板端已回执：屏幕已显示「对方已收到」。';
+    } else if (d.ack_delivered === false) {
+      cls = 'help-alert warn'; icon = '!';
+      title = '回应未被板端接受';
+      desc = '板端回执：当前没有进行中的求助，未显示「对方已收到」。';
+    } else {
+      title = '回应已下发 · 等待板端回执';
+      desc = '回应命令已写出串口，等待板端回执确认显示。';
+    }
+  } else if (st === 'cancelled') {
+    icon = '×';
+    title = '求助已取消';
+    desc = '求助已结束（佩戴者按键取消，或查看者取消）。';
+  }
+  if (els.helpAlert) {
+    els.helpAlert.className = cls;
+    const ic = els.helpAlert.querySelector('.ha-icon');
+    if (ic) ic.textContent = icon;
+  }
+  if (els.helpTitle) els.helpTitle.textContent = title;
+  if (els.helpDesc) els.helpDesc.textContent = desc;
+
+  // 按钮可用性
+  if (els.btnHelpAck) els.btnHelpAck.disabled = (st !== 'received');
+  if (els.btnHelpCancel) els.btnHelpCancel.disabled = !(st === 'received' || st === 'acknowledged');
+  if (els.helpId) els.helpId.textContent = d.help_id || '—';
+  if (els.helpNote) els.helpNote.textContent = d.note || '';
+
+  // 状态时间线
+  if (els.helpSteps) {
+    if (st === 'idle') {
+      els.helpSteps.innerHTML = '<li>尚无求助事件</li>';
+    } else {
+      const row = (label, ts, c, extra) =>
+        `<li class="${c}"><span class="st-time">${ts ? fmtClock(ts) : ''}</span>${escHtml(label)}${extra ? ' · ' + escHtml(extra) : ''}</li>`;
+      const rows = [];
+      rows.push(row('板端按键 · 本地 LED/屏幕立即反馈（不依赖网络）', d.received_at, 'done'));
+      rows.push(row('服务端收到求助（远端接收证据）', d.received_at, 'done'));
+      if (d.ack_sent_at) rows.push(row('查看者回应 · 命令已下发', d.ack_sent_at, 'done'));
+      else if (st === 'received') rows.push(row('等待查看者回应…', null, 'active'));
+      if (d.ack_delivered === true) rows.push(row('板端回执 · 屏幕已显示「对方已收到」', d.ack_sent_at, 'done'));
+      else if (d.ack_sent_at && d.ack_delivered == null) rows.push(row('等待板端回执…', null, 'active'));
+      if (d.cancelled_at) rows.push(row('求助已取消', d.cancelled_at, 'done'));
+      els.helpSteps.innerHTML = rows.join('');
+    }
+  }
+
+  // 证据链
+  if (els.helpEvidence) {
+    if (st === 'idle') {
+      els.helpEvidence.innerHTML = '<div class="obs-empty">尚无求助记录。</div>';
+    } else {
+      const skew = (d.board_ts && d.received_at) ? Math.round(d.received_at - d.board_ts) : null;
+      const yes = (b) => b === true ? '<span class="obs-check ok">✓ 是</span>'
+        : b === false ? '<span class="obs-check no">✗ 否</span>'
+        : '<span class="obs-check">· 等待</span>';
+      els.helpEvidence.innerHTML = `
+        <div class="obs-grid">
+          <div class="obs-item"><div class="k">本地反馈</div><div class="v">LED+屏幕</div></div>
+          <div class="obs-item"><div class="k">服务端接收</div><div class="v">${d.received_at ? fmtClock(d.received_at) : '—'}</div></div>
+          <div class="obs-item"><div class="k">板端时间偏差</div><div class="v">${skew == null ? '—' : (skew >= 0 ? '+' : '') + skew + 'ms'}</div></div>
+        </div>
+        <div class="obs-meta">
+          help_id：<code>${escHtml(d.help_id || '—')}</code>　板端序号：<code>${d.seq == null ? '—' : d.seq}</code><br>
+          回应命令已写出串口：${yes(d.ack_channel_ok)}　板端回执已显示「对方已收到」：${yes(d.ack_delivered)}
+          ${d.mockDevice ? '<br><span class="obs-check no">⚠ 当前为模拟模式，未走真实串口</span>' : ''}
+        </div>`;
+    }
+  }
+
+  renderHelpChannel();
+}
+
+async function helpAction(action) {
+  try {
+    const j = await (await fetch('/api/help', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })).json();
+    if (j && j.help) renderHelp(j.help);
+    else if (j && j.note && els.helpNote) els.helpNote.textContent = j.note;
+  } catch (_) { /* 交给 WS 推送 */ }
+}
+
+if (els.btnHelpAck) els.btnHelpAck.onclick = () => helpAction('ack');
+if (els.btnHelpCancel) els.btnHelpCancel.onclick = () => helpAction('cancel');
+if (els.btnHelpReset) els.btnHelpReset.onclick = () => helpAction('reset');
+
+async function loadHelp() {
+  try {
+    const j = await (await fetch('/api/help')).json();
+    HELP.channelReady = !!(j.channel && j.channel.portOpen);
+    renderHelp(j.help);
+  } catch (_) { /* 忽略 */ }
+}
+
 // ---------------------------------------------------------------- 分页路由
 // 单页应用 + hash 路由：地址栏 #live / #collect / #records，刷新不丢页面。
-const PAGES = ['live', 'collect', 'records'];
+const PAGES = ['live', 'collect', 'help', 'records'];
 function showPage(name) {
   if (!PAGES.includes(name)) name = 'live';
   S.page = name;
@@ -924,6 +1071,9 @@ function connect() {
       COLLECT.reportPaused = !!m.reportPaused;
       if (m.requests && m.requests.length) renderCollect(m.requests[0]);
       renderCollectMode();
+      // 教学求助：刷新页面后恢复当前状态
+      HELP.channelReady = !!(m.help && m.help.channelReady);
+      if (m.help) renderHelp(m.help);
       renderStatus();
       return;
     }
@@ -941,6 +1091,9 @@ function connect() {
       S.stale = !!m.stale;
       S.reportPaused = !!m.reportPaused;
       COLLECT.reportPaused = !!m.reportPaused;
+      // 串口状态变化会直接影响「回应能否送达」
+      HELP.channelReady = !!m.portOpen;
+      renderHelpChannel();
       if (m.config) {
         els.chkAuto.checked = !!m.config.autoReconnect;
         els.baudSelect.value = String(m.config.baudRate || 115200);
@@ -966,6 +1119,13 @@ function connect() {
     // 远程采集：请求状态变化（创建/下发/回执/完成/超时）
     if (m.type === 'collect') {
       renderCollect(m.request);
+      return;
+    }
+
+    // 教学求助：状态变化（收到求助 / 回应下发 / 板端回执 / 取消）
+    if (m.type === 'help') {
+      HELP.channelReady = !!(m.help && m.help.channelReady);
+      renderHelp(m.help);
       return;
     }
 
@@ -1003,6 +1163,7 @@ setInterval(loadPorts, 4000);
 renderStatus();
 loadCollect();
 renderCollectMode();
+loadHelp();
 connect();
 
 })();

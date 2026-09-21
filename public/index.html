@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ESP32-S3-EYE 三轴传感器监控</title>
-<link rel="stylesheet" href="/style.css?v=7" />
+<link rel="stylesheet" href="/style.css?v=8" />
 </head>
 <body>
 <div class="app">
@@ -42,6 +42,7 @@
   <nav class="pagenav" id="pageNav">
     <a href="#live"    class="pagetab" data-page="live">实时监控</a>
     <a href="#collect" class="pagetab" data-page="collect">远程采集</a>
+    <a href="#help"    class="pagetab" data-page="help">教学求助<span id="helpBadge" class="tab-badge hidden"></span></a>
     <a href="#records" class="pagetab" data-page="records">记录与设备</a>
   </nav>
 
@@ -156,7 +157,56 @@
       </div>
     </section>
 
-    <!-- ==================== ③ 记录与设备 ==================== -->
+    <!-- ==================== ③ 教学求助（第 3 周功能） ==================== -->
+    <section class="page" data-page="help">
+      <div class="grid">
+
+        <!-- 求助状态 -->
+        <section class="card help-hero">
+          <div class="card-head">
+            <h2>教学求助 · 当前状态</h2>
+            <span id="helpTag" class="tag">暂无求助</span>
+          </div>
+          <div id="helpAlert" class="help-alert">
+            <div class="ha-icon">·</div>
+            <div class="ha-body">
+              <strong id="helpTitle">当前没有求助</strong>
+              <p id="helpDesc">佩戴者按下开发板上的功能键后，这里会显示求助，并提示你回应。</p>
+            </div>
+          </div>
+          <div class="collect-actions">
+            <button id="btnHelpAck" class="btn btn-primary" disabled>我已收到</button>
+            <button id="btnHelpCancel" class="btn btn-ghost" disabled>取消求助</button>
+            <button id="btnHelpReset" class="btn btn-ghost">清除记录</button>
+          </div>
+          <div id="helpChannel" class="ctrl-note"></div>
+        </section>
+
+        <!-- 状态时间线 -->
+        <section class="card">
+          <div class="card-head">
+            <h2>状态时间线</h2>
+            <span id="helpId" class="mono req-id">—</span>
+          </div>
+          <ol id="helpSteps" class="steps"></ol>
+          <div id="helpNote" class="ctrl-note"></div>
+        </section>
+
+        <!-- 证据链 -->
+        <section class="card">
+          <div class="card-head"><h2>证据链（本地 → 远端 → 回应）</h2></div>
+          <div id="helpEvidence" class="obs-empty">尚无求助记录。</div>
+          <p class="hint">
+            <b>本地确认</b>由板端 LED + 屏幕完成，<b>不依赖网络</b>——断开外网按键，板子照样闪灯、显示「求助已发送」。<br>
+            <b>远端显示</b>只有服务端真正收到求助事件才会出现；<br>
+            <b>「对方已收到」</b>只有板端收到回应命令并回执后才显示——<b>没有证据绝不显示</b>。
+          </p>
+        </section>
+
+      </div>
+    </section>
+
+    <!-- ==================== ④ 记录与设备 ==================== -->
     <section class="page" data-page="records">
       <div class="grid">
 
@@ -229,6 +279,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=19"></script>
+<script src="/app.js?v=20"></script>
 </body>
 </html>

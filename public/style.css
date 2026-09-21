@@ -318,6 +318,35 @@ select { appearance: none; padding: 8px 32px 8px 12px; border: 1px solid var(--l
 .obs-check.ok { color: var(--ok); }
 .obs-check.no { color: var(--bad); }
 
+/* ---------------- 教学求助页（第 3 周） ---------------- */
+.tab-badge {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--bad); margin-left: 7px; vertical-align: middle;
+  box-shadow: 0 0 0 3px rgba(239,68,68,.18);
+  animation: pulse 1.4s infinite;
+}
+.tab-badge.hidden { display: none !important; }
+
+.help-hero { grid-column: 1 / -1; }
+.help-alert {
+  display: flex; gap: 14px; align-items: flex-start;
+  padding: 16px 18px; border-radius: 14px;
+  background: #f6f8fc; border: 1px solid var(--line); border-left: 4px solid var(--dim);
+}
+.help-alert.warn { background: #fff7e6; border-color: #f5d99b; border-left-color: var(--warn); }
+.help-alert.ok   { background: #e9f9ef; border-color: #b7e4c7; border-left-color: var(--ok); }
+.help-alert .ha-icon {
+  flex: none; width: 30px; height: 30px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 17px; font-weight: 700; color: #fff; background: var(--dim);
+}
+.help-alert.warn .ha-icon { background: var(--warn); }
+.help-alert.ok   .ha-icon { background: var(--ok); }
+.help-alert .ha-body strong { font-size: 15px; }
+.help-alert.warn .ha-body strong { color: #92400e; }
+.help-alert.ok   .ha-body strong { color: #166534; }
+.help-alert .ha-body p { margin: 4px 0 0; font-size: 12.5px; color: var(--ink2); }
+
 @media (max-width: 940px) {
   .grid { grid-template-columns: 1fr; }
   .meta-card, .chart-card { grid-column: 1 / -1; }

@@ -400,6 +400,11 @@ function mockDeviceReply(request_id) {
 
 /* 板端回执 */
 function onDeviceAck(request_id, status, seq, simulated) {
+  /* 板端回执：求助相关（help-*）路由到求助模块，不进采集请求表 */
+  if (typeof request_id === 'string' && request_id.startsWith('help-')) {
+    onHelpAck(request_id, status);
+    return;
+  }
   const r = REQUESTS.get(request_id);
   if (!r) return;
   if (r.status === 'completed' || r.status === 'timeout' || r.status === 'failed') return;
@@ -443,6 +448,165 @@ function onRequestTimeout(request_id) {
   r.timeout_at = Date.now();
   r.note = '未在限定时间内收到本次新观测。超时≠硬件故障，也不代表旧值有效。';
   pushRequest(r);
+}
+
+/* ------------------------------------------------------------------ */
+/* 教学求助（第 3 周）：按键 → 本地反馈 → 远端显示 → 回应 / 取消        */
+/*                                                                     */
+/* 当堂验证的两条硬指标，靠这里的数据流保证：                            */
+/*   ① 本地确认不依赖网络：板端 LED/LCD 在按下瞬间就变，与本模块无关；   */
+/*      本模块只记录「服务端确实收到了求助事件」这一事实。                */
+/*   ② 无远端接收证据不得显示「对方已收到」：                            */
+/*      - 服务端只有【真正收到】板端 help 事件，才把状态置为 received；   */
+/*      - 网页只有【命令确实写出串口】才显示「回应已下发」；              */
+/*      - 板端只有【收到 viewer_ack 命令】才显示「对方已收到」；          */
+/*      - 板端回执 ack_shown 回来后，才把 ack_delivered 标为 true。       */
+/* ------------------------------------------------------------------ */
+const HELP_KEEP = 20;
+const help = {
+  active: false,
+  help_id: null,
+  device_id: null,
+  status: 'idle',          // idle | received | acknowledged | cancelled
+  event: null,             // request | cancel
+  received_at: null,       // 服务端收到求助的时刻
+  board_ts: null,          // 板端时间戳（毫秒 UTC）
+  seq: null,               // 板端序号
+  ack_sent_at: null,       // 网页点「已收到」的时刻
+  ack_channel_ok: null,    // 回应命令是否成功写出串口
+  ack_delivered: null,     // 板端回执确认已显示（true/false/null=等待）
+  cancelled_at: null,
+  note: null,
+  history: [],             // 最近 N 条事件（时间 + 事件名）
+};
+
+function publicHelp() {
+  return {
+    active: help.active,
+    help_id: help.help_id,
+    device_id: help.device_id,
+    status: help.status,
+    event: help.event,
+    received_at: help.received_at,
+    board_ts: help.board_ts,
+    seq: help.seq,
+    ack_sent_at: help.ack_sent_at,
+    ack_channel_ok: help.ack_channel_ok,
+    ack_delivered: help.ack_delivered,
+    cancelled_at: help.cancelled_at,
+    note: help.note,
+    history: help.history.slice(-HELP_KEEP),
+    mockDevice: !!config.mockDevice,
+    channelReady: !!(port && port.isOpen),
+  };
+}
+
+function pushHelp() { broadcast({ type: 'help', help: publicHelp() }); }
+
+function helpLog(ev, detail) {
+  help.history.push({ at: Date.now(), ev, detail: detail || null });
+  if (help.history.length > HELP_KEEP) help.history.shift();
+}
+
+/** 板端上报的求助事件（request / cancel）—— 这是「远端接收」的唯一证据来源 */
+function onHelpEvent(obj) {
+  const ev = obj.event === 'cancel' ? 'cancel' : 'request';
+  if (ev === 'request') {
+    help.active = true;
+    help.help_id = obj.help_id || null;
+    help.device_id = obj.device || state.deviceId || null;
+    help.status = 'received';
+    help.event = 'request';
+    help.received_at = Date.now();
+    help.board_ts = typeof obj.ts === 'number' ? obj.ts : null;
+    help.seq = typeof obj.seq === 'number' ? obj.seq : null;
+    help.ack_sent_at = null; help.ack_channel_ok = null; help.ack_delivered = null;
+    help.cancelled_at = null;
+    help.note = '已收到板端求助 —— 这是「远端接收」的证据。等待查看者回应。';
+    helpLog('received', obj.help_id);
+    console.log(`[help] 收到求助 ${obj.help_id} ← ${help.device_id}`);
+  } else {
+    help.active = false;
+    help.status = 'cancelled';
+    help.event = 'cancel';
+    help.cancelled_at = Date.now();
+    help.note = '佩戴者已取消求助（板端本地已显示「已取消」）。';
+    helpLog('cancelled', obj.help_id);
+    console.log(`[help] 收到取消 ${obj.help_id}`);
+  }
+  pushHelp();
+}
+
+/** 网页回应：把 viewer_ack 下发到板端 */
+function createHelpAck() {
+  if (!help.active || help.status === 'cancelled') {
+    return { ok: false, note: '当前没有待回应的求助。' };
+  }
+  const rid = help.help_id || `help-${Date.now()}`;
+  const ok = sendCommand({ cmd: 'viewer_ack', request_id: rid });
+  help.ack_sent_at = Date.now();
+  help.ack_channel_ok = ok;
+  if (ok) {
+    help.status = 'acknowledged';
+    help.ack_delivered = null;   // 等板端回执
+    help.note = '回应已下发到设备，等待板端回执确认显示。';
+    helpLog('ack_sent', rid);
+  } else if (config.mockDevice) {
+    help.status = 'acknowledged';
+    help.ack_delivered = null;
+    help.note = '模拟模式：回应未走真实串口（仅供联调，不代表板端已显示）。';
+    helpLog('ack_mock', rid);
+  } else {
+    help.status = 'received';    // 未送达 → 状态不前进
+    help.note = '⚠ 回应未送达设备：命令通道不可用（串口未打开）。板端不会显示「对方已收到」。';
+    helpLog('ack_failed', rid);
+  }
+  pushHelp();
+  return { ok, note: help.note };
+}
+
+/** 网页取消 */
+function createHelpCancel() {
+  if (!help.active && help.status === 'idle') {
+    return { ok: false, note: '当前没有进行中的求助。' };
+  }
+  const rid = help.help_id || `help-${Date.now()}`;
+  const ok = sendCommand({ cmd: 'help_cancel', request_id: rid });
+  help.status = 'cancelled';
+  help.active = false;
+  help.cancelled_at = Date.now();
+  help.note = ok ? '查看者已取消，取消命令已下发到设备。'
+                 : '已标记取消（命令通道不可用，板端未收到取消命令）。';
+  helpLog('cancel_sent', rid);
+  pushHelp();
+  return { ok, note: help.note };
+}
+
+/** 板端回执：确认「对方已收到」是否真的已在板端显示 */
+function onHelpAck(help_id, status) {
+  if (help.help_id && help_id && help.help_id !== help_id) return;
+  if (status === 'ack_shown') {
+    help.ack_delivered = true;
+    help.status = 'acknowledged';
+    help.note = '板端已回执：屏幕已显示「对方已收到」。';
+    helpLog('ack_delivered', help_id);
+  } else if (status === 'no_active_help') {
+    help.ack_delivered = false;
+    help.note = '板端回执：当前没有进行中的求助，未显示「对方已收到」。';
+    helpLog('ack_rejected', help_id);
+  } else if (status === 'cancelled') {
+    helpLog('cancel_delivered', help_id);
+  }
+  pushHelp();
+}
+
+function resetHelp() {
+  help.active = false; help.help_id = null; help.status = 'idle'; help.event = null;
+  help.received_at = null; help.board_ts = null; help.seq = null;
+  help.ack_sent_at = null; help.ack_channel_ok = null; help.ack_delivered = null;
+  help.cancelled_at = null; help.note = null;
+  helpLog('reset', null);
+  pushHelp();
 }
 
 function pushStatus(reason) {
@@ -628,6 +792,13 @@ function handleLine(line, source) {
           stats.linesValid++;
           pushRaw(trimmed, true);
           onDeviceAck(obj.request_id, obj.status, obj.seq);
+          return;
+        }
+        // 教学求助事件（第 3 周）：板端按键/取消，单独处理，不当作传感数据
+        if (obj.type === 'help') {
+          stats.linesValid++;
+          pushRaw(trimmed, true);
+          onHelpEvent(obj);
           return;
         }
         const n = {};
@@ -1119,6 +1290,34 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // ---- 教学求助（第 3 周）：查询当前状态 ----
+  if (p === '/api/help' && req.method === 'GET') {
+    return json(res, 200, {
+      ok: true,
+      help: publicHelp(),
+      channel: { portOpen: !!(port && port.isOpen), cmdSent: stats.cmdSent || 0 },
+    });
+  }
+
+  // ---- 教学求助：查看者回应 / 取消 / 复位 ----
+  if (p === '/api/help' && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    if (body.action === 'ack') {
+      const r = createHelpAck();
+      return json(res, 200, { ok: r.ok, note: r.note, help: publicHelp() });
+    }
+    if (body.action === 'cancel') {
+      const r = createHelpCancel();
+      return json(res, 200, { ok: r.ok, note: r.note, help: publicHelp() });
+    }
+    if (body.action === 'reset') {
+      resetHelp();
+      return json(res, 200, { ok: true, help: publicHelp() });
+    }
+    return json(res, 400, { error: 'unknown action' });
+  }
+
   // ---- 波特率探测 ----
   if (p === '/api/probe' && req.method === 'POST') {
     let body = {};
@@ -1295,6 +1494,8 @@ wss.on('connection', (ws) => {
     requests: recentRequests(10),
     mockDevice: !!config.mockDevice,
     collectTimeoutMs: collectTimeoutMs(),
+    // 教学求助：刷新页面后恢复当前求助状态
+    help: publicHelp(),
   }));
   pushStatus('client');
 });

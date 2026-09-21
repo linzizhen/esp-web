@@ -39,8 +39,15 @@
 
 #include "driver/i2c_master.h"
 #include "driver/temperature_sensor.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_adc/adc_oneshot.h"
 
 #include "app_config.h"
+#include "lcd_font.h"
 
 static const char *TAG = "S3EYE";
 
@@ -58,6 +65,36 @@ static const char *TAG = "S3EYE";
 
 #define I2C_SDA_GPIO    4
 #define I2C_SCL_GPIO    5
+
+/* ---------------------- 按键 / LED / LCD（第 3 周：物理反馈闭环） ----------------------
+ * 硬件依据（官方 ESP32-S3-EYE v2.2 用户指南 + esp-bsp，非猜测）：
+ *   - 板载仅 1 颗可编程 LED（Module Power LED，绿色）接 GPIO3，
+ *     ★ 必须用「开漏输出」：软件拉高会烧 LED（v2.2 已加 R83 限流，仍应遵守）
+ *   - 6 个功能按键走电阻分压 → ADC1_CH0（GPIO1）；无按键时被上拉至接近满量程，
+ *     按下不同键得到不同电压（esp-bsp 参考值 2410/1980/820/380，另 BOOT 键=GPIO0）
+ *   - LCD 1.3" 240x240 ST7789，SPI3：PCLK=21 / MOSI=47 / DC=43 / CS=44 / 背光=48
+ *     （GPIO43/44 是 UART0 的 TX/RX，但本固件控制台走 USB-Serial-JTAG，故可自由使用）
+ *   - 板载【没有】扬声器/蜂鸣器，实体反馈只能用 LED + LCD
+ * ------------------------------------------------------------------ */
+#define LED_GPIO        3
+#define BTN_ADC_CH      ADC_CHANNEL_0    /* = GPIO1 */
+#define LCD_SCLK_GPIO   21
+#define LCD_MOSI_GPIO   47
+#define LCD_DC_GPIO     43
+#define LCD_CS_GPIO     44
+#define LCD_BL_GPIO     48
+#define LCD_H_RES       240
+#define LCD_V_RES       240
+
+/* RGB565 常用色 */
+#define RGB565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
+#define C_BLACK   RGB565(0, 0, 0)
+#define C_WHITE   RGB565(255, 255, 255)
+#define C_RED     RGB565(220, 50, 50)
+#define C_GREEN   RGB565(30, 160, 80)
+#define C_GRAY    RGB565(70, 78, 90)
+#define C_BLUE    RGB565(50, 110, 220)
+#define C_DIM     RGB565(150, 158, 170)
 
 static i2c_master_bus_handle_t  s_bus = NULL;
 static i2c_master_dev_handle_t  s_dev = NULL;
@@ -267,10 +304,10 @@ static void time_sync(void)
 
 /* ===================== HTTP 上传 ===================== */
 
-static bool http_upload(const char *body)
+static bool http_post(const char *path, const char *body)
 {
-    char url[96];
-    snprintf(url, sizeof(url), "http://%s:%d/api/data", APP_SERVER_HOST, APP_SERVER_PORT);
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d%s", APP_SERVER_HOST, APP_SERVER_PORT, path);
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -286,6 +323,387 @@ static bool http_upload(const char *body)
     int status = esp_http_client_get_status_code(c);
     esp_http_client_cleanup(c);
     return (err == ESP_OK && status == 200);
+}
+
+static bool http_upload(const char *body)
+{
+    return http_post("/api/data", body);
+}
+
+/* ===================== 本地反馈（LED + LCD）与按键（第 3 周） =====================
+ *
+ * 闭环设计（与网页/服务端配合）：
+ *   佩戴者按键
+ *     ├─ 立即本地反馈（不依赖网络）：LED 快闪 + LCD「求助已发送」  ← 断开外网也必须成立
+ *     └─ 再上报 help_request（USB 串口 + WiFi）→ 服务端 → 网页
+ *   查看者点「已收到」→ 服务端下发 viewer_ack → 板端 LCD「对方已收到」+ LED 慢闪
+ *   佩戴者再次按键 = 取消 → 本地「已取消」+ 上报 help_cancel
+ *
+ * 硬约束：没有收到 viewer_ack 之前，板端绝不显示「对方已收到」。
+ * ================================================================= */
+
+/* ---------------------- LED（GPIO3，开漏） ---------------------- */
+typedef enum { LED_OFF = 0, LED_FAST, LED_SLOW } led_mode_t;
+
+static void led_init(void)
+{
+    gpio_config_t c = {
+        .pin_bit_mask = 1ULL << LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT_OD,          /* ★ 开漏：拉高会烧 LED */
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&c);
+    gpio_set_level(LED_GPIO, 1);              /* 高阻 = 灭 */
+}
+
+static inline void led_write(bool on) { gpio_set_level(LED_GPIO, on ? 0 : 1); }
+
+/* ---------------------- LCD（ST7789, SPI3） ---------------------- */
+static esp_lcd_panel_handle_t s_lcd = NULL;
+static bool s_lcd_ok = false;
+
+static void lcd_init(void)
+{
+    gpio_config_t bl = {
+        .pin_bit_mask = 1ULL << LCD_BL_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&bl);
+    gpio_set_level(LCD_BL_GPIO, 0);           /* 先关背光，避免上电白屏闪 */
+
+    spi_bus_config_t buscfg = {
+        .sclk_io_num = LCD_SCLK_GPIO,
+        .mosi_io_num = LCD_MOSI_GPIO,
+        .miso_io_num = -1,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    if (spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO) != ESP_OK) {
+        ESP_LOGW(TAG, "LCD SPI3 总线初始化失败，跳过屏幕");
+        return;
+    }
+    esp_lcd_panel_io_handle_t io = NULL;
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .dc_gpio_num = LCD_DC_GPIO,
+        .cs_gpio_num = LCD_CS_GPIO,
+        .pclk_hz = 40 * 1000 * 1000,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+    };
+    if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI3_HOST, &io_cfg, &io) != ESP_OK) {
+        ESP_LOGW(TAG, "LCD IO 创建失败，跳过屏幕");
+        return;
+    }
+    esp_lcd_panel_dev_config_t pcfg = {
+        .reset_gpio_num = -1,                  /* 本板 LCD_RST 未接 GPIO，走软复位 */
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        .bits_per_pixel = 16,
+    };
+    if (esp_lcd_new_panel_st7789(io, &pcfg, &s_lcd) != ESP_OK) {
+        ESP_LOGW(TAG, "ST7789 面板创建失败，跳过屏幕");
+        return;
+    }
+    esp_lcd_panel_reset(s_lcd);
+    esp_lcd_panel_init(s_lcd);
+    esp_lcd_panel_invert_color(s_lcd, true);
+    esp_lcd_panel_swap_xy(s_lcd, false);
+    esp_lcd_panel_mirror(s_lcd, false, false);
+    esp_lcd_panel_set_gap(s_lcd, 0, 0);
+    esp_lcd_panel_disp_on_off(s_lcd, true);
+    s_lcd_ok = true;
+    gpio_set_level(LCD_BL_GPIO, 1);           /* 开背光 */
+    ESP_LOGI(TAG, "LCD 初始化完成（240x240 ST7789, SPI3）");
+}
+
+static void lcd_fill(uint16_t color)
+{
+    if (!s_lcd_ok) return;
+    static uint16_t line[LCD_H_RES];
+    for (int i = 0; i < LCD_H_RES; i++) line[i] = color;
+    for (int y = 0; y < LCD_V_RES; y++) {
+        esp_lcd_panel_draw_bitmap(s_lcd, 0, y, LCD_H_RES, y + 1, line);
+    }
+}
+
+/* 画一个 32x32 汉字（不在字库内则跳过） */
+static void lcd_draw_zh(int x, int y, uint32_t cp, uint16_t fg, uint16_t bg)
+{
+    if (!s_lcd_ok) return;
+    int idx = -1;
+    for (size_t i = 0; i < LCD_ZH_COUNT; i++) {
+        if (LCD_ZH_CP[i] == cp) { idx = (int)i; break; }
+    }
+    if (idx < 0) return;
+    static uint16_t buf[LCD_ZH_W * LCD_ZH_H];
+    const uint8_t *bmp = LCD_ZH_BMP[idx];
+    for (int r = 0; r < LCD_ZH_H; r++) {
+        for (int c = 0; c < LCD_ZH_W; c++) {
+            int on = (bmp[r * (LCD_ZH_W / 8) + (c / 8)] >> (7 - (c % 8))) & 1;
+            buf[r * LCD_ZH_W + c] = on ? fg : bg;
+        }
+    }
+    esp_lcd_panel_draw_bitmap(s_lcd, x, y, x + LCD_ZH_W, y + LCD_ZH_H, buf);
+}
+
+/* 画一个 8x16 ASCII 字符 */
+static void lcd_draw_ascii(int x, int y, char ch, uint16_t fg, uint16_t bg)
+{
+    if (!s_lcd_ok) return;
+    unsigned c = (unsigned char)ch;
+    if (c < 0x20 || c > 0x7E) c = '?';
+    static uint16_t buf[LCD_ASCII_W * LCD_ASCII_H];
+    const uint8_t *bmp = LCD_ASCII_BMP[c - 0x20];
+    for (int r = 0; r < LCD_ASCII_H; r++) {
+        for (int col = 0; col < LCD_ASCII_W; col++) {
+            int on = (bmp[r] >> (7 - col)) & 1;
+            buf[r * LCD_ASCII_W + col] = on ? fg : bg;
+        }
+    }
+    esp_lcd_panel_draw_bitmap(s_lcd, x, y, x + LCD_ASCII_W, y + LCD_ASCII_H, buf);
+}
+
+/* 解码一个 UTF-8 字符，返回消耗字节数（0 = 结束） */
+static int utf8_next(const char *s, uint32_t *cp)
+{
+    unsigned char c = (unsigned char)s[0];
+    if (!c) return 0;
+    if (c < 0x80) { *cp = c; return 1; }
+    if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
+        *cp = ((c & 0x1F) << 6) | (s[1] & 0x3F); return 2;
+    }
+    if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
+        *cp = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); return 3;
+    }
+    if ((c & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 && (s[3] & 0xC0) == 0x80) {
+        *cp = ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); return 4;
+    }
+    *cp = '?'; return 1;
+}
+
+/* 居中显示一行汉字 */
+static void lcd_show_zh_line(const char *utf8, int y, uint16_t fg, uint16_t bg)
+{
+    if (!s_lcd_ok) return;
+    int n = 0;
+    const char *p = utf8;
+    uint32_t cp;
+    while (*p) { int k = utf8_next(p, &cp); if (!k) break; n++; p += k; }
+    if (!n) return;
+    int x = (LCD_H_RES - n * LCD_ZH_W) / 2;
+    p = utf8;
+    while (*p) {
+        int k = utf8_next(p, &cp);
+        if (!k) break;
+        lcd_draw_zh(x, y, cp, fg, bg);
+        x += LCD_ZH_W;
+        p += k;
+    }
+}
+
+/* 居中显示一行 ASCII */
+static void lcd_show_ascii_line(const char *s, int y, uint16_t fg, uint16_t bg)
+{
+    if (!s_lcd_ok) return;
+    int n = (int)strlen(s);
+    if (!n) return;
+    int x = (LCD_H_RES - n * LCD_ASCII_W) / 2;
+    for (int i = 0; i < n; i++) lcd_draw_ascii(x + i * LCD_ASCII_W, y, s[i], fg, bg);
+}
+
+/* ---------------------- 求助状态机（板端） ---------------------- */
+typedef enum { HELP_IDLE = 0, HELP_SENT, HELP_ACKED, HELP_CANCELLED } help_state_t;
+
+static volatile help_state_t s_help = HELP_IDLE;
+static volatile int          s_scr = 0;          /* 0=空闲 1=已发送 2=已收到 3=已取消 */
+static char                  s_help_id[48] = "";
+static uint32_t              s_help_counter = 0;
+
+static void new_help_id(char *out, size_t cap)
+{
+    s_help_counter++;
+    time_t t = time(NULL);
+    if (t > 1700000000) {
+        struct tm ti;
+        gmtime_r(&t, &ti);
+        snprintf(out, cap, "help-%04d%02d%02d-%02d%02d%02d-%04lu",
+                 ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                 ti.tm_hour, ti.tm_min, ti.tm_sec, (unsigned long)s_help_counter);
+    } else {
+        snprintf(out, cap, "help-boot-%04lu", (unsigned long)s_help_counter);
+    }
+}
+
+/* 上报一次求助事件（USB 串口 + WiFi 双通道，与数据帧同样的传输方式） */
+static void send_help_event(const char *event)
+{
+    char body[384];
+    int n = 0;
+    n += snprintf(body + n, sizeof(body) - n,
+                  "{\"type\":\"help\",\"event\":\"%s\",\"help_id\":\"%s\","
+                  "\"device\":\"%s\",\"mac\":\"%s\",\"seq\":%lu,\"src\":\"s3eye\"",
+                  event, s_help_id, APP_DEVICE_ID, s_mac, (unsigned long)s_seq);
+    time_t t = time(NULL);
+    if (t > 1700000000) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        struct tm ti;
+        gmtime_r(&t, &ti);
+        char iso[32];
+        strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &ti);
+        n += snprintf(body + n, sizeof(body) - n, ",\"ts\":%llu,\"iso\":\"%s\"",
+                      (unsigned long long)t * 1000ULL + (unsigned long long)(tv.tv_usec / 1000), iso);
+    }
+    n += snprintf(body + n, sizeof(body) - n, "}");
+
+    printf("%s\n", body);                 /* 通道 1：USB 串口 */
+    if (wifi_wait(0)) {                   /* 通道 2：WiFi（失败不影响本地反馈） */
+        http_post("/api/data", body);
+    }
+}
+
+/* 按键事件：本地反馈【立即】执行，之后才尝试上报 —— 断开外网也照样确认 */
+static void on_button_press(int raw)
+{
+    if (s_help == HELP_SENT) {
+        s_help = HELP_CANCELLED;
+        s_scr  = 3;
+        ESP_LOGI(TAG, "按键：取消求助 (raw=%d) help_id=%s", raw, s_help_id);
+        send_help_event("cancel");
+    } else {
+        new_help_id(s_help_id, sizeof(s_help_id));
+        s_help = HELP_SENT;
+        s_scr  = 1;
+        ESP_LOGI(TAG, "按键：发起求助 (raw=%d) help_id=%s", raw, s_help_id);
+        send_help_event("request");
+    }
+}
+
+/* ---------------------- 按键扫描（ADC 电阻分压，GPIO1） ---------------------- */
+static adc_oneshot_unit_handle_t s_adc = NULL;
+static int s_btn_idle = 0;
+
+static void btn_init(void)
+{
+    adc_oneshot_unit_init_cfg_t u = { .unit_id = ADC_UNIT_1 };
+    if (adc_oneshot_new_unit(&u, &s_adc) != ESP_OK) {
+        ESP_LOGW(TAG, "ADC 初始化失败，按键不可用");
+        s_adc = NULL;
+        return;
+    }
+    adc_oneshot_chan_cfg_t ch = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    adc_oneshot_config_channel(s_adc, BTN_ADC_CH, &ch);
+}
+
+static void btn_task(void *arg)
+{
+    (void)arg;
+    if (!s_adc) { vTaskDelete(NULL); return; }
+
+    /* 上电校准：此时无人按键，取最大读数作为"空闲"基准（自适应不同板子/批次） */
+    int idle = 0;
+    for (int i = 0; i < 60; i++) {
+        int v = 0;
+        if (adc_oneshot_read(s_adc, BTN_ADC_CH, &v) == ESP_OK && v > idle) idle = v;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    s_btn_idle = idle;
+    int th = idle - 500;
+    if (th < 300) th = 300;                       /* 兜底：基准异常时仍能触发 */
+    ESP_LOGI(TAG, "按键 ADC 校准：空闲=%d，按下判定阈值<%d（按下不同键读数更低）", idle, th);
+
+    bool debounced = false, cand = false;
+    int same = 0;
+    int64_t last_dbg = 0;
+    while (1) {
+        int v = 0;
+        if (adc_oneshot_read(s_adc, BTN_ADC_CH, &v) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
+        bool p = (v < th);
+        if (p == cand) { if (same < 4) same++; }
+        else { cand = p; same = 1; }
+
+        if (same >= 3 && cand != debounced) {
+            debounced = cand;
+            if (debounced) on_button_press(v);
+        }
+        /* 每 2 秒打印一次原始读数，便于现场校准阈值 */
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - last_dbg > 2000) {
+            last_dbg = now;
+            ESP_LOGD(TAG, "按键 ADC 原始值=%d（空闲基准 %d）", v, s_btn_idle);
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
+/* ---------------------- UI 任务：按状态刷新 LED 与 LCD ---------------------- */
+static void ui_task(void *arg)
+{
+    (void)arg;
+    int last_scr = -1;
+    led_mode_t led = LED_OFF;
+    int64_t last_toggle = 0;
+    bool led_on = false;
+
+    while (1) {
+        int cur = s_scr;
+        if (cur != last_scr) {
+            last_scr = cur;
+            switch (cur) {
+            case 1:  /* 已发送（本地确认，不依赖网络） */
+                lcd_fill(C_RED);
+                lcd_show_zh_line("求助已发送", 76, C_WHITE, C_RED);
+                lcd_show_zh_line("等待回应", 124, C_WHITE, C_RED);
+                lcd_show_ascii_line(APP_DEVICE_ID, 205, C_WHITE, C_RED);
+                led = LED_FAST;
+                break;
+            case 2:  /* 已收到回应（仅当收到 viewer_ack 才进入） */
+                lcd_fill(C_GREEN);
+                lcd_show_zh_line("对方已收到", 90, C_WHITE, C_GREEN);
+                lcd_show_ascii_line(APP_DEVICE_ID, 205, C_WHITE, C_GREEN);
+                led = LED_SLOW;
+                break;
+            case 3:  /* 已取消 */
+                lcd_fill(C_GRAY);
+                lcd_show_zh_line("已取消", 90, C_WHITE, C_GRAY);
+                lcd_show_ascii_line(APP_DEVICE_ID, 205, C_WHITE, C_GRAY);
+                led = LED_OFF;
+                break;
+            default: /* 空闲 */
+                lcd_fill(C_BLACK);
+                lcd_show_zh_line("空闲", 90, C_WHITE, C_BLACK);
+                lcd_show_ascii_line(APP_DEVICE_ID, 205, C_DIM, C_BLACK);
+                led = LED_OFF;
+                break;
+            }
+        }
+
+        /* LED：快闪=求助中；慢闪=对方已收到；灭=空闲/已取消 */
+        int64_t now = esp_timer_get_time() / 1000;
+        int half = led == LED_FAST ? 100 : led == LED_SLOW ? 450 : 0;
+        if (half == 0) {
+            led_write(false);
+            led_on = false;
+        } else if (now - last_toggle >= half) {
+            last_toggle = now;
+            led_on = !led_on;
+            led_write(led_on);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 /* ===================== 主程序 ===================== */
@@ -443,6 +861,25 @@ static void handle_command(const char *line)
         ESP_LOGI(TAG, "周期上报已恢复");
     } else if (strcmp(cmd, "ping") == 0) {
         cmd_ack(rid, "pong");
+    } else if (strcmp(cmd, "viewer_ack") == 0) {
+        /* 查看者已回应 —— 只有收到这条命令，板端才允许显示「对方已收到」 */
+        if (s_help == HELP_SENT) {
+            s_help = HELP_ACKED;
+            s_scr  = 2;
+            cmd_ack(rid, "ack_shown");
+            ESP_LOGI(TAG, "收到查看者回应：板端显示「对方已收到」");
+        } else {
+            cmd_ack(rid, "no_active_help");
+        }
+    } else if (strcmp(cmd, "help_cancel") == 0) {
+        s_help = HELP_CANCELLED;
+        s_scr  = 3;
+        cmd_ack(rid, "cancelled");
+        ESP_LOGI(TAG, "收到远端取消：板端显示「已取消」");
+    } else if (strcmp(cmd, "help_reset") == 0) {
+        s_help = HELP_IDLE;
+        s_scr  = 0;
+        cmd_ack(rid, "idle");
     } else {
         cmd_ack(rid, "unknown_cmd");
     }
@@ -490,6 +927,14 @@ void app_main(void)
     if (!s_imu_ok) {
         ESP_LOGW(TAG, "IMU 不可用，将只上报芯片内部温度（仍是真实传感源）");
     }
+
+    /* 第 3 周：本地实体反馈（LED + LCD）与按键 —— 放在联网之前，
+     * 保证「断开外网也能本地确认按键已触发」这条硬指标成立。 */
+    led_init();
+    lcd_init();
+    btn_init();
+    xTaskCreate(ui_task,  "ui",  4096, NULL, 4, NULL);
+    xTaskCreate(btn_task, "btn", 3072, NULL, 4, NULL);
 
     wifi_init();
     if (wifi_wait(15000)) {

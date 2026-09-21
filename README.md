@@ -78,7 +78,8 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 ├── scripts/
 │   └── idfwrap.py            # ESP-IDF 构建/烧录封装（自动注入工具链环境）
 ├── docs/
-│   └── week2-remote-collect.md  # 第 2 周：远程采集协议、状态图、时序图、实测记录
+│   ├── week2-remote-collect.md  # 第 2 周：远程采集协议、状态图、时序图、实测记录
+│   └── week3-button-feedback.md # 第 3 周：按键触发与物理反馈闭环（协议/状态图/时序图/实测）
 ├── data/                     # NDJSON 原始记录（持久化存储，运行后生成）
 ├── recordings/               # 录制导出的 CSV（运行后生成）
 ├── public/
@@ -89,8 +90,11 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   ├── s3eye_imu_idf/        # ★ 当前使用：ESP-IDF 工程（QMA7981 三轴 + 10Hz 上报 + 校准）
 │   │   ├── CMakeLists.txt
 │   │   ├── sdkconfig.defaults
+│   │   ├── tools/
+│   │   │   └── gen_font.py   # LCD 点阵字模生成脚本（输出 lcd_font.h + 预览图）
 │   │   └── main/
-│   │       ├── main.c        # 主程序：IMU 读取 / JSON 组帧 / USB-CDC + WiFi 上报
+│   │       ├── main.c        # 主程序：IMU / JSON 组帧 / USB-CDC + WiFi 上报 / 按键 / LED / LCD
+│   │       ├── lcd_font.h    # 自动生成的点阵字模（中文 32×32 × 25 字 + ASCII 8×16）
 │   │       └── app_config.h  # ★ 唯一需要改的配置：WiFi 凭据 / 服务器 IP / 设备 ID
 │   ├── esp32_monitor.ino       # （旧）Arduino USB 串口版草稿
 │   ├── esp32_monitor_wifi.ino  # （旧）Arduino 通用 WiFi 版草稿
@@ -187,7 +191,9 @@ temperature:26.5 humidity:58.2
 | GET | `/api/collect` | **远程采集**：最近请求列表（页面刷新后恢复显示）+ 通道状态 + `mockDevice` |
 | GET | `/api/collect/:id` | **远程采集**：查询单个请求的完整状态 |
 | POST | `/api/report` | **周期上报开关**：`{action:'pause'\|'resume'}`（命令通道保持可用） |
-| WS | `/ws` | 实时推送 `sample` / `status` / `raw` / `cleared` / `stale` / `hello` / `collect` |
+| GET | `/api/help` | **教学求助**：当前求助状态 + 命令通道状态 |
+| POST | `/api/help` | **教学求助**：`{action:'ack'\|'cancel'\|'reset'}` 查看者回应 / 取消 / 复位 |
+| WS | `/ws` | 实时推送 `sample` / `status` / `raw` / `cleared` / `stale` / `hello` / `collect` / `help` |
 
 ## 六之一、ESP32-S3-EYE 专项说明
 
@@ -280,6 +286,57 @@ Web 页「**远程采集**」标签页可向开发板**下发一次立即采集�
 **所有模拟结果都带 `simulated` 标记**，界面显示红色「模拟」徽章，绝不冒充实物命令。
 
 > 完整说明（含状态图、时序图、实测记录）见 [`docs/week2-remote-collect.md`](docs/week2-remote-collect.md)。
+
+## 六之四、教学求助（第 3 周）
+
+Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + 屏幕**组成一个物理反馈闭环。
+
+### 三种反馈，三层含义
+
+| 阶段 | 谁看到 | 形式 | 依赖网络？ |
+|------|--------|------|-----------|
+| ① 本地确认 | 佩戴者 | 板端 **LED 快闪** + 屏幕「求助已发送」 | ❌ 不依赖 |
+| ② 远端接收 | 查看者 | 网页出现求助 + 导航红点 | ✅ |
+| ③ 查看者回应 | 双方 | 网页点「我已收到」→ 板端 **LED 慢闪** + 屏幕「对方已收到」 | ✅ |
+
+### 两条硬指标（当堂验证）
+
+1. **断开外网后，本地仍能确认按键已触发** —— 板端 LED/屏幕在按下瞬间变化，上报失败不影响它们。
+2. **无远端接收证据时，绝不显示「对方已收到」** ——
+   - 服务端只有真正收到板端求助事件才把状态置为 `received`；
+   - 网页只有**命令确实写出串口**才显示"回应已下发"；
+   - 板端**只有收到 `viewer_ack` 命令**才显示「对方已收到」，并回执 `ack_shown` 供网页确认。
+
+### 硬件（ESP32-S3-EYE v2.2 官方资料）
+
+| 用途 | 引脚 | 约束 |
+|------|------|------|
+| 功能按键（ADC 电阻分压） | GPIO1 (ADC1_CH0) | 上电自适应校准阈值 |
+| Module Power LED | **GPIO3** | ★ **必须开漏输出**，拉高会烧 LED |
+| LCD 1.3" 240×240 ST7789 | PCLK=21 / MOSI=47 / DC=43 / CS=44 / 背光=48 | SPI3 |
+| 蜂鸣器 | **板载没有** | 实体反馈用 LED + 屏幕实现 |
+
+### 协议
+
+```jsonc
+// 上行（板端 → 服务端，复用数据帧同一条链路）
+{"type":"help","event":"request","help_id":"help-...","device":"...","seq":130,...}
+{"type":"help","event":"cancel","help_id":"help-...",...}
+// 下行（服务端 → 板端）
+{"cmd":"viewer_ack","request_id":"help-..."}
+{"cmd":"help_cancel","request_id":"help-..."}
+// 板端回执
+{"type":"ack","request_id":"help-...","status":"ack_shown"}
+```
+
+### 界面
+
+- 导航「教学求助」上的**红点**：有待回应的求助时提示
+- 三个按钮：**我已收到** / **取消求助** / **清除记录**
+- **状态时间线** + **证据链**（本地反馈 / 服务端接收时刻 / 板端时间偏差 / 命令是否送达 / 板端是否回执）
+
+> 完整说明（含板端与服务端状态图、时序图、实测记录、迁移说明）见
+> [`docs/week3-button-feedback.md`](docs/week3-button-feedback.md)。
 
 ## 七、排查：板子插上了但没数据
 
