@@ -313,6 +313,11 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
+    /* 排查"关联成功却拿不到 IP"时打开 DHCP 客户端详细日志：
+     * 能看到 DISCOVER 是否发出、有没有收到 OFFER。定位完可关掉。 */
+    esp_log_level_set("dhcpc", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_netif_lwip", ESP_LOG_DEBUG);
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
@@ -324,6 +329,12 @@ static void wifi_init(void)
     wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* 兼容开放/各类加密 */
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    /* 关闭 WiFi 省电（modem sleep）。
+     * 实测坑：默认省电模式下，某些 AP/路由器（尤其廉价家用路由）会丢掉
+     * DHCP 响应，表现为日志里 "wifi:connected with XXX" 成功、却永远拿不到 IP。
+     * 关掉后即可正常拿到地址。代价是功耗略高，本项目由 USB/电源供电，无影响。 */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
 #if WIFI_SCAN_ON_BOOT
     /* 先抑制自动连接，让 STA 停在空闲态再做扫描 ——
@@ -1129,7 +1140,18 @@ void app_main(void)
     if (wifi_wait(15000)) {
         time_sync();
     } else {
-        ESP_LOGW(TAG, "WiFi 未连上（请检查 app_config.h）。仍会通过 USB 串口输出 JSON。");
+        /* 区分两种失败，排查方向完全不同：
+         *   A) 根本没关联上 → SSID/密码/频段（2.4G？）问题
+         *   B) 关联成功但没拿到 IP → DHCP 无响应（AP 限制、省电丢包等） */
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            ESP_LOGW(TAG, "★ 已关联到 \"%s\"（rssi=%d）但未取得 IP —— 属于 DHCP 无响应。"
+                          "常见原因：AP 做了 MAC/客户端限制，或省电模式丢包。"
+                          "仍会通过 USB 串口输出 JSON。", APP_WIFI_SSID, ap.rssi);
+        } else {
+            ESP_LOGW(TAG, "WiFi 未连上（请检查 app_config.h 的 SSID/密码，"
+                          "并确认该热点在 2.4GHz 广播）。仍会通过 USB 串口输出 JSON。");
+        }
     }
 
     /* 启动远程命令接收任务（下行通道，与上报共用同一 USB 串口） */
