@@ -223,6 +223,43 @@ HOST=0.0.0.0 PORT=8080 npm start
 
 **无线侧调试**：板端串口日志会打印 `[wifi] IP=… RSSI=…`、`[http] 200 成功=N 失败=M`；服务端 `/api/diag` 与网页「VPS 原始记录」可确认数据是否落盘；两端时间用 `skew_ms` 对照。
 
+### 6.2 WiFi 独立网络连通性排查（2026-09-23 实测记录）
+
+要让板子**脱离 USB**、走 WiFi 独立网络上报，本组遇到的障碍与逐项排查：
+
+| # | 排查项 | 方法 | 结果 |
+|---|--------|------|------|
+| 1 | 服务器电脑有无线网卡吗 | `netsh wlan show drivers`、`netsh interface show interface` | **没有**，只有一块有线网卡（`10.1.41.112/24`，网关 `10.1.41.254`） |
+| 2 | 学校 WiFi 与有线网互通吗 | 手机连 `SZIT-WLAN` 后浏览器打开 `http://10.1.41.112:8080` | **能打开** → 两网之间有路由、**没有客户端隔离** |
+| 3 | 防火墙放行了吗 | `netsh advfirewall firewall show rule name=all dir=in` | ❌ `node.exe` 规则**只覆盖「公用」**，而以太网是**「专用」** → 入站 8080 会被丢包。已补规则 `IMU Monitor 8080 LocalSubnet`（域/专用/公用，`remoteip=localsubnet`） |
+| 4 | 板子能看到这个 SSID 吗 | 固件内置 2.4GHz 扫描（`WIFI_SCAN_ON_BOOT`） | ❌ **扫到 14 个 2.4GHz 网络，`SZIT-WLAN` 不在其中** |
+
+**根因**：`SZIT-WLAN` **只广播 5GHz**（手机 WiFi 详情里「频率」显示 `5 GHz`），
+而 **ESP32-S3 只支持 2.4GHz** —— 芯片硬件限制，无法通过配置解决。
+
+**排查中踩到的两个固件陷阱**（已修复，提交 `aa9b6ea`）：
+
+1. `esp_wifi_start()` 会触发 `STA_START` 事件并**立即发起连接**。此时
+   `esp_wifi_scan_start()` 拿不到结果，`esp_wifi_set_config()` 返回
+   `ESP_ERR_WIFI_STATE`；若外面套了 `ESP_ERROR_CHECK` 会直接 `abort()`，
+   表现为**开机循环崩溃**。
+2. `esp_wifi_set_config()` 会把配置**写入 NVS**，因此从第二次开机起，
+   `esp_wifi_start()` 就用 NVS 里的旧配置自动连接，STA 长期停在 connecting。
+
+**解法**：新增 `s_wifi_paused` 标志，在 `STA_START` / `STA_DISCONNECTED`
+事件处理里抑制自动重连，让 STA 停在空闲态再扫描；扫完清标志再连。
+同时把 `set_config` 的 `ESP_ERROR_CHECK` 降级为告警，避免配置失败拖垮整机。
+
+**结论**：本组学校 WiFi 无法用于板端独立联网。可行替代路径：
+
+① **USB 无线网卡**（电脑插上后用 Windows 自带「移动热点」，板子连它）——最稳；
+② **iPhone 热点 + USB 共享**（其 USB 共享与热点同属 `172.20.10.x` 网段；
+   安卓则分为 `192.168.42.x` / `192.168.43.x`，且默认互不路由）；
+③ **自带小路由器**。
+
+> 关键认知：**板子不需要上外网**，只要能访问服务器电脑即可 ——
+> 因此校园网的网页认证不影响上述任何一种方案。
+
 ---
 
 ## 7. 自检脚本（共 102 项，全部通过）
