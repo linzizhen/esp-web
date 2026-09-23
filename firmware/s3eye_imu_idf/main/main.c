@@ -885,6 +885,17 @@ static int build_frame(char *body, size_t cap, const char *request_id)
     return n;
 }
 
+/* WiFi 上传失败退避：
+ * 当"连上了 WiFi 但到不了服务器"时（典型场景：访客网/跨网段隔离、服务器没开），
+ * 不要每帧都去撞 HTTP —— 既费电，也把串口日志刷爆、拖慢上报循环。
+ * 连续失败到阈值后进入退避，改为低频重试；一旦成功立即恢复全速。
+ * 注意：USB 串口输出不受影响，仍然每帧照常打印（保底通道）。 */
+static uint32_t s_consec_fail = 0;
+static int64_t  s_next_try_us  = 0;
+
+#define UPLOAD_FAIL_BACKOFF_AFTER 5       /* 连续失败几次后进入退避 */
+#define UPLOAD_BACKOFF_MS         10000   /* 退避期间每 10 秒重试一次 */
+
 /* 构建并双通道发送一帧（USB 串口 + WiFi） */
 static void send_frame(const char *request_id)
 {
@@ -894,13 +905,31 @@ static void send_frame(const char *request_id)
         ESP_LOGW(TAG, "组帧溢出(%d)，跳过本帧", n);
         return;
     }
-    printf("%s\n", body);                 /* 通道 1：USB 串口 */
-    if (wifi_wait(0)) {                   /* 通道 2：WiFi 上传 */
-        if (http_upload(body)) {
-            s_ok++;
-            if (s_ok % 10 == 1) ESP_LOGI(TAG, "上传成功 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
-        } else {
-            s_fail++;
+    printf("%s\n", body);                 /* 通道 1：USB 串口（始终输出） */
+    if (!wifi_wait(0)) return;            /* 通道 2：WiFi 未连接则跳过 */
+
+    int64_t now = esp_timer_get_time();
+    if (now < s_next_try_us) return;      /* 退避中，本帧不尝试 WiFi */
+
+    if (http_upload(body)) {
+        s_ok++;
+        if (s_consec_fail >= UPLOAD_FAIL_BACKOFF_AFTER) {
+            ESP_LOGI(TAG, "WiFi 上传已恢复（此前连续失败 %u 次）", (unsigned)s_consec_fail);
+        }
+        s_consec_fail = 0;
+        s_next_try_us = 0;
+        if (s_ok % 10 == 1) ESP_LOGI(TAG, "上传成功 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
+    } else {
+        s_fail++;
+        s_consec_fail++;
+        if (s_consec_fail == UPLOAD_FAIL_BACKOFF_AFTER) {
+            s_next_try_us = now + (int64_t)UPLOAD_BACKOFF_MS * 1000;
+            ESP_LOGW(TAG, "★ WiFi 上传连续失败 %u 次，进入退避：每 %d 秒重试一次。"
+                          "请检查 APP_SERVER_HOST=%s:%d 是否可达、电脑防火墙是否放行。"
+                          "（USB 串口输出不受影响）",
+                     (unsigned)s_consec_fail, UPLOAD_BACKOFF_MS / 1000,
+                     APP_SERVER_HOST, APP_SERVER_PORT);
+        } else if (s_consec_fail < UPLOAD_FAIL_BACKOFF_AFTER) {
             ESP_LOGW(TAG, "上传失败 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
         }
     }
@@ -1057,7 +1086,8 @@ static void poll_task(void *arg)
             last_dbg = now;
             ESP_LOGD(TAG, "WiFi 下行轮询中：累计取到命令 %lu 条", (unsigned long)got_cmds);
         }
-        vTaskDelay(pdMS_TO_TICKS(CMD_POLL_INTERVAL_MS));
+        /* 服务器不可达时降频：没必要每 400ms 撞一次 */
+        vTaskDelay(pdMS_TO_TICKS(fail_streak >= 5 ? 5000 : CMD_POLL_INTERVAL_MS));
     }
 }
 
