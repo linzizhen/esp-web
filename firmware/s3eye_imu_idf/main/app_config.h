@@ -57,3 +57,10 @@
 #ifndef CMD_POLL_INTERVAL_MS
 #define CMD_POLL_INTERVAL_MS 400
 #endif
+
+/* 上电是否扫描一遍 2.4GHz 并打印可见 AP（默认开）。
+ * 排查"手机能连、板子连不上"时非常有用 —— 一眼看出目标 SSID 是否在 2.4GHz 广播。
+ * 会拖慢开机约 2~4 秒；调试完可改为 0。 */
+#ifndef WIFI_SCAN_ON_BOOT
+#define WIFI_SCAN_ON_BOOT 1
+#endif

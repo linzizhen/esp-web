@@ -231,12 +231,18 @@ static bool imu_read(int16_t out[3])
 
 /* ===================== WiFi ===================== */
 
+/* 诊断扫描期间置位：临时抑制自动重连，让 STA 停在空闲态。
+ * 否则 STA 一直处于 connecting，esp_wifi_scan_start / esp_wifi_set_config
+ * 都会被拒（ESP_ERR_WIFI_STATE）。 */
+static volatile bool s_wifi_paused = false;
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (!s_wifi_paused) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT);
+        if (s_wifi_paused) return;          /* 诊断扫描中：不要重连 */
         ESP_LOGW(TAG, "WiFi 断开，重连中…");
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -244,6 +250,41 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&e->ip_info.ip));
         ESP_LOGI(TAG, "WiFi 已连接，IP=%s", s_ip);
         xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
+    }
+}
+
+/* 上电扫描一遍 2.4GHz 频段并打印可见 AP。
+ * 用途：排查"手机能看到 SSID，但板子连不上"这类问题 ——
+ * 常见原因是该热点只在 5GHz 广播，而 ESP32-S3 只支持 2.4GHz。 */
+static void wifi_scan_log(void)
+{
+    static wifi_ap_record_t list[24];
+    wifi_scan_config_t sc = { .show_hidden = false };
+    if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi 扫描失败（不影响连接尝试）");
+        return;
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n == 0) {
+        ESP_LOGW(TAG, "★ 2.4GHz 频段未扫描到任何 WiFi —— 请确认路由器开了 2.4GHz");
+        return;
+    }
+    uint16_t cap = (n > 24) ? 24 : n;
+    esp_wifi_scan_get_ap_records(&cap, list);
+    ESP_LOGI(TAG, "扫描到 %u 个 2.4GHz 网络（列出前 %u 个）：", n, cap);
+    bool found = false;
+    for (uint16_t i = 0; i < cap; i++) {
+        const char *ssid = (const char *)list[i].ssid;
+        if (strcmp(ssid, APP_WIFI_SSID) == 0) found = true;
+        ESP_LOGI(TAG, "  [%02u] %-28s ch=%-3d rssi=%-4d %s", i + 1,
+                 ssid[0] ? ssid : "(隐藏)", list[i].primary, list[i].rssi,
+                 (strcmp(ssid, APP_WIFI_SSID) == 0) ? "★ 目标" : "");
+    }
+    if (!found) {
+        ESP_LOGW(TAG, "★ 未在 2.4GHz 发现 SSID=\"%s\" —— 该热点很可能只广播 5GHz，"
+                      "ESP32-S3 无法连接（只能等路由器开放 2.4GHz，或改用手机热点/随身路由）",
+                 APP_WIFI_SSID);
     }
 }
 
@@ -265,9 +306,23 @@ static void wifi_init(void)
     wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* 兼容开放/各类加密 */
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+
+#if WIFI_SCAN_ON_BOOT
+    /* 先抑制自动连接，让 STA 停在空闲态再做扫描 ——
+     * esp_wifi_start() 会触发 STA_START 事件并立即连接，此时扫描/改配置都会被拒。 */
+    s_wifi_paused = true;
     ESP_ERROR_CHECK(esp_wifi_start());
+    vTaskDelay(pdMS_TO_TICKS(300));
+    wifi_scan_log();
+    s_wifi_paused = false;
+#else
+    ESP_ERROR_CHECK(esp_wifi_start());
+#endif
+
+    esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    if (e != ESP_OK) ESP_LOGW(TAG, "设置 WiFi 配置失败: %s", esp_err_to_name(e));
     ESP_LOGI(TAG, "WiFi 启动，SSID=%s", APP_WIFI_SSID);
+    esp_wifi_connect();      /* 显式发起连接 */
 }
 
 static bool wifi_wait(int ms)
