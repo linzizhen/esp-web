@@ -236,6 +236,22 @@ static bool imu_read(int16_t out[3])
  * 都会被拒（ESP_ERR_WIFI_STATE）。 */
 static volatile bool s_wifi_paused = false;
 
+/* 把 WiFi 断线原因码翻译成人话，便于现场排查 */
+static const char *wifi_reason_str(uint8_t r)
+{
+    switch (r) {
+    case WIFI_REASON_NO_AP_FOUND:            return "找不到该 SSID（信号太弱，或只在 5GHz 广播）";
+    case WIFI_REASON_AUTH_FAIL:              return "认证失败（密码不对）";
+    case WIFI_REASON_ASSOC_FAIL:             return "关联被拒（AP 满/不允许该设备）";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "四次握手超时（通常是密码错误）";
+    case WIFI_REASON_CONNECTION_FAIL:        return "连接失败（AP 无响应）";
+    case WIFI_REASON_BEACON_TIMEOUT:         return "信标超时（AP 不可达/信号丢失）";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY: return "找到 SSID 但加密方式不兼容";
+    default:                                 return "其他原因";
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -243,7 +259,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT);
         if (s_wifi_paused) return;          /* 诊断扫描中：不要重连 */
-        ESP_LOGW(TAG, "WiFi 断开，重连中…");
+        wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "WiFi 断开（reason=%u：%s），重连中…",
+                 (unsigned)e->reason, wifi_reason_str(e->reason));
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
