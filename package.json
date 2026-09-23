@@ -10,7 +10,8 @@
     "test:help": "node test/help-test.js",
     "firmware:build": "cd firmware/s3eye_imu_idf && C:/Espressif/python_env/idf5.4_py3.11_env/Scripts/python.exe ../../scripts/idfwrap.py build",
     "firmware:flash": "cd firmware/s3eye_imu_idf && C:/Espressif/python_env/idf5.4_py3.11_env/Scripts/python.exe ../../scripts/idfwrap.py flash -p COM4",
-    "firmware:monitor": "cd firmware/s3eye_imu_idf && C:/Espressif/python_env/idf5.4_py3.11_env/Scripts/python.exe ../../scripts/idfwrap.py monitor -p COM4"
+    "firmware:monitor": "cd firmware/s3eye_imu_idf && C:/Espressif/python_env/idf5.4_py3.11_env/Scripts/python.exe ../../scripts/idfwrap.py monitor -p COM4",
+    "wifi:set": "C:/Espressif/python_env/idf5.4_py3.11_env/Scripts/python.exe scripts/set_wifi.py"
   },
   "keywords": ["esp32", "s3-eye", "qma7981", "imu", "serial", "realtime", "dashboard"],
   "author": "",

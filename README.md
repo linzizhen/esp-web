@@ -89,7 +89,8 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 ├── start.bat                 # 一键启动（双击即可）
 ├── .gitignore                # 排除构建产物 / 依赖 / 运行时数据
 ├── scripts/
-│   └── idfwrap.py            # ESP-IDF 构建/烧录封装（自动注入工具链环境）
+│   ├── idfwrap.py            # ESP-IDF 构建/烧录封装（自动注入工具链环境）
+│   └── set_wifi.py           # 一键切换板端 WiFi 配置（自动检测本机 IP，写入 gitignore 的本地文件）
 ├── docs/
 │   ├── week2-remote-collect.md  # 第 2 周：远程采集协议、状态图、时序图、实测记录
 │   └── week3-button-feedback.md # 第 3 周：按键触发与物理反馈闭环（协议/状态图/时序图/实测）
@@ -385,10 +386,31 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 
 ### 要真正用起来，需要两件事
 
-1. **填 WiFi 凭据**：复制 `firmware/s3eye_imu_idf/main/app_config.local.h.example` 为
-   `app_config.local.h`（已被 `.gitignore` 忽略，密码不会进仓库），填入
-   `APP_WIFI_SSID` / `APP_WIFI_PASS`，然后重新烧录；
-2. **放行防火墙**：服务器电脑允许 8080 入站，板子才能 POST 进来、取走命令。
+1. **填 WiFi 凭据**：一条命令搞定（会自动检测本机 IP 并写入被 `.gitignore` 忽略的
+   `app_config.local.h`，密码不会进仓库）：
+
+   ```bash
+   # 只写配置
+   npm run wifi:set -- --ssid "你的热点名"
+
+   # 指定服务器 IP（多网卡时）
+   npm run wifi:set -- --ssid "你的热点名" --pass "密码" --host 192.168.137.1
+
+   # 写完直接编译并烧录
+   npm run wifi:set -- --ssid "你的热点名" --flash
+   ```
+
+   也可以手工：复制 `app_config.local.h.example` 为 `app_config.local.h` 再填。
+
+2. **放行防火墙**：服务器电脑允许 8080 入站（仅需一次，需管理员权限）：
+
+   ```
+   netsh advfirewall firewall add rule name="IMU Monitor 8080 LocalSubnet" dir=in action=allow protocol=TCP localport=8080 remoteip=localsubnet profile=any
+   ```
+
+> ⚠️ **ESP32-S3 只支持 2.4GHz**。若目标热点只广播 5GHz，板子扫不到它。
+> 烧录后看开机扫描日志：目标 SSID 会标 `★ 目标`；若提示"未在 2.4GHz 发现"，
+> 说明该热点是 5GHz-only，需要改用 2.4GHz 的热点（手机热点注意开"最大兼容性"）。
 
 改完就可以**拔掉 USB 线**，完整跑通「实时数据 + 远程采集 + 教学求助」闭环。
 `APP_SERVER_HOST` 填服务器电脑的局域网 IP；轮询间隔由 `CMD_POLL_INTERVAL_MS` 控制（默认 400ms）。
