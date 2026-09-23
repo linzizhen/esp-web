@@ -1031,6 +1031,37 @@ static void handle_command(const char *line)
         s_help = HELP_IDLE;
         s_scr  = 0;
         cmd_ack(rid, "idle");
+    } else if (strcmp(cmd, "wifi_status") == 0) {
+        /* 现场诊断：一条命令问清 WiFi 当前到底什么状态，不用重烧固件 */
+        wifi_ap_record_t ap;
+        bool linked = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+        bool has_ip = wifi_wait(0);
+        char st[96];
+        snprintf(st, sizeof(st), "linked=%d ip=%s rssi=%d up=%lu fail=%lu",
+                 linked ? 1 : 0, has_ip ? s_ip : "-", linked ? ap.rssi : 0,
+                 (unsigned long)s_ok, (unsigned long)s_fail);
+        cmd_ack(rid, st);
+        if (linked) {
+            ESP_LOGI(TAG, "WiFi 状态：已关联 rssi=%d ch=%d；IP=%s；上传 成功=%lu 失败=%lu",
+                     ap.rssi, ap.primary, has_ip ? s_ip : "（未取得 IP！）",
+                     (unsigned long)s_ok, (unsigned long)s_fail);
+            if (!has_ip) {
+                ESP_LOGW(TAG, "★ 已关联但无 IP：该 AP 未下发 DHCP 租约（AP/网络侧限制），"
+                              "与 SSID/密码无关");
+            }
+        } else {
+            ESP_LOGW(TAG, "WiFi 状态：未关联；IP=%s；上传 成功=%lu 失败=%lu",
+                     has_ip ? s_ip : "（无）", (unsigned long)s_ok, (unsigned long)s_fail);
+        }
+    } else if (strcmp(cmd, "wifi_scan") == 0) {
+        /* 现场诊断：重扫一遍 2.4GHz 并打印（会短暂断开再自动重连） */
+        cmd_ack(rid, "scanning");
+        s_wifi_paused = true;
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        wifi_scan_log();
+        s_wifi_paused = false;
+        esp_wifi_connect();
     } else {
         cmd_ack(rid, "unknown_cmd");
     }

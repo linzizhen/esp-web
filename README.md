@@ -417,6 +417,25 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 
 > 点「诊断」按钮可查看下行状态：`downlink: {serial, wifiPolling, queued, sentViaSerial, sentViaWifi}`。
 
+### 板端自带诊断命令（现场排查用，无需重烧固件）
+
+直接向板子发命令即可（串口或 WiFi 轮询通道都行）：
+
+```jsonc
+{"cmd":"wifi_status","request_id":"x"}   // 问清当前 WiFi 状态
+{"cmd":"wifi_scan","request_id":"x"}     // 重扫 2.4GHz 并打印可见 AP（短暂断开后自动重连）
+```
+
+`wifi_status` 回执示例与含义：
+
+| 回执 | 含义 |
+|------|------|
+| `linked=1 ip=10.1.41.x rssi=-28 up=12 fail=0` | 一切正常 |
+| `linked=1 ip=- rssi=-28 up=0 fail=0` | **已关联但拿不到 IP** → 问题在 AP/网络侧（DHCP 未响应），与 SSID/密码无关 |
+| `linked=0 ip=- ...` | 没关联上 → SSID/密码错，或该热点只在 5GHz 广播 |
+
+> 这两条命令是排查"连上了却传不出去"时最有效的第一步——先分清是**关联失败**还是 **DHCP 失败**，两者排查方向完全不同。
+
 ## 七、排查：板子插上了但没数据
 
 页面上有两个按钮专门解决这个问题：
