@@ -49,6 +49,7 @@ const els = {
   camView: $('camView'), camPlaceholder: $('camPlaceholder'), camTag: $('camTag'),
   camStats: $('camStats'), camNote: $('camNote'),
   btnCamStart: $('btnCamStart'), btnCamStop: $('btnCamStop'), btnCamShot: $('btnCamShot'),
+  btnCamApply: $('btnCamApply'), camSize: $('camSize'), camQuality: $('camQuality'), camFps: $('camFps'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
 };
@@ -888,6 +889,29 @@ if (els.btnCamShot)  els.btnCamShot.onclick  = async () => {
     els.camNote.textContent = CAM.hasFrame
       ? '已抓拍一帧（板端抓完立即上报，最新帧已更新）。'
       : '还没收到帧 —— 确认板子在线、且命令通道可用。';
+  }
+};
+
+if (els.btnCamApply) els.btnCamApply.onclick = async () => {
+  if (els.camNote) els.camNote.textContent = '正在下发摄像头参数…';
+  try {
+    const d = await (await fetch('/api/cam', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'set',
+        framesize: Number(els.camSize.value),
+        quality:   Number(els.camQuality.value),
+        fps:       Number(els.camFps.value),
+      }),
+    })).json();
+    if (els.camNote) {
+      els.camNote.textContent = d.ok
+        ? '参数已下发到板端（画面会在下一帧生效）'
+        : '⚠ ' + (d.note || '命令通道不可用，参数未送达板端。');
+    }
+  } catch (e) {
+    if (els.camNote) els.camNote.textContent = '下发失败：' + e.message;
   }
 };
 

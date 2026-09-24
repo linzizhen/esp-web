@@ -1471,14 +1471,26 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/cam' && req.method === 'POST') {
     let body = {};
     try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
-    const action = body.action === 'stop' ? 'stop' : 'start';
-    const ok = sendCommand({ cmd: action === 'start' ? 'cam_on' : 'cam_off' }, state.deviceId || null);
-    if (ok) state.camStreaming = (action === 'start');
+
+    const action = body.action === 'stop' ? 'stop' : (body.action === 'set' ? 'set' : 'start');
+    let cmdObj;
+    if (action === 'set') {
+      cmdObj = { cmd: 'cam_set' };
+      if (body.framesize != null) cmdObj.framesize = Number(body.framesize);
+      if (body.quality   != null) cmdObj.quality   = Number(body.quality);
+      if (body.fps       != null) cmdObj.fps       = Number(body.fps);
+    } else {
+      cmdObj = { cmd: action === 'start' ? 'cam_on' : 'cam_off' };
+    }
+
+    const ok = sendCommand(cmdObj, state.deviceId || null);
+    if (ok && action !== 'set') state.camStreaming = (action === 'start');
     pushStatus('cam');
     return json(res, 200, {
       ok,
       action,
       streaming: !!state.camStreaming,
+      sent: cmdObj,
       note: ok ? null : (config.mockDevice ? '模拟模式：未走真实通道' : '命令通道不可用（串口未打开、板端也未在轮询）'),
     });
   }

@@ -34,9 +34,10 @@ static const char *TAG = "S3EYE";
 #define CAM_PIN_D7      (16)
 
 /* 默认参数：QVGA(320x240) + 质量 12。
- * 当前上行链路是 USB Serial/JTAG，带宽有限；QVGA 单帧 JPEG 约 8~15KB，
- * 能保证可用帧率。 */
-#define CAM_DEF_FRAMESIZE  (5)     /* framesize_t: 5 = FRAMESIZE_QVGA */
+ * 当前上行链路是 USB Serial/JTAG，带宽有限；QVGA 单帧 JPEG 约 5~10KB，
+ * 能保证可用帧率。
+ * ★ 索引 6 = FRAMESIZE_QVGA(320x240)。注意不是 5 —— 见下方名称表注释。 */
+#define CAM_DEF_FRAMESIZE  (6)
 #define CAM_DEF_QUALITY    (12)
 
 static bool          s_ready     = false;
@@ -47,23 +48,31 @@ static uint32_t      s_last_len  = 0;
 static int           s_framesize = CAM_DEF_FRAMESIZE;
 static int           s_quality   = CAM_DEF_QUALITY;
 
+/* 分辨率名称表 —— 必须与组件 driver/include/sensor.h 里的 framesize_t 枚举
+ * 逐项对齐。★ 该枚举与网上很多旧资料不同：它在 3 处插入了 QCIF(176x144)、
+ * 在 7 处插入了 320X320，导致 QVGA/CIF/VGA 的索引整体后移。
+ * 实测对照（请求索引 → 实际 JPEG 尺寸）：
+ *   5 → 240x240    6 → 320x240(QVGA)    8 → 400x296    10 → 640x480(VGA)
+ * 若照抄旧表，会出现"请求 QVGA 却得到 240x240"这种表里不一。 */
 const char *cam_stream_framesize_name(int f)
 {
     switch (f) {
     case 0:  return "96x96";
-    case 1:  return "160x120";
+    case 1:  return "160x120";    /* QQVGA */
     case 2:  return "128x128";
-    case 3:  return "240x176";
-    case 4:  return "240x240";
-    case 5:  return "320x240";
-    case 6:  return "400x296";
-    case 7:  return "480x320";
-    case 8:  return "640x480";
-    case 9:  return "800x600";
-    case 10: return "1024x768";
-    case 11: return "1280x720";
-    case 12: return "1280x1024";
-    case 13: return "1600x1200";
+    case 3:  return "176x144";    /* QCIF  */
+    case 4:  return "240x176";    /* HQVGA */
+    case 5:  return "240x240";
+    case 6:  return "320x240";    /* QVGA  */
+    case 7:  return "320x320";
+    case 8:  return "400x296";    /* CIF   */
+    case 9:  return "480x320";    /* HVGA  */
+    case 10: return "640x480";    /* VGA   */
+    case 11: return "800x600";    /* SVGA  */
+    case 12: return "1024x768";   /* XGA   */
+    case 13: return "1280x720";   /* HD    */
+    case 14: return "1280x1024";  /* SXGA  */
+    case 15: return "1600x1200";  /* UXGA  */
     default: return "?";
     }
 }

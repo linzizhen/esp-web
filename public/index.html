@@ -227,6 +227,36 @@
             <button id="btnCamStop"  class="btn btn-ghost" disabled>停止</button>
             <button id="btnCamShot"  class="btn btn-ghost">抓拍一帧</button>
           </div>
+          <div class="cam-controls">
+            <label>分辨率
+              <select id="camSize">
+                <option value="5">240x240</option>
+                <option value="6" selected>320x240（QVGA）</option>
+                <option value="8">400x296</option>
+                <option value="9">480x320</option>
+                <option value="10">640x480（VGA）</option>
+                <option value="11">800x600</option>
+                <option value="12">1024x768</option>
+              </select>
+            </label>
+            <label>画质
+              <select id="camQuality">
+                <option value="8">高（更清晰、更大）</option>
+                <option value="12" selected>中</option>
+                <option value="20">低（更省带宽）</option>
+                <option value="30">很低</option>
+              </select>
+            </label>
+            <label>帧率
+              <select id="camFps">
+                <option value="2">2 fps</option>
+                <option value="5" selected>5 fps</option>
+                <option value="10">10 fps</option>
+                <option value="15">15 fps</option>
+              </select>
+            </label>
+            <button id="btnCamApply" class="btn btn-ghost">应用参数</button>
+          </div>
           <div id="camNote" class="ctrl-note"></div>
         </section>
 

@@ -385,6 +385,38 @@ select { appearance: none; padding: 8px 32px 8px 12px; border: 1px solid var(--l
 
 .cam-hero .collect-actions { margin-top: 14px; }
 
+/* 摄像头参数控件 */
+.cam-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.cam-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.cam-controls select {
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  min-width: 132px;
+}
+
+.cam-controls button { align-self: flex-end; }
+
 /* 链路状态用两列小格 */
 #camStats {
   display: grid;
