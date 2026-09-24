@@ -353,3 +353,63 @@ select { appearance: none; padding: 8px 32px 8px 12px; border: 1px solid var(--l
   .hero-body { gap: 18px; }
   .axes { min-width: 0; }
 }
+
+/* ===================================================================
+   摄像头页面（OV2640 实时画面）
+   =================================================================== */
+.cam-wrap {
+  position: relative;
+  background: #0f172a;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  min-height: 260px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.cam-view {
+  max-width: 100%;
+  max-height: 62vh;
+  display: block;
+}
+
+.cam-placeholder {
+  color: #94a3b8;
+  font-size: 13px;
+  line-height: 1.9;
+  text-align: center;
+  padding: 32px 24px;
+}
+
+.cam-hero .collect-actions { margin-top: 14px; }
+
+/* 链路状态用两列小格 */
+#camStats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+#camStats .obs-cell {
+  background: var(--bg1);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+#camStats .obs-cell .k {
+  display: block;
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+
+#camStats .obs-cell .v {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+

@@ -48,6 +48,8 @@
 
 #include "app_config.h"
 #include "lcd_font.h"
+#include "cam_stream.h"
+#include "mbedtls/base64.h"
 
 static const char *TAG = "S3EYE";
 
@@ -98,7 +100,11 @@ static const char *TAG = "S3EYE";
 
 static i2c_master_bus_handle_t  s_bus = NULL;
 static i2c_master_dev_handle_t  s_dev = NULL;
+/* IMU 实际使用的 I2C 端口（0 或 1）。摄像头 SCCB 在 GPIO4/5 上与 IMU 共用同一条
+ * 总线，必须复用这个端口，不能再建一条。 */
+static int s_imu_port = -1;
 static bool                     s_imu_ok = false;
+static bool                     s_cam_ok = false;
 static uint8_t                  s_imu_id = 0;     // 读到的 WHO_AM_I 字节（诊断用）
 static char                     s_imu_scan[128] = ""; // 扫描到的 I2C 地址列表
 
@@ -199,6 +205,7 @@ static bool imu_init_on_port(i2c_port_num_t port)
     qma_write(QMA_REG_RANGE, 0x00);
     qma_write(QMA_REG_PWR, QMA_ACTIVE_CMD);   /* 进入 active */
     vTaskDelay(pdMS_TO_TICKS(60));
+    s_imu_port = (int)port;                   /* 记下来给摄像头 SCCB 复用 */
     ESP_LOGI(TAG, "QMA7981 初始化完成（±2g，14bit，端口 %d）", port);
     return true;
 }
@@ -975,6 +982,20 @@ static bool json_str(const char *json, const char *key, char *out, size_t cap)
     return true;
 }
 
+/* 极简 JSON 取整数："key":123 */
+static bool json_int(const char *json, const char *key, int *out)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (*p != '-' && (*p < '0' || *p > '9')) return false;
+    *out = atoi(p);
+    return true;
+}
+
 static void cmd_ack(const char *request_id, const char *status)
 {
     char buf[192];
@@ -991,6 +1012,84 @@ static void cmd_collect_once(const char *request_id)
     s_seq++;                        /* 新序号 —— 服务端据此确认是「新采集」 */
     send_frame(request_id);
     ESP_LOGI(TAG, "远程采集完成 request_id=%s seq=%lu", request_id, (unsigned long)s_seq);
+}
+
+/* ---------------------- 摄像头推流（OV2640） ----------------------
+ * 帧格式：一行 JSON，JPEG 用 base64 内联，复用既有上行链路（USB 串口 + WiFi）：
+ *   {"type":"frame","device":"...","seq":N,"size":"320x240","len":12345,"jpeg":"<base64>"}
+ * 选 base64 而不是二进制协议，是为了不改动现有「一行一条 JSON」的传输层 ——
+ * 服务端与网页都能直接复用，代价是 33% 体积开销。
+ * ------------------------------------------------------------------ */
+static volatile bool s_cam_on  = false;
+static int           s_cam_fps = 5;      /* 目标帧率，实际受链路带宽限制 */
+static uint32_t      s_cam_seq = 0;
+static uint32_t      s_cam_sent = 0, s_cam_drop = 0;
+
+/* 发送一帧。返回耗时毫秒（0 表示失败） */
+static int cam_send_frame(void)
+{
+    if (!s_cam_ok) return 0;
+
+    int64_t t0 = esp_timer_get_time();
+    uint8_t *jpg = NULL; size_t jlen = 0;
+    if (!cam_stream_capture(&jpg, &jlen) || !jpg || jlen == 0) {
+        s_cam_drop++;
+        ESP_LOGW(TAG, "抓帧失败（累计 %lu 次）", (unsigned long)s_cam_drop);
+        return 0;
+    }
+
+    /* base64 输出长度 = 4*ceil(n/3)，再加 JSON 头尾余量 */
+    size_t b64_cap = ((jlen + 2) / 3) * 4 + 4;
+    size_t cap     = b64_cap + 256;
+    char  *out     = malloc(cap);
+    if (!out) { cam_stream_release(); s_cam_drop++; return 0; }
+
+    int hdr = snprintf(out, cap,
+        "{\"type\":\"frame\",\"device\":\"%s\",\"seq\":%u,\"size\":\"%s\","
+        "\"len\":%u,\"jpeg\":\"",
+        APP_DEVICE_ID, (unsigned)++s_cam_seq,
+        cam_stream_framesize_name(cam_stream_get_framesize()), (unsigned)jlen);
+    if (hdr < 0 || (size_t)hdr >= cap) { free(out); cam_stream_release(); s_cam_drop++; return 0; }
+
+    size_t olen = 0;
+    if (mbedtls_base64_encode((unsigned char *)out + hdr, b64_cap, &olen, jpg, jlen) != 0) {
+        free(out); cam_stream_release(); s_cam_drop++;
+        return 0;
+    }
+    cam_stream_release();                       /* 尽早归还帧缓冲 */
+
+    out[hdr + olen]     = '"';
+    out[hdr + olen + 1] = '}';
+    out[hdr + olen + 2] = '\n';
+    out[hdr + olen + 3] = '\0';
+
+    printf("%s", out);                          /* 通道 1：USB 串口 */
+    if (wifi_wait(0)) {                         /* 通道 2：WiFi（连上才发） */
+        http_post("/api/data", out);
+    }
+    free(out);
+
+    int ms = (int)((esp_timer_get_time() - t0) / 1000);
+    s_cam_sent++;
+    if (s_cam_sent % 10 == 1) {
+        ESP_LOGI(TAG, "摄像头：第 %lu 帧 %u 字节，耗时 %d ms（约 %.1f fps）",
+                 (unsigned long)s_cam_sent, (unsigned)jlen, ms,
+                 ms > 0 ? 1000.0f / ms : 0.0f);
+    }
+    return ms;
+}
+
+/* 推流任务：按目标帧率抓帧发送。链路慢时自动降速（以实际耗时为准）。 */
+static void cam_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        if (!s_cam_on || !s_cam_ok) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+        int ms = cam_send_frame();
+        int period = 1000 / (s_cam_fps > 0 ? s_cam_fps : 1);
+        int wait = period - ms;
+        vTaskDelay(pdMS_TO_TICKS(wait > 10 ? wait : 10));
+    }
 }
 
 static void handle_command(const char *line)
@@ -1031,6 +1130,40 @@ static void handle_command(const char *line)
         s_help = HELP_IDLE;
         s_scr  = 0;
         cmd_ack(rid, "idle");
+    } else if (strcmp(cmd, "cam_on") == 0) {
+        /* 开始推流 */
+        if (!s_cam_ok) { cmd_ack(rid, "no_camera"); }
+        else { s_cam_on = true; cmd_ack(rid, "cam_on"); ESP_LOGI(TAG, "摄像头推流已开启"); }
+    } else if (strcmp(cmd, "cam_off") == 0) {
+        s_cam_on = false;
+        cmd_ack(rid, "cam_off");
+        ESP_LOGI(TAG, "摄像头推流已停止（累计发送 %lu 帧）", (unsigned long)s_cam_sent);
+    } else if (strcmp(cmd, "cam_shot") == 0) {
+        /* 抓一帧（不开启持续推流） */
+        if (!s_cam_ok) { cmd_ack(rid, "no_camera"); }
+        else { cmd_ack(rid, "shot"); cam_send_frame(); }
+    } else if (strcmp(cmd, "cam_set") == 0) {
+        int fs = -1, q = -1, fps = -1;
+        json_int(line, "framesize", &fs);
+        json_int(line, "quality",   &q);
+        json_int(line, "fps",       &fps);
+        if (fps > 0) s_cam_fps = fps > 20 ? 20 : fps;
+        bool ok = cam_stream_set_params(fs, q);
+        char st[64];
+        snprintf(st, sizeof(st), "%s q%d fps%d",
+                 cam_stream_framesize_name(cam_stream_get_framesize()),
+                 cam_stream_get_quality(), s_cam_fps);
+        cmd_ack(rid, ok ? st : "no_camera");
+    } else if (strcmp(cmd, "cam_status") == 0) {
+        uint32_t f = 0, fl = 0, last = 0;
+        cam_stream_get_stats(&f, &fl, &last);
+        char st[96];
+        snprintf(st, sizeof(st), "ready=%d on=%d %s q%d sent=%lu drop=%lu lastlen=%lu",
+                 s_cam_ok ? 1 : 0, s_cam_on ? 1 : 0,
+                 cam_stream_framesize_name(cam_stream_get_framesize()),
+                 cam_stream_get_quality(), (unsigned long)f, (unsigned long)fl,
+                 (unsigned long)last);
+        cmd_ack(rid, st);
     } else if (strcmp(cmd, "wifi_status") == 0) {
         /* 现场诊断：一条命令问清 WiFi 当前到底什么状态，不用重烧固件 */
         wifi_ap_record_t ap;
@@ -1159,6 +1292,17 @@ void app_main(void)
         ESP_LOGW(TAG, "IMU 不可用，将只上报芯片内部温度（仍是真实传感源）");
     }
 
+    /* 摄像头（OV2640）：SCCB 在 GPIO4/5，与 IMU 同一条总线，
+     * 因此必须复用 IMU 已建好的 I2C 端口，不能另建一条。 */
+    if (s_imu_port >= 0) {
+        s_cam_ok = cam_stream_init(s_imu_port);
+        if (!s_cam_ok) {
+            ESP_LOGW(TAG, "摄像头初始化失败，IMU 上报与按键闭环不受影响");
+        }
+    } else {
+        ESP_LOGW(TAG, "IMU 未初始化 → 摄像头 SCCB 无总线可复用，跳过摄像头");
+    }
+
     /* 第 3 周：本地实体反馈（LED + LCD）与按键 —— 放在联网之前，
      * 保证「断开外网也能本地确认按键已触发」这条硬指标成立。 */
     led_init();
@@ -1189,6 +1333,8 @@ void app_main(void)
     xTaskCreate(cmd_task, "cmd", 4096, NULL, 5, NULL);
     /* 启动 WiFi 命令轮询任务（串口不在线时的下行兜底通道） */
     xTaskCreate(poll_task, "poll", 4096, NULL, 4, NULL);
+    /* 启动摄像头推流任务（默认不推流，收到 cam_on 才开始） */
+    xTaskCreate(cam_task, "cam", 5120, NULL, 4, NULL);
 
     int64_t last = 0;
     while (1) {

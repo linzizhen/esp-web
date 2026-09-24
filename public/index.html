@@ -43,6 +43,7 @@
     <a href="#live"    class="pagetab" data-page="live">实时监控</a>
     <a href="#collect" class="pagetab" data-page="collect">远程采集</a>
     <a href="#help"    class="pagetab" data-page="help">教学求助<span id="helpBadge" class="tab-badge hidden"></span></a>
+    <a href="#cam"     class="pagetab" data-page="cam">摄像头</a>
     <a href="#records" class="pagetab" data-page="records">记录与设备</a>
   </nav>
 
@@ -200,6 +201,44 @@
             <b>本地确认</b>由板端 LED + 屏幕完成，<b>不依赖网络</b>——断开外网按键，板子照样闪灯、显示「求助已发送」。<br>
             <b>远端显示</b>只有服务端真正收到求助事件才会出现；<br>
             <b>「对方已收到」</b>只有板端收到回应命令并回执后才显示——<b>没有证据绝不显示</b>。
+          </p>
+        </section>
+
+      </div>
+    </section>
+
+    <!-- ==================== 摄像头 ==================== -->
+    <section class="page" data-page="cam">
+      <div class="grid">
+
+        <section class="card cam-hero">
+          <div class="card-head">
+            <h2>板载摄像头 · 实时画面</h2>
+            <span id="camTag" class="tag">未开启</span>
+          </div>
+          <div class="cam-wrap">
+            <img id="camView" class="cam-view hidden" alt="开发板摄像头画面">
+            <div id="camPlaceholder" class="cam-placeholder">
+              点下方「开启实时画面」，开发板开始推送 OV2640 采集的 JPEG 帧
+            </div>
+          </div>
+          <div class="collect-actions">
+            <button id="btnCamStart" class="btn btn-primary">开启实时画面</button>
+            <button id="btnCamStop"  class="btn btn-ghost" disabled>停止</button>
+            <button id="btnCamShot"  class="btn btn-ghost">抓拍一帧</button>
+          </div>
+          <div id="camNote" class="ctrl-note"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>链路状态</h2></div>
+          <div id="camStats" class="obs-grid"></div>
+          <p class="hint">
+            画面来自板载 <b>OV2640</b>（DVP 并口，XCLK=GPIO15 / PCLK=GPIO13 / D0-D7=GPIO11,9,8,10,12,18,17,16），
+            板端直接输出 JPEG，base64 内联后<b>复用既有上行链路</b>（USB 串口 / WiFi）上报，
+            服务端再以 <b>MJPEG</b> 转发给浏览器。<br>
+            <b>不需要给板子写 HTTP 服务</b>：板子始终是客户端，服务端连不上它，所以画面是「推」上来的；
+            这也意味着<b>拔掉 USB 走 WiFi 时同一套逻辑照样成立</b>。
           </p>
         </section>
 

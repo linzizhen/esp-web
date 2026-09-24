@@ -46,6 +46,9 @@ const els = {
   helpBadge: $('helpBadge'), helpTag: $('helpTag'), helpAlert: $('helpAlert'),
   helpTitle: $('helpTitle'), helpDesc: $('helpDesc'),
   btnHelpAck: $('btnHelpAck'), btnHelpCancel: $('btnHelpCancel'), btnHelpReset: $('btnHelpReset'),
+  camView: $('camView'), camPlaceholder: $('camPlaceholder'), camTag: $('camTag'),
+  camStats: $('camStats'), camNote: $('camNote'),
+  btnCamStart: $('btnCamStart'), btnCamStop: $('btnCamStop'), btnCamShot: $('btnCamShot'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
 };
@@ -803,6 +806,94 @@ async function helpAction(action) {
   } catch (_) { /* 交给 WS 推送 */ }
 }
 
+// ---------------------------------------------------------------- 摄像头（OV2640）
+const CAM = { streaming: false, hasFrame: false, frames: 0, seq: 0, size: null, bytes: 0, viewers: 0, timer: null };
+
+async function camControl(action) {
+  if (!els.camNote) return;
+  els.camNote.textContent = action === 'start' ? '正在下发「开启画面」命令…' : '正在下发「停止」命令…';
+  try {
+    const d = await (await fetch('/api/cam', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })).json();
+    els.camNote.textContent = d.ok
+      ? (action === 'start' ? '命令已送达板端，等待第一帧…' : '已下发停止命令。')
+      : '⚠ ' + (d.note || '命令通道不可用，板端不会开始推流。');
+    await loadCam();
+  } catch (e) {
+    els.camNote.textContent = '下发失败：' + e.message;
+  }
+}
+
+async function loadCam() {
+  try {
+    const d = await (await fetch('/api/cam', { cache: 'no-store' })).json();
+    CAM.streaming = !!d.streaming;
+    CAM.hasFrame  = !!d.hasFrame;
+    CAM.frames    = d.frames || 0;
+    CAM.seq       = d.seq || 0;
+    CAM.size      = d.size || null;
+    CAM.bytes     = d.bytes || 0;
+    CAM.viewers   = d.viewers || 0;
+    renderCam();
+  } catch (_) { /* 网络抖动忽略 */ }
+}
+
+function renderCam() {
+  if (!els.camTag) return;
+  const live = CAM.streaming && CAM.hasFrame;
+
+  els.camTag.textContent = live ? '实时' : (CAM.streaming ? '等待首帧' : '未开启');
+  els.camTag.className   = 'tag' + (live ? ' tag-ok' : (CAM.streaming ? ' tag-warn' : ''));
+
+  if (els.camView) {
+    if (live) {
+      // MJPEG：浏览器原生支持 multipart/x-mixed-replace，一个 <img> 就能看直播
+      if (els.camView.getAttribute('src') !== '/api/cam.mjpg') els.camView.setAttribute('src', '/api/cam.mjpg');
+      els.camView.classList.remove('hidden');
+      if (els.camPlaceholder) els.camPlaceholder.classList.add('hidden');
+    } else {
+      if (els.camView.getAttribute('src')) els.camView.removeAttribute('src');  // 断开 MJPEG 连接
+      els.camView.classList.add('hidden');
+      if (els.camPlaceholder) els.camPlaceholder.classList.remove('hidden');
+    }
+  }
+
+  if (els.btnCamStart) els.btnCamStart.disabled = CAM.streaming;
+  if (els.btnCamStop)  els.btnCamStop.disabled  = !CAM.streaming;
+
+  if (els.camStats) {
+    const rows = [
+      ['状态',     live ? '实时画面' : (CAM.streaming ? '等待首帧' : '未开启')],
+      ['已收帧数', CAM.frames],
+      ['最新帧号', CAM.seq],
+      ['分辨率',   CAM.size || '—'],
+      ['单帧大小', CAM.bytes ? (CAM.bytes / 1024).toFixed(1) + ' KB' : '—'],
+      ['观看者',   CAM.viewers],
+    ];
+    els.camStats.innerHTML = rows.map(([k, v]) =>
+      `<div class="obs-cell"><span class="k">${escHtml(k)}</span><span class="v">${escHtml(String(v))}</span></div>`).join('');
+  }
+}
+
+if (els.btnCamStart) els.btnCamStart.onclick = () => camControl('start');
+if (els.btnCamStop)  els.btnCamStop.onclick  = () => camControl('stop');
+if (els.btnCamShot)  els.btnCamShot.onclick  = async () => {
+  if (els.camNote) els.camNote.textContent = '抓拍中…';
+  await fetch('/api/cam.jpg', { cache: 'no-store' }).catch(() => {});
+  await loadCam();
+  if (els.camNote) {
+    els.camNote.textContent = CAM.hasFrame
+      ? '已抓拍一帧（板端抓完立即上报，最新帧已更新）。'
+      : '还没收到帧 —— 确认板子在线、且命令通道可用。';
+  }
+};
+
+// 停在摄像头页时定时刷新状态（画面本身由 MJPEG 推送，无需轮询）
+setInterval(() => { if (S.page === 'cam') loadCam(); }, 3000);
+
 if (els.btnHelpAck) els.btnHelpAck.onclick = () => helpAction('ack');
 if (els.btnHelpCancel) els.btnHelpCancel.onclick = () => helpAction('cancel');
 if (els.btnHelpReset) els.btnHelpReset.onclick = () => helpAction('reset');
@@ -817,13 +908,14 @@ async function loadHelp() {
 
 // ---------------------------------------------------------------- 分页路由
 // 单页应用 + hash 路由：地址栏 #live / #collect / #records，刷新不丢页面。
-const PAGES = ['live', 'collect', 'help', 'records'];
+const PAGES = ['live', 'collect', 'help', 'cam', 'records'];
 function showPage(name) {
   if (!PAGES.includes(name)) name = 'live';
   S.page = name;
   document.querySelectorAll('.page').forEach((el) => el.classList.toggle('on', el.dataset.page === name));
   document.querySelectorAll('.pagetab').forEach((el) => el.classList.toggle('on', el.dataset.page === name));
   needDraw = true;   // 回到实时页时立即重画（隐藏期间画布尺寸为 0）
+  if (name === 'cam') loadCam();   // 进入摄像头页立即刷新一次状态
 }
 window.addEventListener('hashchange', () => showPage(location.hash.slice(1)));
 showPage(location.hash.slice(1) || 'live');

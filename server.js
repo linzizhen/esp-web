@@ -143,6 +143,7 @@ const state = {
   fields: {},           // 最新的真实字段值 { key: number }
   wifiSource: null,     // WiFi 上报来源 { ip }
   reportPaused: false,  // 周期上报是否被远程命令暂停（命令通道保持可用）
+  camStreaming: false,  // 板端是否正在推摄像头画面
 };
 
 let port = null;            // 当前 SerialPort 实例
@@ -823,6 +824,68 @@ function tryCsv(line) {
  * @param {string} line   一行原始文本
  * @param {object} [source] 来源上下文：{ transport:'serial'|'wifi', ip?:string }
  */
+/* ------------------------------------------------------------------ */
+/* 摄像头（OV2640）：板端把 JPEG 以 base64 内联在 JSON 里上报            */
+/*                                                                     */
+/*   {"type":"frame","device":"...","seq":N,"size":"320x240",           */
+/*    "len":6076,"jpeg":"<base64>"}                                    */
+/*                                                                     */
+/* 服务端只保留最近一帧，并向所有 MJPEG 订阅者推送。                     */
+/* 之所以用 MJPEG 而不是 WebSocket：浏览器 <img src="/api/cam.mjpg">    */
+/* 原生支持 multipart/x-mixed-replace，零 JS 即可显示实时画面。          */
+/* ------------------------------------------------------------------ */
+const cam = {
+  latest: null,      // Buffer：最近一帧 JPEG
+  latestAt: 0,
+  latestSeq: 0,
+  size: null,
+  frames: 0,
+  clients: new Set(),// MJPEG 订阅者
+};
+
+/* 从 JPEG 字节流里解析真实宽高（SOF0/1/2 段）。
+ * 为什么要这么做：实测板端 set_framesize(QVGA) 后 sensor->status 仍报 320x240，
+ * 而实际输出是 240x240 —— 与其信上报值，不如直接读字节，永远不会谎报。 */
+function jpegSize(buf) {
+  let i = 2;
+  while (i < buf.length - 9) {
+    if (buf[i] !== 0xFF) { i++; continue; }
+    const m = buf[i + 1];
+    if (m === 0xC0 || m === 0xC1 || m === 0xC2) {
+      return { h: (buf[i + 5] << 8) | buf[i + 6], w: (buf[i + 7] << 8) | buf[i + 8] };
+    }
+    if (m === 0xD8 || m === 0xD9 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
+    const len = (buf[i + 2] << 8) | buf[i + 3];
+    if (len <= 0) break;
+    i += 2 + len;
+  }
+  return null;
+}
+
+function onCameraFrame(obj) {
+  if (typeof obj.jpeg !== 'string' || !obj.jpeg.length) return;
+  let buf;
+  try { buf = Buffer.from(obj.jpeg, 'base64'); } catch (_) { return; }
+  if (!buf.length) return;
+
+  const sz = jpegSize(buf);
+  cam.latest    = buf;
+  cam.latestAt  = Date.now();
+  cam.latestSeq = obj.seq || 0;
+  cam.size      = sz ? `${sz.w}x${sz.h}` : (obj.size || null);
+  cam.bytes     = buf.length;
+  cam.frames++;
+
+  // 推给所有正在观看的浏览器
+  for (const res of cam.clients) {
+    try {
+      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buf.length}\r\n\r\n`);
+      res.write(buf);
+      res.write('\r\n');
+    } catch (_) { cam.clients.delete(res); }
+  }
+}
+
 function handleLine(line, source) {
   if (!line) return;
   const trimmed = line.trim();
@@ -859,6 +922,13 @@ function handleLine(line, source) {
           stats.linesValid++;
           pushRaw(trimmed, true);
           onHelpEvent(obj);
+          return;
+        }
+        // 摄像头帧：JPEG 以 base64 内联，单独处理。
+        // 不 pushRaw 整帧（8KB 会把原始日志刷爆），只记一条摘要。
+        if (obj.type === 'frame') {
+          stats.linesValid++;
+          onCameraFrame(obj);
           return;
         }
         const n = {};
@@ -1382,6 +1452,59 @@ const server = http.createServer(async (req, res) => {
     stats.cmdPollDevice = device;
     const item = takeCommand(device);
     return json(res, 200, item ? item.obj : {});
+  }
+
+  // ---- 摄像头（OV2640）：状态 / 开关 ----
+  if (p === '/api/cam' && req.method === 'GET') {
+    return json(res, 200, {
+      hasFrame: cam.latest != null,
+      frames: cam.frames,
+      lastAt: cam.latestAt || null,
+      seq: cam.latestSeq,
+      size: cam.size,
+      bytes: cam.latest ? cam.latest.length : 0,
+      viewers: cam.clients.size,
+      streaming: !!state.camStreaming,
+    });
+  }
+
+  if (p === '/api/cam' && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const action = body.action === 'stop' ? 'stop' : 'start';
+    const ok = sendCommand({ cmd: action === 'start' ? 'cam_on' : 'cam_off' }, state.deviceId || null);
+    if (ok) state.camStreaming = (action === 'start');
+    pushStatus('cam');
+    return json(res, 200, {
+      ok,
+      action,
+      streaming: !!state.camStreaming,
+      note: ok ? null : (config.mockDevice ? '模拟模式：未走真实通道' : '命令通道不可用（串口未打开、板端也未在轮询）'),
+    });
+  }
+
+  // 最近一帧（单张 JPEG）
+  if (p === '/api/cam.jpg') {
+    if (!cam.latest) return json(res, 404, { error: '还没有收到任何帧' });
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Content-Length': cam.latest.length,
+      'Cache-Control': 'no-store',
+    });
+    return res.end(cam.latest);
+  }
+
+  // MJPEG 实时流：浏览器 <img src="/api/cam.mjpg"> 直接可显示，无需 JS 解码
+  if (p === '/api/cam.mjpg') {
+    res.writeHead(200, {
+      'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+      'Cache-Control': 'no-store',
+      'Pragma': 'no-cache',
+      'Connection': 'close',
+    });
+    cam.clients.add(res);
+    req.on('close', () => cam.clients.delete(res));
+    return;
   }
 
   // ---- 教学求助（第 3 周）：查询当前状态 ----
