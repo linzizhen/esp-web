@@ -293,6 +293,7 @@ node test/help-test.js        # 18 项  第 3 周教学求助闭环（状态不�
 - [x] **（第 2 周）远程采集功能**：`#collect` 页 + `POST /api/collect` + 板端 `collect_once`（§9）
 - [x] **（第 2 周）请求—设备回执—新观测记录**：`/api/collect` 状态机 + 带 `request_id` 的落盘观测
 - [x] **（第 2 周）首版状态图**：[`docs/week2-remote-collect.md`](docs/week2-remote-collect.md)
+- [x] **（第 2 周）向个人项目迁移（为某个动作加执行结果追踪）**：[`docs/week2-remote-collect.md`](docs/week2-remote-collect.md) §八（唯一 id + 执行者回执 + 带同一 id 的新证据，三件套）
 - [x] **（第 3 周）实体按键与反馈**：板端 `btn_task`（ADC 自适应校准）+ `ui_task`（LED 快闪/慢闪 + ST7789 中文状态）+ `lcd_font.h`（自动生成字模）
 - [x] **（第 3 周）双向交互与取消**：`#help` 页 + `GET/POST /api/help` + 板端 `viewer_ack` / `help_cancel`
 - [x] **（第 3 周）任务说明、走查与改进记录**：§10 + [`docs/week3-button-feedback.md`](docs/week3-button-feedback.md)（状态图/时序图/实测/迁移）
