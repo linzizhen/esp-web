@@ -27,3 +27,7 @@ test/.test-data/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ---- 本地备份（临时）----
+*.bak.*
+sdkconfig.bak*
