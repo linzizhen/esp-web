@@ -50,6 +50,8 @@ const els = {
   camStats: $('camStats'), camNote: $('camNote'),
   btnCamStart: $('btnCamStart'), btnCamStop: $('btnCamStop'), btnCamShot: $('btnCamShot'),
   btnCamApply: $('btnCamApply'), camSize: $('camSize'), camQuality: $('camQuality'), camFps: $('camFps'),
+  camShot: $('camShot'), camShotTag: $('camShotTag'), camShotPlaceholder: $('camShotPlaceholder'),
+  camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'), camShotSize: $('camShotSize'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
 };
@@ -808,7 +810,8 @@ async function helpAction(action) {
 }
 
 // ---------------------------------------------------------------- 摄像头（OV2640）
-const CAM = { streaming: false, hasFrame: false, frames: 0, seq: 0, size: null, bytes: 0, viewers: 0, timer: null };
+const CAM = { streaming: false, hasFrame: false, frames: 0, seq: 0, size: null, bytes: 0, viewers: 0,
+              hasSnapshot: false, snapshotAt: 0, snapshotSize: null, snapshotBytes: 0, timer: null };
 
 async function camControl(action) {
   if (!els.camNote) return;
@@ -838,6 +841,10 @@ async function loadCam() {
     CAM.size      = d.size || null;
     CAM.bytes     = d.bytes || 0;
     CAM.viewers   = d.viewers || 0;
+    CAM.hasSnapshot   = !!d.hasSnapshot;
+    CAM.snapshotAt    = d.snapshotAt || 0;
+    CAM.snapshotSize  = d.snapshotSize || null;
+    CAM.snapshotBytes = d.snapshotBytes || 0;
     renderCam();
   } catch (_) { /* 网络抖动忽略 */ }
 }
@@ -865,6 +872,28 @@ function renderCam() {
   if (els.btnCamStart) els.btnCamStart.disabled = CAM.streaming;
   if (els.btnCamStop)  els.btnCamStop.disabled  = !CAM.streaming;
 
+  // 抓拍快照：与直播流分开展示（带时间戳参数，避免浏览器缓存旧图）
+  if (els.camShot) {
+    if (CAM.hasSnapshot) {
+      const url = '/api/cam/snapshot.jpg?t=' + CAM.snapshotAt;
+      if (els.camShot.getAttribute('src') !== url) els.camShot.setAttribute('src', url);
+      els.camShot.classList.remove('hidden');
+      if (els.camShotPlaceholder) els.camShotPlaceholder.classList.add('hidden');
+      if (els.camShotTag) { els.camShotTag.textContent = CAM.snapshotSize || '已抓拍'; els.camShotTag.className = 'tag tag-ok'; }
+      if (els.camShotDownload) { els.camShotDownload.setAttribute('href', url); els.camShotDownload.classList.remove('hidden'); }
+      if (els.camShotInfo) {
+        els.camShotInfo.textContent =
+          `${CAM.snapshotSize || '?'} · ${(CAM.snapshotBytes / 1024).toFixed(1)} KB · ${fmtTime(CAM.snapshotAt)}`;
+      }
+    } else {
+      els.camShot.classList.add('hidden');
+      if (els.camShotPlaceholder) els.camShotPlaceholder.classList.remove('hidden');
+      if (els.camShotTag) { els.camShotTag.textContent = '还没有抓拍'; els.camShotTag.className = 'tag'; }
+      if (els.camShotDownload) els.camShotDownload.classList.add('hidden');
+      if (els.camShotInfo) els.camShotInfo.textContent = '';
+    }
+  }
+
   if (els.camStats) {
     const rows = [
       ['状态',     live ? '实时画面' : (CAM.streaming ? '等待首帧' : '未开启')],
@@ -881,14 +910,28 @@ function renderCam() {
 
 if (els.btnCamStart) els.btnCamStart.onclick = () => camControl('start');
 if (els.btnCamStop)  els.btnCamStop.onclick  = () => camControl('stop');
-if (els.btnCamShot)  els.btnCamShot.onclick  = async () => {
-  if (els.camNote) els.camNote.textContent = '抓拍中…';
-  await fetch('/api/cam.jpg', { cache: 'no-store' }).catch(() => {});
-  await loadCam();
+if (els.btnCamShot) els.btnCamShot.onclick = async () => {
   if (els.camNote) {
-    els.camNote.textContent = CAM.hasFrame
-      ? '已抓拍一帧（板端抓完立即上报，最新帧已更新）。'
-      : '还没收到帧 —— 确认板子在线、且命令通道可用。';
+    els.camNote.textContent = '抓拍中…板端会临时切到所选分辨率，拍完自动切回直播分辨率。';
+  }
+  try {
+    const d = await (await fetch('/api/cam', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'shot',
+        framesize: Number(els.camShotSize ? els.camShotSize.value : 10),
+      }),
+    })).json();
+    if (!d.ok) {
+      if (els.camNote) els.camNote.textContent = '⚠ ' + (d.note || '命令通道不可用，抓拍未送达板端。');
+      return;
+    }
+    // 等高分辨率帧传完（VGA 约 11KB，UXGA 更大）
+    setTimeout(loadCam, 2500);
+    if (els.camNote) els.camNote.textContent = '已下发抓拍命令，等板端回传…';
+  } catch (e) {
+    if (els.camNote) els.camNote.textContent = '抓拍失败：' + e.message;
   }
 };
 

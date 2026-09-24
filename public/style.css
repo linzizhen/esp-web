@@ -417,6 +417,11 @@ select { appearance: none; padding: 8px 32px 8px 12px; border: 1px solid var(--l
 
 .cam-controls button { align-self: flex-end; }
 
+/* 抓拍快照区（比直播区矮一些） */
+.cam-shot-wrap { min-height: 180px; }
+.cam-shot-wrap .cam-view { max-height: 46vh; }
+a.btn { text-decoration: none; display: inline-flex; align-items: center; }
+
 /* 链路状态用两列小格 */
 #camStats {
   display: grid;

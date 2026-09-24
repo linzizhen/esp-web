@@ -835,12 +835,17 @@ function tryCsv(line) {
 /* 原生支持 multipart/x-mixed-replace，零 JS 即可显示实时画面。          */
 /* ------------------------------------------------------------------ */
 const cam = {
-  latest: null,      // Buffer：最近一帧 JPEG
+  latest: null,      // Buffer：最近一帧 JPEG（直播流）
   latestAt: 0,
   latestSeq: 0,
   size: null,
   frames: 0,
   clients: new Set(),// MJPEG 订阅者
+  // 手动抓拍的单张快照（与直播流分开存，页面上单独展示、可下载）
+  snapshot: null,
+  snapshotAt: 0,
+  snapshotSize: null,
+  snapshotBytes: 0,
 };
 
 /* 从 JPEG 字节流里解析真实宽高（SOF0/1/2 段）。
@@ -876,7 +881,15 @@ function onCameraFrame(obj) {
   cam.bytes     = buf.length;
   cam.frames++;
 
-  // 推给所有正在观看的浏览器
+  // 手动抓拍：单独存一份快照，页面上与直播流分开展示（可下载）
+  if (obj.shot === 1 || obj.shot === true) {
+    cam.snapshot      = buf;
+    cam.snapshotAt    = Date.now();
+    cam.snapshotSize  = cam.size;
+    cam.snapshotBytes = buf.length;
+  }
+
+  // 推给所有正在观看的浏览器（直播流不含快照帧，避免抓拍瞬间画面尺寸突变）
   for (const res of cam.clients) {
     try {
       res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buf.length}\r\n\r\n`);
@@ -1465,26 +1478,45 @@ const server = http.createServer(async (req, res) => {
       bytes: cam.latest ? cam.latest.length : 0,
       viewers: cam.clients.size,
       streaming: !!state.camStreaming,
+      // 手动抓拍快照
+      hasSnapshot: cam.snapshot != null,
+      snapshotAt: cam.snapshotAt || null,
+      snapshotSize: cam.snapshotSize || null,
+      snapshotBytes: cam.snapshotBytes || 0,
     });
+  }
+
+  // 手动抓拍的那一张（与直播流分开）
+  if (p === '/api/cam/snapshot.jpg') {
+    if (!cam.snapshot) return json(res, 404, { error: '还没有抓拍过' });
+    const fn = `snapshot-${new Date(cam.snapshotAt).toISOString().replace(/[:.]/g, '-')}.jpg`;
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Content-Length': cam.snapshot.length,
+      'Cache-Control': 'no-store',
+      'Content-Disposition': `inline; filename="${fn}"`,
+    });
+    return res.end(cam.snapshot);
   }
 
   if (p === '/api/cam' && req.method === 'POST') {
     let body = {};
     try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
 
-    const action = body.action === 'stop' ? 'stop' : (body.action === 'set' ? 'set' : 'start');
+    const action = (body.action === 'stop' || body.action === 'set' || body.action === 'shot')
+      ? body.action : 'start';
     let cmdObj;
-    if (action === 'set') {
-      cmdObj = { cmd: 'cam_set' };
+    if (action === 'set' || action === 'shot') {
+      cmdObj = { cmd: action === 'set' ? 'cam_set' : 'cam_shot' };
       if (body.framesize != null) cmdObj.framesize = Number(body.framesize);
       if (body.quality   != null) cmdObj.quality   = Number(body.quality);
-      if (body.fps       != null) cmdObj.fps       = Number(body.fps);
+      if (action === 'set' && body.fps != null) cmdObj.fps = Number(body.fps);
     } else {
       cmdObj = { cmd: action === 'start' ? 'cam_on' : 'cam_off' };
     }
 
     const ok = sendCommand(cmdObj, state.deviceId || null);
-    if (ok && action !== 'set') state.camStreaming = (action === 'start');
+    if (ok && (action === 'start' || action === 'stop')) state.camStreaming = (action === 'start');
     pushStatus('cam');
     return json(res, 200, {
       ok,

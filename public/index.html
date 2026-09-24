@@ -228,7 +228,7 @@
             <button id="btnCamShot"  class="btn btn-ghost">抓拍一帧</button>
           </div>
           <div class="cam-controls">
-            <label>分辨率
+            <label>直播分辨率
               <select id="camSize">
                 <option value="5">240x240</option>
                 <option value="6" selected>320x240（QVGA）</option>
@@ -255,9 +255,37 @@
                 <option value="15">15 fps</option>
               </select>
             </label>
+            <label>抓拍分辨率
+              <select id="camShotSize">
+                <option value="8">400x296</option>
+                <option value="10" selected>640x480（VGA）</option>
+                <option value="11">800x600</option>
+                <option value="12">1024x768</option>
+                <option value="15">1600x1200（UXGA）</option>
+              </select>
+            </label>
             <button id="btnCamApply" class="btn btn-ghost">应用参数</button>
           </div>
           <div id="camNote" class="ctrl-note"></div>
+        </section>
+
+        <!-- 抓拍快照：与直播流分开 -->
+        <section class="card">
+          <div class="card-head">
+            <h2>抓拍快照</h2>
+            <span id="camShotTag" class="tag">还没有抓拍</span>
+          </div>
+          <div class="cam-wrap cam-shot-wrap">
+            <img id="camShot" class="cam-view hidden" alt="抓拍快照">
+            <div id="camShotPlaceholder" class="cam-placeholder">
+              点上方「抓拍一帧」，板端会<b>临时切到你选的分辨率</b>拍一张高清单张，<br>
+              拍完自动切回直播分辨率 —— <b>不影响正在进行的直播流</b>。
+            </div>
+          </div>
+          <div class="collect-actions">
+            <a id="camShotDownload" class="btn btn-ghost hidden" download="snapshot.jpg">下载这一张</a>
+            <span id="camShotInfo" class="ctrl-note"></span>
+          </div>
         </section>
 
         <section class="card">

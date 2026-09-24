@@ -1025,8 +1025,10 @@ static int           s_cam_fps = 5;      /* 目标帧率，实际受链路带宽
 static uint32_t      s_cam_seq = 0;
 static uint32_t      s_cam_sent = 0, s_cam_drop = 0;
 
-/* 发送一帧。返回耗时毫秒（0 表示失败） */
-static int cam_send_frame(void)
+/* 发送一帧。is_shot=true 表示"手动抓拍"（会在 JSON 里带 shot:1，
+ * 服务端据此把它单独存为快照，与直播流区分开）。
+ * 返回耗时毫秒（0 表示失败） */
+static int cam_send_frame(bool is_shot)
 {
     if (!s_cam_ok) return 0;
 
@@ -1046,9 +1048,10 @@ static int cam_send_frame(void)
 
     int hdr = snprintf(out, cap,
         "{\"type\":\"frame\",\"device\":\"%s\",\"seq\":%u,\"size\":\"%s\","
-        "\"len\":%u,\"jpeg\":\"",
+        "\"len\":%u%s,\"jpeg\":\"",
         APP_DEVICE_ID, (unsigned)++s_cam_seq,
-        cam_stream_framesize_name(cam_stream_get_framesize()), (unsigned)jlen);
+        cam_stream_framesize_name(cam_stream_get_framesize()), (unsigned)jlen,
+        is_shot ? ",\"shot\":1" : "");
     if (hdr < 0 || (size_t)hdr >= cap) { free(out); cam_stream_release(); s_cam_drop++; return 0; }
 
     size_t olen = 0;
@@ -1071,12 +1074,37 @@ static int cam_send_frame(void)
 
     int ms = (int)((esp_timer_get_time() - t0) / 1000);
     s_cam_sent++;
-    if (s_cam_sent % 10 == 1) {
-        ESP_LOGI(TAG, "摄像头：第 %lu 帧 %u 字节，耗时 %d ms（约 %.1f fps）",
-                 (unsigned long)s_cam_sent, (unsigned)jlen, ms,
-                 ms > 0 ? 1000.0f / ms : 0.0f);
+    if (is_shot || s_cam_sent % 10 == 1) {
+        ESP_LOGI(TAG, "摄像头：%s %u 字节 %s，耗时 %d ms",
+                 is_shot ? "抓拍一帧" : "推流帧", (unsigned)jlen,
+                 cam_stream_framesize_name(cam_stream_get_framesize()), ms);
     }
     return ms;
+}
+
+/* 手动抓拍：可临时切到高分辨率/高画质拍一张，拍完恢复推流参数。
+ * 用途：直播用低分辨率省带宽，需要看清细节时抓一张高清单张。 */
+static void cam_take_snapshot(int framesize, int quality)
+{
+    if (!s_cam_ok) return;
+
+    int prev_fs = cam_stream_get_framesize();
+    int prev_q  = cam_stream_get_quality();
+    bool changed = false;
+
+    if ((framesize >= 0 && framesize != prev_fs) || (quality >= 0 && quality != prev_q)) {
+        cam_stream_set_params(framesize >= 0 ? framesize : prev_fs,
+                              quality   >= 0 ? quality   : prev_q);
+        changed = true;
+        vTaskDelay(pdMS_TO_TICKS(400));   /* 等传感器参数生效，否则拍到的还是旧尺寸 */
+    }
+
+    cam_send_frame(true);
+
+    if (changed) {
+        cam_stream_set_params(prev_fs, prev_q);   /* 恢复推流参数 */
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
 }
 
 /* 推流任务：按目标帧率抓帧发送。链路慢时自动降速（以实际耗时为准）。 */
@@ -1085,7 +1113,7 @@ static void cam_task(void *arg)
     (void)arg;
     while (1) {
         if (!s_cam_on || !s_cam_ok) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
-        int ms = cam_send_frame();
+        int ms = cam_send_frame(false);
         int period = 1000 / (s_cam_fps > 0 ? s_cam_fps : 1);
         int wait = period - ms;
         vTaskDelay(pdMS_TO_TICKS(wait > 10 ? wait : 10));
@@ -1139,9 +1167,16 @@ static void handle_command(const char *line)
         cmd_ack(rid, "cam_off");
         ESP_LOGI(TAG, "摄像头推流已停止（累计发送 %lu 帧）", (unsigned long)s_cam_sent);
     } else if (strcmp(cmd, "cam_shot") == 0) {
-        /* 抓一帧（不开启持续推流） */
+        /* 抓拍一帧（单张快照）。可带 framesize/quality 临时切到高分辨率，
+         * 拍完自动恢复推流参数 —— 直播用低分辨率省带宽，抓拍用高分辨率看细节。 */
         if (!s_cam_ok) { cmd_ack(rid, "no_camera"); }
-        else { cmd_ack(rid, "shot"); cam_send_frame(); }
+        else {
+            int fs = -1, q = -1;
+            json_int(line, "framesize", &fs);
+            json_int(line, "quality",   &q);
+            cmd_ack(rid, "shot");
+            cam_take_snapshot(fs, q);
+        }
     } else if (strcmp(cmd, "cam_set") == 0) {
         int fs = -1, q = -1, fps = -1;
         json_int(line, "framesize", &fs);
