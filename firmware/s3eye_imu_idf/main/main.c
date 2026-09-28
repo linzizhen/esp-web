@@ -1412,7 +1412,12 @@ void app_main(void)
     lcd_init();
     btn_init();
     xTaskCreate(ui_task,  "ui",  4096, NULL, 4, NULL);
-    xTaskCreate(btn_task, "btn", 3072, NULL, 4, NULL);
+    /* ★ btn 栈必须 ≥8192：on_button_press → send_help_event → http_post 会同步调用
+     * esp_http_client，其"连接失败"路径（esp-tls select 超时 → 传输层报错 → 清理）比成功路径
+     * 更深。实测 WiFi 断开瞬间按键，3072 字节被打穿 → "stack overflow in task btn" → 整板
+     * 软件复位（rst:0xc RTC_SW_CPU_RST），断网验证当场翻车 8 次。
+     * 主任务跑同一个 http_post（8192 字节，含失败帧共 49 万+ 次）从未溢出，故对齐 8192。 */
+    xTaskCreate(btn_task, "btn", 8192, NULL, 4, NULL);
 
     wifi_init();
     if (wifi_wait(15000)) {
