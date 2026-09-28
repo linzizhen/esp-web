@@ -1065,6 +1065,15 @@ function showPage(name) {
   S.page = name;
   document.querySelectorAll('.page').forEach((el) => el.classList.toggle('on', el.dataset.page === name));
   document.querySelectorAll('.pagetab').forEach((el) => el.classList.toggle('on', el.dataset.page === name));
+
+  // 离开摄像头页时主动断开 MJPEG。
+  // 否则 <img src="/api/cam.mjpg"> 会一直保持连接，浏览器在后台以推流帧率
+  // 持续解码（板端也在白推流），占用主线程 —— 在实时监控页上就表现为卡顿。
+  // 回到摄像头页时 loadCam() → renderCam() 会重新挂上 src，自动恢复画面。
+  if (name !== 'cam' && els.camView && els.camView.getAttribute('src')) {
+    els.camView.removeAttribute('src');
+  }
+
   needDraw = true;   // 回到实时页时立即重画（隐藏期间画布尺寸为 0）
   invalidateCanvasRects();   // 页面切换会改变画布可见尺寸，缓存的 rect 需重测
   if (name === 'cam') loadCam();   // 进入摄像头页立即刷新一次状态
