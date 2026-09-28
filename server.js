@@ -739,11 +739,29 @@ function goStale(reason) {
 /* 数据处理                                                            */
 /* ------------------------------------------------------------------ */
 
+/* 原始日志的 WS 广播做批量合并。
+ *
+ * 性能要点：每收到一帧都会有一条原始日志，若逐条广播，10Hz 下就是每秒 10 条
+ * WS 消息（内容还与 sample 消息重复）。合并成每 250ms 一批后，消息数降到约 1/4，
+ * 客户端也能一次性批量写 DOM，避免逐条 append 造成的重排。 */
+let rawBatch = [];
+let rawBatchTimer = null;
+const RAW_BATCH_MS = 250;
+
 function pushRaw(text, ok) {
   if (!ok) stats.lastError = text;
   rawLog.push({ ts: Date.now(), text, ok: !!ok });
   if (rawLog.length > RAW_LOG_MAX) rawLog.shift();
-  broadcast({ type: 'raw', ts: Date.now(), text, ok: !!ok });
+
+  rawBatch.push({ ts: Date.now(), text, ok: !!ok });
+  if (!rawBatchTimer) {
+    rawBatchTimer = setTimeout(() => {
+      rawBatchTimer = null;
+      const items = rawBatch;
+      rawBatch = [];
+      if (items.length) broadcast({ type: 'raw-batch', items });
+    }, RAW_BATCH_MS);
+  }
 }
 
 /**

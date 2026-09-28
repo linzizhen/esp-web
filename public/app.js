@@ -147,8 +147,39 @@ function setLevelZero(z) {
   needDraw = true;
 }
 
+/* 三轴面板的 DOM 节点缓存。
+ *
+ * 性能要点：原实现每收到一帧就 `els.imuPanel.innerHTML = col('x')+col('y')+col('z')`，
+ * 即每秒重建约 10 次、每次 ~15 个节点 —— 浏览器必须重新解析 HTML 并重排整块面板。
+ * 在 10Hz 上报下这会持续抢占主线程，表现为页面"卡顿"。
+ * 改为：结构只建一次，之后仅更新文本与进度条宽度（不触发重排）。 */
+let imuNodes = null;
+
+function buildImuPanel() {
+  els.imuPanel.innerHTML = '';
+  const mk = (axis) => {
+    const d = document.createElement('div');
+    d.className = 'axis ' + axis;
+    d.innerHTML =
+      '<div class="axis-top">' +
+        '<span class="axis-name ' + axis + '">' + AXIS_LABEL[axis] + '</span>' +
+        '<span class="axis-ms2">— m/s²</span>' +
+      '</div>' +
+      '<div class="axis-g"><b>—</b><span class="u">g</span></div>' +
+      '<div class="axis-bar"><i></i></div>';
+    els.imuPanel.appendChild(d);
+    return {
+      ms2: d.querySelector('.axis-ms2'),
+      g:   d.querySelector('.axis-g b'),
+      bar: d.querySelector('.axis-bar i'),
+    };
+  };
+  imuNodes = { x: mk('x'), y: mk('y'), z: mk('z') };
+}
+
 function imuEmpty(msg) {
   els.imuPanel.classList.remove('stale');
+  imuNodes = null;                       // 结构已被替换，缓存失效
   els.imuPanel.innerHTML = `<div class="imu-empty">${escHtml(msg)}</div>`;
 }
 
@@ -170,31 +201,32 @@ function renderImu(fields) {
     return;
   }
 
-  const col = (axis) => {
+  if (!imuNodes) buildImuPanel();        // 首次有数据时建结构
+
+  for (const axis of ['x', 'y', 'z']) {
     const a = axes[axis];
     const g = a.g != null ? a.g : null;
     const ms2 = a.ms2 != null ? a.ms2 : null;
+    const n = imuNodes[axis];
+    // 只在文本真的变了才写 DOM（避免无意义的重排）
+    const ms2Text = ms2 != null ? fmtNum(ms2) + ' m/s²' : '— m/s²';
+    if (n.ms2.textContent !== ms2Text) n.ms2.textContent = ms2Text;
+    const gText = g != null ? fmtNum(g) : '—';
+    if (n.g.textContent !== gText) n.g.textContent = gText;
     // 进度条：以 ±2g 为满量程，中心线为 0
     let barStyle = 'left:50%;width:0';
     if (g != null) {
       const w = clamp(Math.abs(g) / 2, 0, 1) * 50;
       barStyle = g >= 0 ? `left:50%;width:${w}%` : `left:${50 - w}%;width:${w}%`;
     }
-    return `
-      <div class="axis ${axis}">
-        <div class="axis-top">
-          <span class="axis-name ${axis}">${AXIS_LABEL[axis]}</span>
-          <span class="axis-ms2">${ms2 != null ? fmtNum(ms2) : '—'} m/s²</span>
-        </div>
-        <div class="axis-g"><b>${g != null ? fmtNum(g) : '—'}</b><span class="u">g</span></div>
-        <div class="axis-bar"><i style="${barStyle}"></i></div>
-      </div>`;
-  };
+    if (n.bar.style.cssText !== barStyle) n.bar.style.cssText = barStyle;
+  }
 
   els.imuPanel.classList.toggle('stale', !S.live);
-  els.imuPanel.innerHTML = col('x') + col('y') + col('z');
-  els.imuTag.textContent = S.live ? '实时' : '停采保留';
-  els.imuTag.className = 'tag' + (S.live ? ' tag-ok' : ' tag-warn');
+  const tagText = S.live ? '实时' : '停采保留';
+  if (els.imuTag.textContent !== tagText) els.imuTag.textContent = tagText;
+  const tagCls = 'tag' + (S.live ? ' tag-ok' : ' tag-warn');
+  if (els.imuTag.className !== tagCls) els.imuTag.className = tagCls;
 
   // 重力方向指示：静止水平时居中；倾斜时圆点偏向重力在 XY 平面的投影方向。
   // 若已「水平归零」，则按相对基准的差值绘制。
@@ -333,11 +365,27 @@ function renderSample(fields, ts) {
 }
 
 // ---------------------------------------------------------------- 绘图
+/* 画布尺寸缓存。
+ *
+ * 性能要点：getBoundingClientRect() 会强制浏览器立即完成一次同步布局
+ * （forced synchronous layout）。图表每重绘一次就调用一次，8~10Hz 下等于
+ * 每秒额外触发十几次全页重排 —— 这是实时页卡顿的第三个来源。
+ * 画布尺寸只在「窗口缩放」和「页面切换」（隐藏时尺寸为 0）时才会变，
+ * 因此缓存测量结果，仅在这两个时机失效重测。 */
+const _rectCache = new WeakMap();
+let _rectEpoch = 0;
+function invalidateCanvasRects() { _rectEpoch++; }
+
 function fitCanvas(canvas) {
   const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  const w = Math.max(1, Math.round(rect.width || canvas.clientWidth || 300));
-  const h = Math.max(1, Math.round(rect.height || canvas.clientHeight || 200));
+  let c = _rectCache.get(canvas);
+  if (!c || c.epoch !== _rectEpoch) {
+    const rect = canvas.getBoundingClientRect();
+    c = { epoch: _rectEpoch, w: rect.width, h: rect.height };
+    _rectCache.set(canvas, c);
+  }
+  const w = Math.max(1, Math.round(c.w || canvas.clientWidth || 300));
+  const h = Math.max(1, Math.round(c.h || canvas.clientHeight || 200));
   if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
     canvas.width = Math.round(w * dpr);
     canvas.height = Math.round(h * dpr);
@@ -529,7 +577,7 @@ function frame() {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-window.addEventListener('resize', () => { needDraw = true; });
+window.addEventListener('resize', () => { needDraw = true; invalidateCanvasRects(); });
 
 // ---------------------------------------------------------------- 远程采集（第 2 周）
 // 核心原则：只展示带 request_id 的新观测，绝不拿数据库里的旧值冒充本次结果。
@@ -846,7 +894,27 @@ async function loadCam() {
     CAM.snapshotSize  = d.snapshotSize || null;
     CAM.snapshotBytes = d.snapshotBytes || 0;
     renderCam();
+    resolveShotPending();
   } catch (_) { /* 网络抖动忽略 */ }
+}
+
+/* 抓拍是异步的：下发命令后要等板端抓完、编码、经链路回传。
+ * 这里用「snapshotAt 是否变化」作为唯一判据 —— 变化了才算真拿到新帧，
+ * 否则一律如实报超时，绝不显示成功。 */
+let camShotPending = false;
+let camShotTimer = null;
+let camShotBaseline = 0;
+
+function resolveShotPending() {
+  if (!camShotPending) return;
+  if (CAM.snapshotAt && CAM.snapshotAt !== camShotBaseline) {
+    camShotPending = false;
+    clearTimeout(camShotTimer);
+    if (els.camNote) {
+      els.camNote.textContent =
+        `✅ 已抓到一张：${CAM.snapshotSize || '?'} · ${(CAM.snapshotBytes / 1024).toFixed(1)} KB`;
+    }
+  }
 }
 
 function renderCam() {
@@ -911,6 +979,9 @@ function renderCam() {
 if (els.btnCamStart) els.btnCamStart.onclick = () => camControl('start');
 if (els.btnCamStop)  els.btnCamStop.onclick  = () => camControl('stop');
 if (els.btnCamShot) els.btnCamShot.onclick = async () => {
+  if (camShotPending) return;                 // 防重复点击
+  camShotBaseline = CAM.snapshotAt || 0;
+  camShotPending  = true;
   if (els.camNote) {
     els.camNote.textContent = '抓拍中…板端会临时切到所选分辨率，拍完自动切回直播分辨率。';
   }
@@ -924,13 +995,26 @@ if (els.btnCamShot) els.btnCamShot.onclick = async () => {
       }),
     })).json();
     if (!d.ok) {
+      camShotPending = false;
       if (els.camNote) els.camNote.textContent = '⚠ ' + (d.note || '命令通道不可用，抓拍未送达板端。');
       return;
     }
-    // 等高分辨率帧传完（VGA 约 11KB，UXGA 更大）
-    setTimeout(loadCam, 2500);
     if (els.camNote) els.camNote.textContent = '已下发抓拍命令，等板端回传…';
+    // 高分辨率帧（VGA 约 13KB、UXGA 更大）经链路回传需要时间，轮询等它
+    camShotTimer = setTimeout(() => {
+      if (!camShotPending) return;
+      camShotPending = false;
+      if (els.camNote) {
+        els.camNote.textContent = '⚠ 超时：板端未回传新帧。请确认命令通道可用、板子在线。';
+      }
+    }, 15000);
+    // 主动多查几次，比等 3 秒定时器更及时
+    for (let i = 0; i < 8 && camShotPending; i++) {
+      await new Promise((r) => setTimeout(r, 1200));
+      await loadCam();
+    }
   } catch (e) {
+    camShotPending = false;
     if (els.camNote) els.camNote.textContent = '抓拍失败：' + e.message;
   }
 };
@@ -982,21 +1066,47 @@ function showPage(name) {
   document.querySelectorAll('.page').forEach((el) => el.classList.toggle('on', el.dataset.page === name));
   document.querySelectorAll('.pagetab').forEach((el) => el.classList.toggle('on', el.dataset.page === name));
   needDraw = true;   // 回到实时页时立即重画（隐藏期间画布尺寸为 0）
+  invalidateCanvasRects();   // 页面切换会改变画布可见尺寸，缓存的 rect 需重测
   if (name === 'cam') loadCam();   // 进入摄像头页立即刷新一次状态
 }
 window.addEventListener('hashchange', () => showPage(location.hash.slice(1)));
 showPage(location.hash.slice(1) || 'live');
 
 // ---------------------------------------------------------------- 原始日志
-function appendRaw(ts, text, ok) {
-  const div = document.createElement('div');
-  div.className = 'line' + (ok ? ' ok' : ' err');
-  div.innerHTML = `<span class="ts">${fmtTime(ts)}</span>${escHtml(text)}`;
-  els.rawLog.appendChild(div);
-  while (els.rawLog.childElementCount > 300) els.rawLog.removeChild(els.rawLog.firstChild);
-  els.rawLog.scrollTop = els.rawLog.scrollHeight;
+/* 原始日志。
+ *
+ * 性能要点：每收到一帧就会有一条原始日志。若每次直接 appendChild 并给
+ * scrollTop 赋值，浏览器必须为每次赋值做一次同步布局（forced reflow）——
+ * 10Hz 下就是每秒十几次整页重排，这是实时页卡顿的第二个来源。
+ * 改为：先入队，用 requestAnimationFrame 合并成一次批量写入（DocumentFragment），
+ * 并且只在用户本来就贴着底部时才自动滚动（否则会打断向上翻阅历史）。 */
+let rawPending = [];
+let rawRaf = 0;
+const RAW_DOM_MAX = 300;
+
+function flushRaw() {
+  rawRaf = 0;
+  if (!rawPending.length) return;
+  const el = els.rawLog;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  const frag = document.createDocumentFragment();
+  for (const it of rawPending) {
+    const div = document.createElement('div');
+    div.className = 'line' + (it.ok ? ' ok' : ' err');
+    div.innerHTML = `<span class="ts">${fmtTime(it.ts)}</span>${escHtml(it.text)}`;
+    frag.appendChild(div);
+  }
+  rawPending = [];
+  el.appendChild(frag);
+  while (el.childElementCount > RAW_DOM_MAX) el.removeChild(el.firstChild);
+  if (nearBottom) el.scrollTop = el.scrollHeight;
 }
-els.btnClearLog.onclick = () => { els.rawLog.innerHTML = ''; };
+
+function appendRaw(ts, text, ok) {
+  rawPending.push({ ts, text, ok });
+  if (!rawRaf) rawRaf = requestAnimationFrame(flushRaw);
+}
+els.btnClearLog.onclick = () => { rawPending = []; els.rawLog.innerHTML = ''; };
 
 // ---------------------------------------------------------------- 端口
 async function loadPorts() {
@@ -1330,6 +1440,11 @@ function connect() {
     }
 
     if (m.type === 'raw') { appendRaw(m.ts, m.text, m.ok); return; }
+    // 服务端把原始日志按 250ms 合并成批，这里一次性入队（appendRaw 内部还会再合并到一帧）
+    if (m.type === 'raw-batch') {
+      for (const it of (m.items || [])) appendRaw(it.ts, it.text, it.ok);
+      return;
+    }
   };
 
   ws.onclose = () => {

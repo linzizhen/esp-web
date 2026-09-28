@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "esp_system.h"
 #include "esp_log.h"
@@ -1025,10 +1026,25 @@ static int           s_cam_fps = 5;      /* 目标帧率，实际受链路带宽
 static uint32_t      s_cam_seq = 0;
 static uint32_t      s_cam_sent = 0, s_cam_drop = 0;
 
-/* 发送一帧。is_shot=true 表示"手动抓拍"（会在 JSON 里带 shot:1，
+/* 摄像头互斥锁。
+ * 推流任务（cam_task）与「抓拍」命令（handle_command → cam_take_snapshot）
+ * 会并发访问摄像头，而帧缓冲在 cam_stream.c 里是单份全局状态：
+ *   - cam_stream_capture() 开头会先 cam_stream_release()
+ *     → 一方抓帧时会把另一方正在使用的帧缓冲提前归还掉
+ *   - 两个任务同时调 esp_camera_fb_get() 会打乱驱动内部的帧队列
+ * 实测症状：第一次抓拍正常，之后每次抓拍都拿不到新帧
+ * （服务端 snapshotAt 不再变化），但推流与 IMU 上报都还正常。
+ * 因此所有摄像头访问都必须串行化。 */
+static SemaphoreHandle_t s_cam_mtx = NULL;
+
+#define CAM_LOCK()   do { if (s_cam_mtx) xSemaphoreTake(s_cam_mtx, portMAX_DELAY); } while (0)
+#define CAM_UNLOCK() do { if (s_cam_mtx) xSemaphoreGive(s_cam_mtx); } while (0)
+
+/* 发送一帧（内部版本）。is_shot=true 表示"手动抓拍"（会在 JSON 里带 shot:1，
  * 服务端据此把它单独存为快照，与直播流区分开）。
+ * ★ 调用方必须已持有 s_cam_mtx —— 摄像头访问必须串行化，见其定义处注释。
  * 返回耗时毫秒（0 表示失败） */
-static int cam_send_frame(bool is_shot)
+static int cam_send_frame_locked(bool is_shot)
 {
     if (!s_cam_ok) return 0;
 
@@ -1082,12 +1098,25 @@ static int cam_send_frame(bool is_shot)
     return ms;
 }
 
+/* 发送一帧（加锁版本，供推流任务使用） */
+static int cam_send_frame(bool is_shot)
+{
+    CAM_LOCK();
+    int ms = cam_send_frame_locked(is_shot);
+    CAM_UNLOCK();
+    return ms;
+}
+
 /* 手动抓拍：可临时切到高分辨率/高画质拍一张，拍完恢复推流参数。
- * 用途：直播用低分辨率省带宽，需要看清细节时抓一张高清单张。 */
+ * 用途：直播用低分辨率省带宽，需要看清细节时抓一张高清单张。
+ * ★ 整个过程（切换 → 等生效 → 抓帧 → 恢复）独占摄像头：
+ *   否则推流任务会在分辨率切换中途抓帧，既可能拍到半帧，
+ *   也会因帧缓冲竞争导致后续抓拍彻底失效。 */
 static void cam_take_snapshot(int framesize, int quality)
 {
     if (!s_cam_ok) return;
 
+    CAM_LOCK();
     int prev_fs = cam_stream_get_framesize();
     int prev_q  = cam_stream_get_quality();
     bool changed = false;
@@ -1099,12 +1128,13 @@ static void cam_take_snapshot(int framesize, int quality)
         vTaskDelay(pdMS_TO_TICKS(400));   /* 等传感器参数生效，否则拍到的还是旧尺寸 */
     }
 
-    cam_send_frame(true);
+    cam_send_frame_locked(true);
 
     if (changed) {
         cam_stream_set_params(prev_fs, prev_q);   /* 恢复推流参数 */
         vTaskDelay(pdMS_TO_TICKS(300));
     }
+    CAM_UNLOCK();
 }
 
 /* 推流任务：按目标帧率抓帧发送。链路慢时自动降速（以实际耗时为准）。 */
@@ -1329,6 +1359,7 @@ void app_main(void)
 
     /* 摄像头（OV2640）：SCCB 在 GPIO4/5，与 IMU 同一条总线，
      * 因此必须复用 IMU 已建好的 I2C 端口，不能另建一条。 */
+    s_cam_mtx = xSemaphoreCreateMutex();   /* 串行化摄像头访问（推流 vs 抓拍） */
     if (s_imu_port >= 0) {
         s_cam_ok = cam_stream_init(s_imu_port);
         if (!s_cam_ok) {
