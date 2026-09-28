@@ -147,7 +147,9 @@ const HELP = (extra) => Object.assign({
     console.error('测试异常：', e);
     fail++;
   } finally {
-    try { await jpost('/api/config', { autoDetect: true, autoReconnect: true }); } catch (_) { /* 忽略 */ }
+    // 保持关闭：测试用的隔离配置必须 autoDetect=false，否则会连上真实板子，
+    // 板子持续上报会让"停采/注入"类断言失效（历史假失败根因）。
+    try { await jpost('/api/config', { autoDetect: false, autoReconnect: false }); } catch (_) { /* 忽略 */ }
     srv.kill('SIGKILL');
     await sleep(200);
   }

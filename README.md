@@ -467,11 +467,17 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 
 ## 九、自检
 
+全套 **110 项**。测试实例统一使用 `test/.test-config.json` 隔离配置（`autoDetect:false`），
+所以**开发板插着也能跑**，不会互相干扰（此前板子在线会导致"停采保留"类断言假失败，已修复）。
+
 ```bash
-node test/e2e-test.js      # 数据链路：空状态 / 上报解析 / 离线清空 / 非法报文过滤
-node test/feature-test.js  # 诊断接口 / 录制导出 / CSV 内容
-node test/parse-test.js    # 通用解析：JSON / 键值 / 中文键 / 误解析防护
-node test/help-test.js     # 第 3 周：教学求助闭环（自带服务，独立端口 8097，18 项）
+# 下面三个需要先在 8080 起服务：npm start
+node test/e2e-test.js      # 数据链路：空状态 / 上报解析 / 离线清空 / 非法报文过滤（14 项）
+node test/feature-test.js  # 诊断接口 / 录制导出 / CSV 内容（14 项）
+node test/parse-test.js    # 通用解析：JSON / 键值 / 中文键 / 误解析防护（10 项）
+
+# 以下自带服务，无需先启动（各自独立端口）
+node test/help-test.js     # 第 3 周：教学求助闭环（端口 8097，26 项）
 node test/listen.js COM4 25  # 原样监听某个串口 25 秒，看板子到底在发什么
 ```
 

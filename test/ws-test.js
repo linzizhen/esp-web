@@ -18,7 +18,8 @@ function req(opts, body) {
 }
 
 (async () => {
-  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1' }), stdio: 'ignore' });
+  // 用隔离配置，避免测试实例连上真实板子（板子在线会让"停采"场景失效，造成假失败）
+  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: require('node:path').join(__dirname, '.test-config.json') }), stdio: 'ignore' });
   await sleep(1200);
   const got = { hello: null, sample: [], stale: null, cleared: null };
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);

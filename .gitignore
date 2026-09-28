@@ -20,7 +20,9 @@ recordings/*.csv
 _*.log
 _idf*.log
 server.log
-test/.test-config.json
+# 注意：test/.test-config.json 是测试夹具（无敏感信息，被 acceptance/e2e/verify/
+# help/storage/ws 等多个测试引用），必须纳入版本控制 —— 否则 clone 后各测试
+# 会退回到默认配置（autoDetect=true），连上真实板子产生"停采"类假失败。
 test/.test-data/
 
 # ---- 系统文件 ----
