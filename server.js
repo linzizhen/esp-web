@@ -899,6 +899,41 @@ function onCameraFrame(obj) {
   }
 }
 
+/* ------------------------------------------------------------------
+ * 双通道去重（安全网）
+ *
+ * 背景：板端每一帧同时走两条路上报 —— printf → USB 串口，http_post → WiFi。
+ * 两路都连着时，服务端本可能收到同一帧两次，破坏「一帧观测 = 一条记录」。
+ *
+ * 现状（2026-09-28 实测）：/api/data 里已有一条「串口优先」规则
+ * （串口在线时忽略 WiFi 上报），受控 A/B 测试显示它已经足够：
+ *     纯 WiFi 95 条/12 秒  vs  双通道 92 条/12 秒（比值 0.97）
+ * 因此本去重当前不会触发，属于**额外保险**，而非必需项。
+ *
+ * 那为什么还留着：那条规则依赖 state.transport 这个共享可变标志 ——
+ * 串口刚重连的一瞬间，transport 还停留在 'wifi'，此时到达的 WiFi 帧会被
+ * 放行；等串口帧把它改回 'serial' 之后才恢复拦截。这个竞态窗口内就可能
+ * 产生重复。本函数以不可变的 (device, seq) 为键，与标志位无关，能兜住它。
+ *
+ * 窗口取 5 秒：足以覆盖两路之间的到达间隔，又能在板子重启后 seq 归零重来
+ * 时不被误判为重复。
+ * ------------------------------------------------------------------ */
+const DEDUP_WINDOW_MS = 5000;
+const dedupSeen = new Map();     // "device#seq" -> 首次到达时间戳
+
+function isDuplicateFrame(device, seq) {
+  if (typeof seq !== 'number' || !device) return false;
+  const key = `${device}#${seq}`;
+  const now = Date.now();
+  const seenAt = dedupSeen.get(key);
+  if (seenAt != null && now - seenAt < DEDUP_WINDOW_MS) return true;
+  dedupSeen.set(key, now);
+  if (dedupSeen.size > 500) {    // 顺手清理过期项，避免无限增长
+    for (const [k, t] of dedupSeen) if (now - t > DEDUP_WINDOW_MS) dedupSeen.delete(k);
+  }
+  return false;
+}
+
 function handleLine(line, source) {
   if (!line) return;
   const trimmed = line.trim();
@@ -979,6 +1014,13 @@ function handleLine(line, source) {
   state.deviceVerified = !config.expectedDeviceId || state.deviceId === config.expectedDeviceId;
   if (typeof meta.ts === 'number') { state.boardTs = meta.ts; state.boardIso = meta.iso || null; }
   if (typeof meta.seq === 'number') state.seq = meta.seq;
+
+  // 双通道去重：同一帧的串口副本与 WiFi 副本 (device, seq) 相同，只认第一份。
+  // 必须在任何副作用（状态更新 / 原始日志 / 落盘 / WebSocket 推送）之前返回。
+  if (isDuplicateFrame(meta.device || state.deviceId, meta.seq)) {
+    stats.linesDuplicate = (stats.linesDuplicate || 0) + 1;
+    return;
+  }
 
   const recvTs = Date.now();
   state.connected = true;
@@ -1070,7 +1112,12 @@ function attachPortHandlers() {
     while ((idx = lineBuffer.indexOf('\n')) >= 0) {
       const line = lineBuffer.slice(0, idx);
       lineBuffer = lineBuffer.slice(idx + 1);
-      handleLine(line.replace(/\r$/, ''));
+      // ★ 必须显式声明来源是串口。
+      // 否则 handleLine 会退化成 `state.transport`，而 /api/data 的 WiFi 处理器
+      // 会先把它设成 'wifi' —— 结果是：串口数据被标成 wifi，且
+      // 「串口优先」规则的判断条件 state.transport === 'serial' 永远不成立，
+      // WiFi 副本从此再也不会被忽略，同一帧被记录两次。
+      handleLine(line.replace(/\r$/, ''), { transport: 'serial' });
     }
     if (lineBuffer.length > 65536) lineBuffer = ''; // 防御性截断
   });
@@ -1390,7 +1437,14 @@ const server = http.createServer(async (req, res) => {
       connected: state.connected,
       transport: state.transport,
       bytesReceived: stats.bytesReceived,
-      lines: { total: stats.linesTotal, valid: stats.linesValid, invalid: stats.linesInvalid },
+      lines: {
+        total: stats.linesTotal,
+        valid: stats.linesValid,
+        invalid: stats.linesInvalid,
+        // 双通道（串口 + WiFi 同时在线）时被丢弃的重复帧数。
+        // 正常值：只连一路时为 0；两路都连时约等于其中一路的帧数。
+        duplicate: stats.linesDuplicate || 0,
+      },
       lastError: stats.lastError,
       lastOpenError: stats.lastOpenError,
       recording: { active: recording.active, rows: recording.rows.length },
