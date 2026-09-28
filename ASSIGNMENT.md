@@ -635,6 +635,43 @@ node test/help-test.js        # 26 项  第 3 周教学求助闭环（状态不�
 **验证**：烧录后梯度回归 **QVGA / CIF / VGA / SVGA 全部 3/3**；
 自动化测试 acceptance 12/0、help 26/0、storage 19/0、ws 9/0、verify 6/0，无回归。
 
+**★ 二次回归（2026-09-28，把前端提供的 5 档全部跑完）—— 发现还有第二层限制**：
+
+| framesize | 分辨率 | 实测帧大小 | 结果 |
+|-----------|--------|-----------|------|
+| 10 | 640x480 VGA | 10.4 KB | **3/3** ✅ |
+| 11 | 800x600 SVGA | 15.2 KB | **3/3** ✅（距上限仅 119 字节） |
+| 12 | 1024x768 XGA | 超限 | **0/3** ❌ |
+| 15 | 1600x1200 UXGA | 超限 | **0/3** ❌ |
+
+失败时板端会明确打印 `抓拍命令执行完毕：失败（耗时 0 ms）` + `抓帧失败（累计 N 次）`
+—— 失败可见，这正是上一节修复带来的价值。
+
+**第二层根因：帧缓冲大小在初始化时算死，运行时改分辨率不会重新分配。**
+
+`managed_components/espressif__esp32-camera/driver/cam_hal.c` → `cam_config()`：
+
+```c
+cam_obj->width     = resolution[frame_size].width;            // frame_size = init 时传入的
+cam_obj->recv_size = cam_obj->width * cam_obj->height / 5;    // JPEG_MODE_FRAME_SIZE_AUTO=y
+cam_obj->fb_size   = cam_obj->recv_size;
+```
+
+- `sdkconfig` 中 `CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_AUTO=y`
+- 初始化时 frame_size = QVGA(320x240) → **`fb_size` = 320×240/5 = 15360 字节**，写死
+- `cam_config()` **只在 `esp_camera_init()` 时调用一次**；运行时 `set_framesize()`
+  只写传感器寄存器，**不重新分配帧缓冲**
+- 因此帧超过 15360 字节时 `esp_camera_fb_get()` 直接返回 NULL → 抓帧失败
+
+**★ 800x600 只剩 119 字节余量**（15241 / 15360）—— 画质调好一点就会翻车。
+**抓拍推荐用 640x480，800x600 已是极限。**
+
+**处置**：前端抓拍下拉框去掉 1024x768 / UXGA 两档，只留 400x296 / 640x480 / 800x600
+（选了必然失败的档位不如不给）。若确要支持更高分辨率，需要二选一：
+① 抓拍时 `deinit + init` 到目标分辨率，抓完切回（每次约 2~3 秒，推流会中断）；
+② 改 `CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_AUTO=n` 并手动指定更大的 `fb_size`
+（`recv_size` 会一并变大，影响 DMA 与内存占用，必须实测）。
+
 > **教训**：失败路径如果不留日志，排查成本会成倍上升 ——
 > 本次真正的问题不是"抓拍失败"，而是**失败不可见**。
 > 另外 `cam_stream_set_params()` 忽略了 `set_framesize()` 的返回值，

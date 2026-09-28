@@ -255,13 +255,20 @@
                 <option value="15">15 fps</option>
               </select>
             </label>
+            <!-- 抓拍分辨率上限说明（2026-09-28 实测）：
+                 帧缓冲在摄像头初始化时按 QVGA 算死 —— esp32-camera 的 cam_config()
+                 里 fb_size = width*height/5 = 320*240/5 = 15360 字节，且只在 init 时
+                 分配一次；运行时 set_framesize() 只改传感器寄存器，不重分配缓冲。
+                 因此 JPEG 超过 15360 字节的分辨率，esp_camera_fb_get() 必然失败：
+                     640x480 → 10.4KB  OK（3/3）
+                     800x600 → 15.2KB  OK（3/3，但只剩 119 字节余量，已接近上限）
+                     1024x768 / 1600x1200 → 0/3，帧超限，抓不到
+                 故只提供到 800x600。详见 ASSIGNMENT.md §11.8 -->
             <label>抓拍分辨率
               <select id="camShotSize">
                 <option value="8">400x296</option>
-                <option value="10" selected>640x480（VGA）</option>
-                <option value="11">800x600</option>
-                <option value="12">1024x768</option>
-                <option value="15">1600x1200（UXGA）</option>
+                <option value="10" selected>640x480（VGA，最稳）</option>
+                <option value="11">800x600（上限）</option>
               </select>
             </label>
             <button id="btnCamApply" class="btn btn-ghost">应用参数</button>
