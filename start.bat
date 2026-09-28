@@ -3,7 +3,13 @@ chcp 65001 >nul
 cd /d "%~dp0"
 title ESP32-S3-EYE 三轴传感器监控（本机服务器）
 
-set NODE_BIN=C:\Users\user\.workbuddy-ai\binaries\node\versions\22.22.2-2\node.exe
+rem 优先用 PATH 里的 node；找不到再退回 WorkBuddy 托管的 node。
+rem ★ 托管运行时升级后版本目录名会变（如 22.22.2-2 → 22.22.2-3），
+rem   所以这里**动态查找**而不是写死版本号 —— 写死会在升级后静默失效。
+set "NODE_BIN="
+for /d %%d in ("%USERPROFILE%\.workbuddy-ai\binaries\node\versions\*") do (
+  if exist "%%d\node.exe" set "NODE_BIN=%%d\node.exe"
+)
 
 echo.
 echo   启动本机服务器（电脑即服务器，不依赖 VPS）…
