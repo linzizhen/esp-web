@@ -45,6 +45,7 @@
     <a href="#help"    class="pagetab" data-page="help">教学求助<span id="helpBadge" class="tab-badge hidden"></span></a>
     <a href="#cam"     class="pagetab" data-page="cam">摄像头</a>
     <a href="#records" class="pagetab" data-page="records">记录与设备</a>
+    <a href="#ask"     class="pagetab" data-page="ask">自然语言</a>
   </nav>
 
   <main class="pages">
@@ -374,6 +375,33 @@
             </div>
             <div id="rawLog" class="log"></div>
           </details>
+        </section>
+
+      </div>
+    </section>
+
+    <!-- ==================== ⑤ 自然语言助手（第 4 周功能） ==================== -->
+    <section class="page" data-page="ask">
+      <div class="grid">
+
+        <section class="card ask-hero">
+          <div class="card-head">
+            <h2>自然语言助手</h2>
+            <span id="nlEngine" class="tag">…</span>
+          </div>
+          <p class="hint" id="nlCap">能力说明加载中…</p>
+          <div id="nlChat" class="nl-chat">
+            <div class="nl-empty">试试输入：<b>查看上次数据</b> 或 <b>重新采集一次</b></div>
+          </div>
+          <form id="nlForm" class="nl-form">
+            <input id="nlInput" class="nl-input" maxlength="200" autocomplete="off"
+                   placeholder="例如：查看上次数据 / 重新采集一次" />
+            <button id="nlSend" class="btn btn-primary" type="submit">发送</button>
+          </form>
+          <div class="ctrl-note">
+            受限助手：只提供【查看上次数据】与【重新采集一次】两个工具；密钥留在服务端；
+            无完成证据时不会声称“采集成功”；设备不提供位置信息，不会生成坐标。
+          </div>
         </section>
 
       </div>

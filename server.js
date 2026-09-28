@@ -736,6 +736,236 @@ function goStale(reason) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 自然语言助手（第 4 周）：自然语言 → 意图 → 受限工具 → 真实结果        */
+/*                                                                     */
+/* 三条设计红线：                                                       */
+/*   ① 密钥留服务端：LLM 密钥只读自 config.local.json（gitignored）或    */
+/*      环境变量，绝不进 config.json（受版本控制），前端拿不到；          */
+/*   ② 工具受限：只暴露 query_last / collect_once 两件事，               */
+/*      设备白名单 + 意图白名单，越界一律拒绝；                           */
+/*   ③ 诚实性：query 保留旧时间并声明"是历史记录"；                      */
+/*      collect 必须等到状态机 completed 才说"采集成功"；                */
+/*      无位置数据时如实说明，绝不生成坐标。                              */
+/* ------------------------------------------------------------------ */
+
+/* ---- LLM 配置（OpenAI 兼容协议；教师授权服务 / 任意兼容服务均可接入） ---- */
+const NL_LOCAL_PATH = path.join(ROOT, 'config.local.json');
+let nlFileCfg = {};
+try {
+  if (fs.existsSync(NL_LOCAL_PATH)) nlFileCfg = JSON.parse(fs.readFileSync(NL_LOCAL_PATH, 'utf8'));
+} catch (e) { console.warn('[nl] config.local.json 读取失败：', e.message); }
+const NL = {
+  endpoint: process.env.NL_ENDPOINT || nlFileCfg.nlEndpoint || null,   // 如 https://api.deepseek.com
+  apiKey:   process.env.NL_API_KEY  || nlFileCfg.nlApiKey  || null,
+  model:    process.env.NL_MODEL    || nlFileCfg.nlModel   || 'deepseek-chat',
+  timeoutMs: Number(process.env.NL_TIMEOUT_MS || nlFileCfg.nlTimeoutMs || 8000),
+};
+
+const NL_INTENTS = new Set(['query_last', 'collect_once', 'ambiguous', 'out_of_scope', 'location_query', 'other']);
+
+/* ---- 意图解析器 A：LLM（结构化 JSON 输出；任何失败一律降级规则解析） ---- */
+const NL_SYSTEM_PROMPT = [
+  '你是嵌入式监测平台的任务路由器。把用户的话映射为结构化任务，只能输出 JSON。',
+  '允许的 intent：',
+  '- query_last：查看/询问最近一次或历史数据（"上次数据""最新记录""现在数据多少"）',
+  '- collect_once：要求立即重新采集/再采一次（"重新采集""再采一帧""采新的"）',
+  '- ambiguous：只说"数据""采集"等，无法判断是查询还是发起',
+  '- out_of_scope：要求操作其他设备、删除/修改/清空数据、打电话、发短信等越界或危险请求',
+  '- location_query：询问设备位置/坐标/经纬度/在哪',
+  '参数：device（用户明确点名的设备号，未点名则为 null）',
+  '输出格式（严格 JSON，不要任何多余文字）：{"intent":"...","device":null,"reason":"一句话"}',
+].join('\n');
+
+async function parseIntentByLlm(text) {
+  if (!NL.endpoint || !NL.apiKey) return null;
+  const url = NL.endpoint.replace(/\/+$/, '') + '/v1/chat/completions';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), NL.timeoutMs);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + NL.apiKey },
+      body: JSON.stringify({
+        model: NL.model,
+        messages: [
+          { role: 'system', content: NL_SYSTEM_PROMPT },
+          { role: 'user', content: text },
+        ],
+        temperature: 0,
+        response_format: { type: 'json_object' },
+        max_tokens: 200,
+      }),
+      signal: ac.signal,
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+    if (!content) throw new Error('空响应');
+    const parsed = JSON.parse(content);
+    if (!NL_INTENTS.has(parsed.intent)) throw new Error('非法 intent: ' + parsed.intent);
+    return { intent: parsed.intent, device: parsed.device || null, reason: parsed.reason || null };
+  } catch (e) {
+    console.warn('[nl] LLM 解析失败，降级规则解析：', e.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ---- 意图解析器 B：规则兜底（无 LLM 时也能通过当堂验证 —— 备用路径） ---- */
+function nlPickDevice(t) { const m = t.match(/S3EYE[-\w]*/i); return m ? m[0] : null; }
+
+function parseIntentByRule(text) {
+  const t = text.replace(/\s+/g, '');
+  // 位置类单独识别（防止"在哪采集"之类句子被误判为采集）
+  if (/(在哪|位置|坐标|经纬|定位)/.test(t)) return { intent: 'location_query', device: nlPickDevice(t), reason: '规则：含位置关键词' };
+  // 点名白名单外设备 → 越界
+  const dev = nlPickDevice(t);
+  const allowed = config.expectedDeviceId || null;
+  if (dev && allowed && dev.toUpperCase() !== String(allowed).toUpperCase()) {
+    return { intent: 'out_of_scope', device: dev, reason: '规则：点名了白名单外设备' };
+  }
+  // 危险/越界动作
+  if (/(删除|清空|删掉|修改|打电话|发短信|报警|拨号|呼叫)/.test(t)) return { intent: 'out_of_scope', device: dev, reason: '规则：含越界/危险动作' };
+  // 发起采集（动作词优先于查询词）
+  if (/(重新|再|重采|新采)/.test(t) && /采/.test(t)) return { intent: 'collect_once', device: dev, reason: '规则：重新+采集' };
+  if (/(采一帧|采集一次|采一次|发起采集|立即采集|马上采集|现在采|开始采集)/.test(t)) return { intent: 'collect_once', device: dev, reason: '规则：发起采集' };
+  // 查询
+  if (/(查看|查询|看一下|看看|上次|最近|最新|历史|多少|数据呢|数据显示)/.test(t)) return { intent: 'query_last', device: dev, reason: '规则：查询类' };
+  // 含糊
+  if (/(数据|采集)/.test(t)) return { intent: 'ambiguous', device: dev, reason: '规则：只提到数据/采集，无法判断' };
+  return { intent: 'other', device: null, reason: '规则：未识别' };
+}
+
+/* ---- 设备范围校验（工具执行前的统一闸门） ---- */
+function nlValidateDevice(parsed) {
+  const allowed = config.expectedDeviceId || null;
+  if (parsed.device && allowed && String(parsed.device).toUpperCase() !== String(allowed).toUpperCase()) {
+    return { ok: false, reason: `设备 ${parsed.device} 不在允许范围。本助手只服务 ${allowed}，不会代你操作其他设备。` };
+  }
+  return { ok: true, device: allowed || parsed.device || null };
+}
+
+/* ---- 受限工具 1：query_last —— 只读历史记录，保留旧时间，绝不触发新采集 ---- */
+function nlRunQueryLast() {
+  const dev = config.expectedDeviceId || null;
+  const recs = readRecords({ device: dev, limit: 1, order: 'desc' });
+  const rec = recs[0] || null;
+  if (!rec) {
+    return { reply: '还没有任何历史记录（设备从未上报过数据），无法回答"上次数据"。', evidence: { found: false } };
+  }
+  const ageMs = Date.now() - (rec.recv_ts || 0);
+  const f = rec.fields || {};
+  const fmt = (v) => (typeof v === 'number' ? Number(v.toFixed(4)) : (v ?? '无'));
+  const reply = '上次记录（历史数据，不是新采集）：'
+    + `接收于 ${rec.recv_iso || new Date(rec.recv_ts).toISOString()}，距今约 ${Math.round(ageMs / 1000)} 秒。`
+    + ` 三轴 acc_g=(${fmt(f.acc_x_g)}, ${fmt(f.acc_y_g)}, ${fmt(f.acc_z_g)})，温度 ${fmt(f.temp_c)}°C。`
+    + ' 这是存储里的旧记录，时间也是旧的；需要当前数据请说"重新采集一次"。';
+  return {
+    reply,
+    evidence: {
+      found: true, recv_iso: rec.recv_iso || null, recv_ts: rec.recv_ts || null,
+      board_ts: rec.board_ts || null, record_seq: rec.seq ?? null, age_ms: ageMs,
+      stale: !state.live,
+    },
+  };
+}
+
+/* ---- 受限工具 2：collect_once —— 发起采集并等待真实完成证据 ---- */
+function nlRunCollectOnce() {
+  return new Promise((resolve) => {
+    const r = createCollectRequest();
+    const deadline = Date.now() + collectTimeoutMs() + 2000;
+    const iv = setInterval(() => {
+      const cur = REQUESTS.get(r.request_id);
+      if (!cur) { clearInterval(iv); return resolve({ reply: '采集请求状态丢失（内部错误），没有完成证据。', evidence: { status: 'lost', request_id: r.request_id } }); }
+      if (cur.status === 'completed') {
+        clearInterval(iv);
+        const o = cur.observation || {};
+        return resolve({
+          reply: `采集成功：设备已回执（${cur.ack_status || 'received'}），新观测 seq=${o.seq} 于 ${new Date(cur.completed_at).toISOString()} 到达。`
+            + (cur.simulated ? '（注意：当前为模拟模式，未走真实设备）' : ' 回执与新观测携带同一 request_id，证据链完整。'),
+          evidence: {
+            status: 'completed', request_id: r.request_id, ack_status: cur.ack_status || null,
+            seq_before: cur.seq_before ?? null, seq_observed: o.seq ?? null,
+            completed_iso: new Date(cur.completed_at).toISOString(),
+            checks: o.checks || null, simulated: !!cur.simulated, fields: o.fields || null,
+          },
+        });
+      }
+      if (cur.status === 'timeout' || cur.status === 'failed') {
+        clearInterval(iv);
+        return resolve({
+          reply: '未能确认采集完成：' + (cur.error || '等待期间没有收到设备的新观测') + '。我不会把旧值当作本次采集的结果。'
+            + (cur.note ? ' 说明：' + cur.note : ''),
+          evidence: {
+            status: cur.status, request_id: r.request_id, error: cur.error || null,
+            note: cur.note || null, ack_status: cur.ack_status || null,
+          },
+        });
+      }
+      if (Date.now() > deadline) {
+        clearInterval(iv);
+        return resolve({ reply: '等待超时（内部兜底），没有完成证据。', evidence: { status: 'watchdog_timeout', request_id: r.request_id } });
+      }
+    }, 200);
+  });
+}
+
+/* ---- 主入口：意图 → 校验 → 工具/澄清/拒绝 ---- */
+async function nlHandle(text) {
+  let engine = 'rule';
+  let parsed = await parseIntentByLlm(text);
+  if (parsed) engine = 'llm';
+  else parsed = parseIntentByRule(text);
+
+  const allowed = config.expectedDeviceId || null;
+  const base = { engine, intent: parsed.intent, tool: null, params: {}, parser_note: parsed.reason || null };
+
+  /* 设备白名单统一闸门：任何意图只要点名了白名单外设备，一律拒绝（在解析之后、工具之前） */
+  const v = nlValidateDevice(parsed);
+  if (!v.ok) {
+    return { ...base, intent: 'out_of_scope', error: 'device_out_of_scope', reply: v.reason };
+  }
+
+  switch (parsed.intent) {
+    case 'query_last': {
+      const out = nlRunQueryLast();
+      return { ...base, tool: 'query_last', params: { device: v.device }, ...out };
+    }
+    case 'collect_once': {
+      const out = await nlRunCollectOnce();
+      return { ...base, tool: 'collect_once', params: { device: v.device }, ...out };
+    }
+    case 'ambiguous':
+      return {
+        ...base, error: 'ambiguous',
+        reply: '这句话我无法确定任务。你是想【查看上次数据】（只读历史记录，时间是旧的），'
+          + '还是【重新采集一次】（让设备立刻采一帧新的，并等待新结果）？这是两个不同任务，请明确一个。',
+      };
+    case 'location_query':
+      return {
+        ...base, error: 'no_location_data',
+        reply: '设备只上报三轴加速度、温度等传感数据，不包含位置信息。没有位置数据时我不会生成或推测坐标。'
+          + '如需定位，需要额外的定位硬件与数据源。',
+      };
+    case 'out_of_scope': {
+      const d = parsed.device ? `（涉及设备 ${parsed.device}）` : '';
+      return {
+        ...base, error: 'out_of_scope',
+        reply: `这个请求超出我的允许范围${d}。我只能对 ${allowed || '当前设备'} 做两件事：`
+          + '查看上次数据、发起一次重新采集。删除/修改数据、控制其他设备、外呼等操作一律不执行。',
+      };
+    }
+    default:
+      return {
+        ...base, intent: 'other', error: 'unknown_intent',
+        reply: '我只能帮你两件事：【查看上次数据】或【重新采集一次】。请换一种说法，例如"上次数据是多少"或"重新采集一次"。',
+      };
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 数据处理                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1649,6 +1879,34 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, help: publicHelp() });
     }
     return json(res, 400, { error: 'unknown action' });
+  }
+
+  // ---- 自然语言助手（第 4 周）：自然语言 → 受限工具 ----
+  if (p === '/api/nl' && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const text = String(body.text || '').trim();
+    if (!text) return json(res, 400, { error: 'empty text' });
+    if (text.length > 200) return json(res, 400, { error: 'text too long (max 200)' });
+    const out = await nlHandle(text);
+    out.ok = true;
+    out.text = text;
+    return json(res, 200, out);
+  }
+
+  // ---- 自然语言助手：能力说明（不暴露密钥，只报是否已配置 LLM） ----
+  if (p === '/api/nl' && req.method === 'GET') {
+    return json(res, 200, {
+      ok: true,
+      llm_configured: !!(NL.endpoint && NL.apiKey),
+      engine: (NL.endpoint && NL.apiKey) ? 'llm (降级兜底: rule)' : 'rule',
+      llm_host: NL.endpoint ? (new URL(NL.endpoint)).host : null,
+      allowed_device: config.expectedDeviceId || null,
+      tools: {
+        query_last: '查看设备最近一次（历史）记录，保留旧时间，不触发采集',
+        collect_once: '请求设备立即采集一帧新数据，等待真实完成证据',
+      },
+    });
   }
 
   // ---- 波特率探测 ----

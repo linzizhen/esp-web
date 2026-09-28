@@ -10,6 +10,9 @@ firmware/s3eye_imu_idf/dependencies.lock
 # ---- 本地私密配置（含真实 WiFi 密码，绝不提交）----
 firmware/s3eye_imu_idf/main/app_config.local.h
 
+# ---- 自然语言服务密钥（第 4 周，LLM API Key 绝不提交）----
+config.local.json
+
 # ---- 运行时数据（真实采集数据，本地保留）----
 data/*.ndjson
 data/records.*.ndjson

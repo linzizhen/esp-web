@@ -1,0 +1,7 @@
+{
+  "//": "自然语言服务配置（第 4 周）。复制本文件为 config.local.json 并填入真实值。该文件已被 .gitignore 忽略，密钥不会进入版本库。未配置时 NL 模块自动使用规则兜底解析，当堂验证全部可过。",
+  "nlEndpoint": "https://api.deepseek.com",
+  "nlApiKey": "sk-在这里填你的密钥",
+  "nlModel": "deepseek-chat",
+  "nlTimeoutMs": 8000
+}

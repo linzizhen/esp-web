@@ -54,6 +54,10 @@ const els = {
   camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'), camShotSize: $('camShotSize'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
+
+  // 自然语言助手（第 4 周）
+  nlEngine: $('nlEngine'), nlCap: $('nlCap'), nlChat: $('nlChat'),
+  nlForm: $('nlForm'), nlInput: $('nlInput'), nlSend: $('nlSend'),
 };
 
 // ---------------------------------------------------------------- 状态
@@ -1057,9 +1061,90 @@ async function loadHelp() {
   } catch (_) { /* 忽略 */ }
 }
 
+// ---------------------------------------------------------------- 自然语言助手（第 4 周）
+/* 受限助手：只调用 POST /api/nl；界面只展示服务端返回的意图/工具/证据，
+ * 不自行推断、不造数据。采集类请求服务端会等待设备真实结果，回复可能慢几秒。 */
+let nlBusy = false;
+
+async function loadNlCap() {
+  try {
+    const j = await (await fetch('/api/nl')).json();
+    els.nlEngine.textContent = j.llm_configured ? 'LLM + 规则兜底' : '规则解析（LLM 未配置）';
+    els.nlCap.innerHTML =
+      `只对 <b>${escHtml(j.allowed_device || '当前设备')}</b> 开放两个受限工具：` +
+      `<b>查看上次数据</b>（只读历史记录，保留旧时间）、<b>重新采集一次</b>（发起采集并等待真实完成证据）。` +
+      ` 意图引擎：${escHtml(j.engine)}。`;
+  } catch (_) {
+    els.nlEngine.textContent = '服务端未连接';
+  }
+}
+
+function nlBubble(cls, html) {
+  const empty = els.nlChat.querySelector('.nl-empty');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = 'nl-msg ' + cls;
+  div.innerHTML = html;
+  els.nlChat.appendChild(div);
+  els.nlChat.scrollTop = els.nlChat.scrollHeight;
+  return div;
+}
+
+function nlEvidenceHtml(ev) {
+  if (!ev) return '';
+  const rows = [];
+  const put = (k, v) => { if (v !== null && v !== undefined && v !== '') rows.push(`<div><span>${k}</span><b>${escHtml(String(v))}</b></div>`); };
+  put('状态', ev.status);
+  put('request_id', ev.request_id);
+  put('回执', ev.ack_status);
+  put('seq（下发前）', ev.seq_before);
+  put('seq（新观测）', ev.seq_observed);
+  put('记录接收时间', ev.recv_iso);
+  put('完成时间', ev.completed_iso);
+  if (typeof ev.age_ms === 'number') put('距今', Math.round(ev.age_ms / 1000) + ' 秒');
+  if (ev.simulated) put('模拟模式', '是（未走真实设备）');
+  if (ev.stale) put('数据时效', '设备当前未在上报（旧值）');
+  if (ev.checks) put('校验', `到达晚于下发=${ev.checks.arrived_after_dispatch}，seq 递增=${ev.checks.seq_increased}`);
+  if (!rows.length) return '';
+  return `<div class="nl-ev">${rows.join('')}</div>`;
+}
+
+async function nlSend(text) {
+  nlBusy = true;
+  nlBubble('me', escHtml(text));
+  const waiting = nlBubble('bot', '<span class="nl-thinking">处理中（采集类请求会等待设备真实结果，可能需要几秒）…</span>');
+  try {
+    const r = await (await fetch('/api/nl', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })).json();
+    const chips = [`<span class="chip chip-intent">${escHtml(r.intent || '?')}</span>`];
+    if (r.tool) chips.push(`<span class="chip chip-tool">${escHtml(r.tool)}</span>`);
+    chips.push(`<span class="chip chip-engine">${escHtml(r.engine === 'llm' ? 'LLM' : '规则')}</span>`);
+    waiting.innerHTML =
+      `<div class="nl-chips">${chips.join('')}</div>` +
+      `<div class="nl-reply">${escHtml(r.reply || '(无回复)')}</div>` +
+      nlEvidenceHtml(r.evidence);
+  } catch (_) {
+    waiting.innerHTML = '<div class="nl-reply">请求失败：服务端未响应。</div>';
+  }
+  els.nlChat.scrollTop = els.nlChat.scrollHeight;
+  nlBusy = false;
+}
+
+if (els.nlForm) {
+  els.nlForm.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const t = els.nlInput.value.trim();
+    if (!t || nlBusy) return;
+    els.nlInput.value = '';
+    nlSend(t);
+  });
+}
+
 // ---------------------------------------------------------------- 分页路由
 // 单页应用 + hash 路由：地址栏 #live / #collect / #records，刷新不丢页面。
-const PAGES = ['live', 'collect', 'help', 'cam', 'records'];
+const PAGES = ['live', 'collect', 'help', 'cam', 'records', 'ask'];
 function showPage(name) {
   if (!PAGES.includes(name)) name = 'live';
   S.page = name;
@@ -1077,6 +1162,7 @@ function showPage(name) {
   needDraw = true;   // 回到实时页时立即重画（隐藏期间画布尺寸为 0）
   invalidateCanvasRects();   // 页面切换会改变画布可见尺寸，缓存的 rect 需重测
   if (name === 'cam') loadCam();   // 进入摄像头页立即刷新一次状态
+  if (name === 'ask') loadNlCap(); // 进入自然语言页刷新能力说明（引擎/白名单）
 }
 window.addEventListener('hashchange', () => showPage(location.hash.slice(1)));
 showPage(location.hash.slice(1) || 'live');

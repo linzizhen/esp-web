@@ -450,3 +450,87 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   font-variant-numeric: tabular-nums;
 }
 
+
+/* ---------------- 自然语言助手（第 4 周） ---------------- */
+.ask-hero { grid-column: 1 / -1; }
+
+.nl-chat {
+  background: var(--bg1);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  min-height: 220px;
+  max-height: 420px;
+  overflow-y: auto;
+  margin-bottom: 10px;
+}
+
+.nl-empty { color: var(--dim); text-align: center; padding: 60px 0 40px; }
+
+.nl-msg {
+  max-width: 86%;
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: 14px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.nl-msg.me {
+  margin-left: auto;
+  background: var(--accent, #2563eb);
+  color: #fff;
+}
+
+.nl-msg.bot {
+  margin-right: auto;
+  background: #fff;
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.nl-chips { margin-bottom: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+
+.chip {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--dim);
+}
+
+.chip-intent { color: #1d4ed8; border-color: #93c5fd; background: #eff6ff; }
+.chip-tool   { color: #047857; border-color: #6ee7b7; background: #ecfdf5; }
+.chip-engine { color: var(--dim); }
+
+.nl-reply { white-space: pre-wrap; }
+
+.nl-thinking { color: var(--dim); font-style: italic; }
+
+.nl-ev {
+  margin-top: 8px;
+  border-top: 1px dashed var(--line);
+  padding-top: 6px;
+  font-size: 12px;
+}
+
+.nl-ev div { display: flex; justify-content: space-between; gap: 12px; padding: 1px 0; }
+.nl-ev span { color: var(--dim); }
+.nl-ev b { font-weight: 500; font-variant-numeric: tabular-nums; text-align: right; }
+
+.nl-form { display: flex; gap: 8px; }
+
+.nl-input {
+  flex: 1;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 14px;
+  background: #fff;
+  color: var(--ink);
+  outline: none;
+}
+
+.nl-input:focus { border-color: var(--accent, #2563eb); }
