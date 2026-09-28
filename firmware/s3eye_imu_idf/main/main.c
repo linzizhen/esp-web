@@ -31,6 +31,7 @@
 #include "esp_err.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -1046,7 +1047,10 @@ static SemaphoreHandle_t s_cam_mtx = NULL;
  * 返回耗时毫秒（0 表示失败） */
 static int cam_send_frame_locked(bool is_shot)
 {
-    if (!s_cam_ok) return 0;
+    if (!s_cam_ok) {
+        if (is_shot) ESP_LOGW(TAG, "抓帧失败：摄像头未就绪");
+        return 0;
+    }
 
     int64_t t0 = esp_timer_get_time();
     uint8_t *jpg = NULL; size_t jlen = 0;
@@ -1059,8 +1063,19 @@ static int cam_send_frame_locked(bool is_shot)
     /* base64 输出长度 = 4*ceil(n/3)，再加 JSON 头尾余量 */
     size_t b64_cap = ((jlen + 2) / 3) * 4 + 4;
     size_t cap     = b64_cap + 256;
-    char  *out     = malloc(cap);
-    if (!out) { cam_stream_release(); s_cam_drop++; return 0; }
+    /* ★ 优先分配到 PSRAM。VGA(640x480) 帧约 15KB，base64 后缓冲需约 20KB；
+     * 实测普通 malloc 在这个量级会失败，且失败是静默的（只表现为"抓拍无回传"）：
+     *   QVGA(7.5KB) 3/3 成功、CIF(10.6KB) 3/3 成功、VGA(14.9KB) 1/3、SVGA 0/3。
+     * 帧缓冲本身就在 PSRAM（cam_stream_init 里 fb_location=CAMERA_FB_IN_PSRAM），
+     * 这里保持一致；PSRAM 分配不到时回退内部 RAM。free() 对两者都适用。 */
+    char *out = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!out) out = malloc(cap);
+    if (!out) {
+        cam_stream_release(); s_cam_drop++;
+        ESP_LOGE(TAG, "抓帧失败：分配 %u 字节缓冲失败（PSRAM 与内部 RAM 均不足）",
+                 (unsigned)cap);
+        return 0;
+    }
 
     int hdr = snprintf(out, cap,
         "{\"type\":\"frame\",\"device\":\"%s\",\"seq\":%u,\"size\":\"%s\","
@@ -1068,11 +1083,18 @@ static int cam_send_frame_locked(bool is_shot)
         APP_DEVICE_ID, (unsigned)++s_cam_seq,
         cam_stream_framesize_name(cam_stream_get_framesize()), (unsigned)jlen,
         is_shot ? ",\"shot\":1" : "");
-    if (hdr < 0 || (size_t)hdr >= cap) { free(out); cam_stream_release(); s_cam_drop++; return 0; }
+    if (hdr < 0 || (size_t)hdr >= cap) {
+        free(out); cam_stream_release(); s_cam_drop++;
+        ESP_LOGE(TAG, "抓帧失败：JSON 头 %d 字节超出缓冲 %u", hdr, (unsigned)cap);
+        return 0;
+    }
 
     size_t olen = 0;
-    if (mbedtls_base64_encode((unsigned char *)out + hdr, b64_cap, &olen, jpg, jlen) != 0) {
+    int b64err = mbedtls_base64_encode((unsigned char *)out + hdr, b64_cap, &olen, jpg, jlen);
+    if (b64err != 0) {
         free(out); cam_stream_release(); s_cam_drop++;
+        ESP_LOGE(TAG, "抓帧失败：base64 编码错误 -0x%04x（jlen=%u dlen=%u）",
+                 (unsigned)-b64err, (unsigned)jlen, (unsigned)b64_cap);
         return 0;
     }
     cam_stream_release();                       /* 尽早归还帧缓冲 */
@@ -1112,9 +1134,9 @@ static int cam_send_frame(bool is_shot)
  * ★ 整个过程（切换 → 等生效 → 抓帧 → 恢复）独占摄像头：
  *   否则推流任务会在分辨率切换中途抓帧，既可能拍到半帧，
  *   也会因帧缓冲竞争导致后续抓拍彻底失效。 */
-static void cam_take_snapshot(int framesize, int quality)
+static int cam_take_snapshot(int framesize, int quality)
 {
-    if (!s_cam_ok) return;
+    if (!s_cam_ok) { ESP_LOGW(TAG, "抓拍失败：摄像头未就绪"); return 0; }
 
     CAM_LOCK();
     int prev_fs = cam_stream_get_framesize();
@@ -1128,13 +1150,25 @@ static void cam_take_snapshot(int framesize, int quality)
         vTaskDelay(pdMS_TO_TICKS(400));   /* 等传感器参数生效，否则拍到的还是旧尺寸 */
     }
 
-    cam_send_frame_locked(true);
+    /* ★ 抓拍必须重试：刚切完分辨率时传感器还没稳定，头几帧可能拿不到。
+     * 只试一次就放弃的话，板端不会回传任何帧，前端只能干等到 15 秒超时
+     * （用户看到的就是"一直显示 等板端回传…"）。失败就丢弃一帧再试，最多 3 次。 */
+    int ms = 0;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        ms = cam_send_frame_locked(true);
+        if (ms > 0) break;
+        ESP_LOGW(TAG, "抓拍第 %d 次未成功，丢弃一帧后重试", attempt);
+        cam_stream_release();
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    if (ms <= 0) ESP_LOGE(TAG, "抓拍最终失败（已重试 3 次），本次无快照回传");
 
     if (changed) {
         cam_stream_set_params(prev_fs, prev_q);   /* 恢复推流参数 */
         vTaskDelay(pdMS_TO_TICKS(300));
     }
     CAM_UNLOCK();
+    return ms;
 }
 
 /* 推流任务：按目标帧率抓帧发送。链路慢时自动降速（以实际耗时为准）。 */
@@ -1204,8 +1238,11 @@ static void handle_command(const char *line)
             int fs = -1, q = -1;
             json_int(line, "framesize", &fs);
             json_int(line, "quality",   &q);
-            cmd_ack(rid, "shot");
-            cam_take_snapshot(fs, q);
+            cmd_ack(rid, "shot");     /* 语义不变：只表示"命令已收到" */
+            int ms = cam_take_snapshot(fs, q);
+            /* 抓拍结果单独记一条日志 —— 失败必须可见，不能静默 */
+            ESP_LOGI(TAG, "抓拍命令执行完毕：%s（耗时 %d ms）",
+                     ms > 0 ? "成功" : "失败", ms);
         }
     } else if (strcmp(cmd, "cam_set") == 0) {
         int fs = -1, q = -1, fps = -1;
