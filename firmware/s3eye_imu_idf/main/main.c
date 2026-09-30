@@ -99,6 +99,8 @@ static const char *TAG = "S3EYE";
 #define C_GRAY    RGB565(70, 78, 90)
 #define C_BLUE    RGB565(50, 110, 220)
 #define C_DIM     RGB565(150, 158, 170)
+#define C_IDLE_BG RGB565(18, 34, 74)    /* 空闲画面底色：深蓝。原来是纯黑，被当成"屏幕坏了" */
+#define C_CYAN    RGB565(90, 200, 230)
 
 static i2c_master_bus_handle_t  s_bus = NULL;
 static i2c_master_dev_handle_t  s_dev = NULL;
@@ -657,6 +659,11 @@ static volatile int          s_scr = 0;          /* 0=空闲 1=已发送 2=已�
 static char                  s_help_id[48] = "";
 static uint32_t              s_help_counter = 0;
 
+/* 空闲画面展示的实时值：主循环写、UI 任务读（单写者单读者，无需加锁） */
+static float g_temp_c  = -999.0f;
+static float g_acc_g[3] = { 0.0f, 0.0f, 0.0f };
+static bool  g_ui_dirty = false;   /* 有新数据 → UI 据此周期性重绘空闲画面 */
+
 static void new_help_id(char *out, size_t cap)
 {
     s_help_counter++;
@@ -787,12 +794,22 @@ static void ui_task(void *arg)
     int last_scr = -1;
     led_mode_t led = LED_OFF;
     int64_t last_toggle = 0;
+    int64_t last_idle_draw = 0;
     bool led_on = false;
 
     while (1) {
+        int64_t now = esp_timer_get_time() / 1000;
         int cur = s_scr;
-        if (cur != last_scr) {
+
+        /* 空闲画面带实时数值，需要周期性重绘。
+         * 只在"有新数据"且"距上次绘制 ≥600ms"时才重画 —— lcd_fill 要走 240 次 SPI
+         * 传输，每 20ms 刷一次会抢占上报主循环（实测帧率会被拖垮）。 */
+        bool redraw = (cur != last_scr) ||
+                      (cur == 0 && g_ui_dirty && (now - last_idle_draw >= 600));
+
+        if (redraw) {
             last_scr = cur;
+            if (cur == 0) { last_idle_draw = now; g_ui_dirty = false; }
             switch (cur) {
             case 1:  /* 已发送（本地确认，不依赖网络） */
                 lcd_fill(C_RED);
@@ -813,17 +830,31 @@ static void ui_task(void *arg)
                 lcd_show_ascii_line(APP_DEVICE_ID, 205, C_WHITE, C_GRAY);
                 led = LED_OFF;
                 break;
-            default: /* 空闲 */
-                lcd_fill(C_BLACK);
-                lcd_show_zh_line("空闲", 90, C_WHITE, C_BLACK);
-                lcd_show_ascii_line(APP_DEVICE_ID, 205, C_DIM, C_BLACK);
+            default: /* 空闲：深蓝底 + 实时数值
+                      * 旧实现是纯黑底只画两个字，肉眼跟"屏幕坏了"没区别 —— 驱动其实是好的，
+                      * 却一直被当成硬件故障排查。这里改成常驻显示温度/三轴，一眼能看出在工作。 */
+                lcd_fill(C_IDLE_BG);
+                lcd_show_zh_line("空闲", 26, C_WHITE, C_IDLE_BG);
+                {
+                    char buf[48];
+                    if (g_temp_c > -100.0f) {
+                        snprintf(buf, sizeof buf, "TEMP   %.1f C", g_temp_c);
+                        lcd_show_ascii_line(buf, 92, C_CYAN, C_IDLE_BG);
+                    }
+                    snprintf(buf, sizeof buf, "X   %+.2f g", g_acc_g[0]);
+                    lcd_show_ascii_line(buf, 120, C_WHITE, C_IDLE_BG);
+                    snprintf(buf, sizeof buf, "Y   %+.2f g", g_acc_g[1]);
+                    lcd_show_ascii_line(buf, 144, C_WHITE, C_IDLE_BG);
+                    snprintf(buf, sizeof buf, "Z   %+.2f g", g_acc_g[2]);
+                    lcd_show_ascii_line(buf, 168, C_WHITE, C_IDLE_BG);
+                }
+                lcd_show_ascii_line(APP_DEVICE_ID, 205, C_DIM, C_IDLE_BG);
                 led = LED_OFF;
                 break;
             }
         }
 
         /* LED：快闪=求助中；慢闪=对方已收到；灭=空闲/已取消 */
-        int64_t now = esp_timer_get_time() / 1000;
         int half = led == LED_FAST ? 100 : led == LED_SLOW ? 450 : 0;
         if (half == 0) {
             led_write(false);
@@ -875,10 +906,12 @@ static int build_frame(char *body, size_t cap, const char *request_id)
             for (int i = 0; i < 3; i++) {
                 float g   = (float)raw[i] * QMA_RANGE_G / QMA_FULLSCALE * QMA_CALIBRATION;
                 float ms2 = g * G_TO_MS2;
+                g_acc_g[i] = g;          /* 同步给空闲画面显示 */
                 n += snprintf(body + n, cap - n,
                               ",\"acc_%s_raw\":%d,\"acc_%s_g\":%.4f,\"acc_%s_ms2\":%.3f",
                               axis[i], raw[i], axis[i], g, axis[i], ms2);
             }
+            g_ui_dirty = true;
         }
     }
 
@@ -886,6 +919,8 @@ static int build_frame(char *body, size_t cap, const char *request_id)
     {
         float tc = temp_sensor_read();
         if (!isnan(tc) && tc > -100.0f) {
+            g_temp_c   = tc;             /* 同步给空闲画面显示 */
+            g_ui_dirty = true;
             n += snprintf(body + n, cap - n, ",\"temp_c\":%.1f", tc);
         }
     }
