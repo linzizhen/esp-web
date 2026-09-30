@@ -2107,6 +2107,32 @@ setInterval(() => {
   }
 }, 2000);
 
+/* 摄像头「无观众自动停流」看门狗
+ *
+ * 实测（2026-09-30）：板端推 MJPEG 会抢占 CPU 与串口带宽，把传感上报帧率
+ * 从 5.25 帧/秒压到 1.00 帧/秒，实时监控页表现为明显的「一帧一帧」卡顿。
+ * 而推流一旦开启就会一直推 —— 即使所有观众都已断开（关掉页面 / 切走摄像头页），
+ * /api/cam 里 viewers=0 也照推不误。此前没有任何兜底，只能靠人记得点「停止」。
+ * 这里加看门狗：连续 CAM_IDLE_STOP_MS 无观众，自动下发 cam_off 收流。
+ * 观众回来时前端重新挂 <img src="/api/cam.mjpg">，需重新点「开启画面」。
+ * 阈值可用环境变量 CAM_IDLE_STOP_MS 覆盖（便于测试与调参）。 */
+const CAM_IDLE_STOP_MS = Number(process.env.CAM_IDLE_STOP_MS || 60000);  // 60s：切页瞬间不误停
+let camIdleSince = 0;
+setInterval(() => {
+  if (!state.camStreaming) { camIdleSince = 0; return; }
+  if (cam.clients.size > 0) { camIdleSince = 0; return; }
+  const now = Date.now();
+  if (!camIdleSince) { camIdleSince = now; return; }   // 第一拍只记起点，不判断
+  if (now - camIdleSince < CAM_IDLE_STOP_MS) return;
+  camIdleSince = 0;
+  const ok = sendCommand({ cmd: 'cam_off' }, state.deviceId || null);
+  if (ok) state.camStreaming = false;
+  const msg = `连续 ${Math.round(CAM_IDLE_STOP_MS / 1000)}s 无观众，已自动停止推流（命令下发${ok ? '成功' : '失败'}）`;
+  console.log(`[cam] ${msg}`);
+  pushRaw(`[摄像头] ${msg}`, ok);
+  pushStatus('cam');
+}, 5000);
+
 setInterval(() => {
   const now = Date.now();
   if (!state.connected || !state.lastDataAt) return;
