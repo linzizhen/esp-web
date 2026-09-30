@@ -933,10 +933,16 @@ static int build_frame(char *body, size_t cap, const char *request_id)
     int rssi = 0;
     wifi_ap_record_t ap;
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
+    /* LCD 自检字段：屏幕是"板端本地反馈"的载体，坏了必须能远程看出来，
+     * 否则只能靠肉眼猜（本次黑屏排查就绕了一大圈）。
+     *   lcd_ok=1  LCD 初始化成功（背光已开）；0=初始化失败——失败的屏幕永远是黑的
+     *   scr       当前画面状态：0=空闲 1=求助已发送 2=对方已收到 3=已取消 */
     n += snprintf(body + n, cap - n,
-                  ",\"rssi\":%d,\"heap\":%lu,\"upload_ok\":%lu,\"upload_fail\":%lu}",
+                  ",\"rssi\":%d,\"heap\":%lu,\"upload_ok\":%lu,\"upload_fail\":%lu"
+                  ",\"lcd_ok\":%d,\"scr\":%d}",
                   rssi, (unsigned long)esp_get_free_heap_size(),
-                  (unsigned long)s_ok, (unsigned long)s_fail);
+                  (unsigned long)s_ok, (unsigned long)s_fail,
+                  s_lcd_ok ? 1 : 0, s_scr);
     return n;
 }
 
