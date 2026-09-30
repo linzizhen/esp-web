@@ -99,8 +99,12 @@ static const char *TAG = "S3EYE";
 #define C_GRAY    RGB565(70, 78, 90)
 #define C_BLUE    RGB565(50, 110, 220)
 #define C_DIM     RGB565(150, 158, 170)
-#define C_IDLE_BG RGB565(18, 34, 74)    /* 空闲画面底色：深蓝。原来是纯黑，被当成"屏幕坏了" */
-#define C_CYAN    RGB565(90, 200, 230)
+/* 空闲画面底色：必须"够亮"。
+ * 第一版用深蓝 (18,34,74)，实测在室内光下肉眼仍判定为"黑屏"；
+ * 求助画面的红 (220,50,50) 明显更亮，于是出现"按键亮一下、松手就黑"的错觉。
+ * 这里直接用亮蓝，和求助/已收到三态的亮度对齐，一眼能看出屏幕在工作。 */
+#define C_IDLE_BG RGB565(45, 105, 200)
+#define C_CYAN    RGB565(120, 230, 255)
 
 static i2c_master_bus_handle_t  s_bus = NULL;
 static i2c_master_dev_handle_t  s_dev = NULL;
@@ -801,11 +805,12 @@ static void ui_task(void *arg)
         int64_t now = esp_timer_get_time() / 1000;
         int cur = s_scr;
 
-        /* 空闲画面带实时数值，需要周期性重绘。
-         * 只在"有新数据"且"距上次绘制 ≥600ms"时才重画 —— lcd_fill 要走 240 次 SPI
-         * 传输，每 20ms 刷一次会抢占上报主循环（实测帧率会被拖垮）。 */
+        /* 空闲画面带实时数值，需要周期性重绘（每 500ms）。
+         * 这里不依赖 g_ui_dirty：万一某次 SPI 传输失败，画面就再也不刷新了 ——
+         * 宁可定时重画保证"屏幕一定亮着"。
+         * 但也不能每 20ms 画：lcd_fill 要走 240 次 SPI 传输，会把上报主循环拖垮。 */
         bool redraw = (cur != last_scr) ||
-                      (cur == 0 && g_ui_dirty && (now - last_idle_draw >= 600));
+                      (cur == 0 && (now - last_idle_draw >= 500));
 
         if (redraw) {
             last_scr = cur;
