@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>IMU 监控台 · 纯像素抖动方案</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+/* ===================================================================
+   中文点阵字体：Fusion Pixel 12px（含简中 / 拉丁 / 数字）
+   注意：@fontsource 的同名包只有 latin 分片，中文会掉回系统字体，
+   所以这里直接取 @fontpkg 的完整 TTF（3.4MB，font-display:swap）。
+   落地时建议把 ttf 下载到 public/fonts/ 本地托管，避免每次走 CDN。
+   =================================================================== */
+@font-face {
+  font-family: "FusionPixel";
+  src: url("https://cdn.jsdelivr.net/npm/@fontpkg/fusion-pixel@20220405.0.0/fusion-pixel.ttf") format("truetype");
+  font-display: swap;
+}
+
+/* ===================================================================
+   色板 10 色 —— PICO-8 派生，只用这些，不用别的
+   三轴 = 粉 / 黄 / 蓝；主色 = 绿（在线）；告警 = 红；未更新 = 琥珀
+   =================================================================== */
+:root[data-theme="dark"] {
+  --c0:#0b0f1a;  /* 底 */
+  --c1:#1d2b53;  /* 面板 */
+  --c2:#fff1e8;  /* 主文字 */
+  --c3:#83769c;  /* 次信息 */
+  --c4:#0f1630;  /* 网格点（暗） */
+  --x:#ff77a8;   /* X 轴 */
+  --y:#ffec27;   /* Y 轴 */
+  --z:#29adff;   /* Z 轴 */
+  --on:#00e436;  /* 在线 / 主色 */
+  --bad:#ff004d; /* 离线 / 告警 */
+  --warn:#ffa300;/* 未更新 */
+}
+:root[data-theme="light"] {
+  --c0:#fff1e8;  /* 纸白底 */
+  --c1:#c2c3c7;  /* 面板 */
+  --c2:#1d2b53;  /* 主文字 */
+  --c3:#5f574f;  /* 次信息 */
+  --c4:#d8d3c8;  /* 网格点 */
+  --x:#7e2553;   /* X 轴（压深，保证 4.5:1） */
+  --y:#ab5236;
+  --z:#008751;
+  --on:#008751;
+  --bad:#7e2553;
+  --warn:#ab5236;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--c0); color: var(--c2);
+  font-family: "FusionPixel", "Microsoft YaHei", monospace;
+  font-size: 12px; line-height: 1.9;   /* 12px 是点阵原生尺寸，只用 12 / 24 / 36 */
+}
+canvas { image-rendering: pixelated; image-rendering: crisp-edges; display: block; }
+.hidden { display: none !important; }
+:focus-visible { outline: 3px solid var(--on); outline-offset: 2px; }
+
+.app { max-width: 1080px; margin: 0 auto; padding: 24px 20px 56px; }
+
+/* ---------------- 顶栏 + 抖动渐变带（渐变一律走 canvas，不用 CSS 渐变） ---------------- */
+.topbar { position: relative; border: 3px solid var(--c2); box-shadow: 6px 6px 0 var(--c1); margin-bottom: 28px; }
+#wash { width: 100%; height: 84px; }
+.topbar-in { display: flex; align-items: center; justify-content: space-between; gap: 18px; flex-wrap: wrap; padding: 14px 18px; background: var(--c0); }
+.logo { font-family: "Press Start 2P", monospace; font-size: 16px; color: var(--on); text-shadow: 3px 3px 0 var(--c1); }
+.brand h1 { font-size: 24px; font-weight: normal; line-height: 1.2; }
+.brand p { font-size: 12px; color: var(--c3); }
+.status { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; font-size: 12px; }
+.chip { display: inline-flex; align-items: center; gap: 8px; }
+
+/* 像素 LED：2×2 点阵 */
+.led { width: 5px; height: 5px; background: currentColor;
+  box-shadow: 7px 0 0 currentColor, 0 7px 0 currentColor, 7px 7px 0 currentColor; margin-right: 8px; }
+.led.on { color: var(--on); animation: blink 1s steps(1,end) infinite; }
+.led.off { color: var(--bad); }
+@keyframes blink { 0%,60%{opacity:1} 61%,100%{opacity:.25} }
+
+/* 像素信号格（RSSI） */
+.sig { display: inline-flex; align-items: flex-end; gap: 3px; height: 14px; }
+.sig i { width: 5px; background: var(--c4); }
+.sig i:nth-child(1){height:5px} .sig i:nth-child(2){height:8px}
+.sig i:nth-child(3){height:11px} .sig i:nth-child(4){height:14px}
+.sig.hot i { background: var(--on); }
+.sig.cold i { background: var(--c4); }
+
+/* ---------------- 导航 ---------------- */
+.nav { display: flex; gap: 0; margin-bottom: 28px; flex-wrap: wrap; }
+.tab {
+  font-family: inherit; font-size: 12px; padding: 9px 16px; cursor: pointer;
+  background: var(--c0); color: var(--c3); border: 3px solid var(--c1);
+  border-right-width: 0; transition: none;   /* hover 是调色板切换，不是平滑过渡 */
+}
+.tab:last-child { border-right-width: 3px; }
+.tab:hover { background: var(--c1); color: var(--c2); }
+.tab[aria-selected="true"] { background: var(--c2); color: var(--c0); border-color: var(--c2); }
+
+/* ---------------- 卡片：chunky chrome ---------------- */
+.card { border: 3px solid var(--c2); box-shadow: 6px 6px 0 var(--c1); background: var(--c0); padding: 18px; margin-bottom: 28px; }
+.card > h2 { font-size: 24px; font-weight: normal; margin-bottom: 16px; letter-spacing: 0; }
+.card > h2::before { content: "▸ "; color: var(--on); }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+.span2 { grid-column: 1 / -1; }
+
+/* ---------------- 姿态 + 三轴 ---------------- */
+.hero-body { display: flex; align-items: center; gap: 28px; flex-wrap: wrap; }
+#level { width: 160px; height: 160px; flex: none; border: 3px solid var(--c1); }
+.level-cap { font-size: 12px; color: var(--c3); text-align: center; margin-top: 8px; }
+.axes { display: grid; grid-template-columns: repeat(3,1fr); gap: 16px; flex: 1; min-width: 300px; }
+.axis { border: 3px solid var(--c1); padding: 12px 14px; }
+.axis-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+.axis-name { font-size: 24px; font-weight: normal; }
+.ax-x { color: var(--x); } .ax-y { color: var(--y); } .ax-z { color: var(--z); }
+.axis-ms2 { font-size: 12px; color: var(--c3); }
+/* 读数：36px = 点阵 3 倍；定宽右对齐，避免数字跳动时整行摇摆 */
+.axis-g { display: flex; align-items: baseline; gap: 6px; margin: 6px 0 10px; }
+.axis-g b { font-size: 36px; font-weight: normal; line-height: 1;
+  display: inline-block; min-width: 5.5ch; text-align: right; }
+.axis-g .u { font-size: 12px; color: var(--c3); }
+/* 像素刻度条：条纹不是渐变 */
+.bar { border: 3px solid var(--c1); height: 14px; position: relative; }
+.bar::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 3px; background: var(--c3); }
+.bar > i { display: block; height: 100%; }
+.bar-x > i { background: repeating-linear-gradient(90deg, var(--x) 0 5px, transparent 5px 7px); }
+.bar-y > i { background: repeating-linear-gradient(90deg, var(--y) 0 5px, transparent 5px 7px); }
+.bar-z > i { background: repeating-linear-gradient(90deg, var(--z) 0 5px, transparent 5px 7px); }
+
+/* ---------------- 示波器 ---------------- */
+canvas.scope { width: 100%; border: 3px solid var(--c2); box-shadow: 6px 6px 0 var(--c1); background: var(--c0); }
+.scope-axis { display: flex; justify-content: space-between; font-size: 12px; color: var(--c3); margin-top: 8px; }
+.scope-key { display: flex; gap: 16px; margin-bottom: 12px; flex-wrap: wrap; font-size: 12px; }
+.scope-key span { display: inline-flex; align-items: center; gap: 6px; }
+.key { width: 12px; height: 12px; display: inline-block; }
+.k-x { background: var(--x); } .k-y { background: var(--y); } .k-z { background: var(--z); }
+
+/* ---------------- 参数表 ---------------- */
+.kv { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 2px solid var(--c1); }
+.kv:last-child { border-bottom: none; }
+.kv .k { color: var(--c3); }
+.kv .v { text-align: right; word-break: break-all; }
+
+/* ---------------- 按钮 ---------------- */
+.btn {
+  font-family: inherit; font-size: 12px; padding: 9px 16px; cursor: pointer;
+  background: var(--c1); color: var(--c2); border: 3px solid var(--c2);
+  box-shadow: 4px 4px 0 var(--c2); transition: none;
+}
+.btn:hover { background: var(--on); color: var(--c0); }
+.btn:active { transform: translate(4px,4px); box-shadow: 0 0 0 var(--c2); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn-primary { background: var(--on); color: var(--c0); }
+.btn-primary:hover { background: var(--c2); color: var(--c0); }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+.icon-btn {
+  width: 36px; height: 36px; background: var(--c1); border: 3px solid var(--c2);
+  color: var(--c2); cursor: pointer; font-family: "Press Start 2P", monospace; font-size: 10px;
+}
+.icon-btn:hover { background: var(--on); color: var(--c0); }
+
+/* ---------------- 摄像头 ---------------- */
+.cam { position: relative; border: 3px solid var(--c2); box-shadow: 6px 6px 0 var(--c1); background: var(--c0); }
+.cam canvas { width: 100%; }
+.cam img { width: 100%; image-rendering: pixelated; display: block; }
+.cam::after {   /* CRT 扫描线，只在画面区、很淡 */
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px);
+}
+.cam-cap { position: absolute; left: 12px; bottom: 10px; font-size: 12px; color: var(--c2);
+  background: var(--c0); padding: 2px 8px; border: 2px solid var(--c2); z-index: 2; }
+
+/* ---------------- 表格 ---------------- */
+.records { border: 3px solid var(--c2); box-shadow: 6px 6px 0 var(--c1); max-height: 300px; overflow: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { padding: 7px 12px; text-align: left; border-bottom: 2px solid var(--c1); white-space: nowrap; }
+thead th { position: sticky; top: 0; background: var(--c1); color: var(--c2); }
+tbody tr:hover { background: var(--c1); }
+td.n { color: var(--c3); }
+
+/* ---------------- 空状态（抖动噪点） ---------------- */
+.empty { position: relative; border: 3px solid var(--c1); min-height: 180px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 20px; }
+.empty canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.empty-in { position: relative; text-align: center; }
+.empty-in strong { font-size: 24px; font-weight: normal; }
+.empty-in p { font-size: 12px; color: var(--c3); }
+
+.hint { font-size: 12px; color: var(--c3); margin-top: 14px; line-height: 1.9; max-width: 76ch; }
+.hint b { color: var(--c2); font-weight: normal; }
+.note { font-size: 12px; color: var(--c3); border: 3px dashed var(--c1); padding: 12px 14px; margin-top: 14px; line-height: 1.9; }
+.switch { display: inline-flex; align-items: center; gap: 8px; color: var(--c3); cursor: pointer; }
+.switch input { accent-color: var(--on); }
+.foot { text-align: center; font-size: 12px; color: var(--c3); margin-top: 32px; }
+
+@media (max-width: 860px) { .grid { grid-template-columns: 1fr; } .axes { grid-template-columns: 1fr; min-width: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .001ms !important; animation-iteration-count: 1 !important; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ================= 顶栏 ================= -->
+  <header class="topbar">
+    <canvas id="wash" aria-hidden="true"></canvas>
+    <div class="topbar-in">
+      <div class="brand">
+        <div class="logo">IMU</div>
+        <div>
+          <h1>三轴传感器监控台</h1>
+          <p>QMA7981　板端采集 → 本机服务 → 浏览器</p>
+        </div>
+      </div>
+      <div class="status">
+        <span class="chip"><i id="led" class="led on"></i><span id="statusText">实时</span></span>
+        <span class="chip">设备 <span class="v">S3EYE-GROUP01</span></span>
+        <span class="chip">信号 <span class="sig hot" id="sig"><i></i><i></i><i></i><i></i></span></span>
+        <button id="btnTheme" class="icon-btn" type="button" aria-label="切换深浅主题" title="切换深浅主题">◐</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ================= 导航 ================= -->
+  <nav class="nav" role="tablist">
+    <button class="tab" role="tab" data-page="live" aria-selected="true">实时监控</button>
+    <button class="tab" role="tab" data-page="cam" aria-selected="false">摄像头</button>
+    <button class="tab" role="tab" data-page="records" aria-selected="false">记录与设备</button>
+  </nav>
+
+  <main>
+  <!-- ================= 实时监控 ================= -->
+  <section class="page" data-page="live">
+
+    <div class="card span2">
+      <h2>实时姿态</h2>
+      <div id="liveBody">
+        <div class="hero-body">
+          <div>
+            <canvas id="level" width="160" height="160" aria-label="姿态水平仪"></canvas>
+            <div class="level-cap">重力方向　水平时居中</div>
+          </div>
+          <div class="axes">
+            <div class="axis">
+              <div class="axis-top"><span class="axis-name ax-x">X</span><span class="axis-ms2">-3.11 m/s²</span></div>
+              <div class="axis-g"><b>-0.317</b><span class="u">g</span></div>
+              <div class="bar bar-x"><i style="width:32%;margin-left:18%"></i></div>
+            </div>
+            <div class="axis">
+              <div class="axis-top"><span class="axis-name ax-y">Y</span><span class="axis-ms2">-5.02 m/s²</span></div>
+              <div class="axis-g"><b>-0.512</b><span class="u">g</span></div>
+              <div class="bar bar-y"><i style="width:51%;margin-left:0%"></i></div>
+            </div>
+            <div class="axis">
+              <div class="axis-top"><span class="axis-name ax-z">Z</span><span class="axis-ms2">-7.66 m/s²</span></div>
+              <div class="axis-g"><b>-0.782</b><span class="u">g</span></div>
+              <div class="bar bar-z"><i style="width:78%;margin-left:0%"></i></div>
+            </div>
+          </div>
+        </div>
+        <p class="hint">静止水平放置时 <b>Z 约等于 +1 g</b>，X 与 Y 接近 0。水平仪按 40×40 网格渲染后放大，光标位置量化到格子 —— 和板子的分辨率是同一套逻辑。</p>
+      </div>
+      <div id="liveEmpty" class="empty hidden">
+        <canvas data-noise="soft"></canvas>
+        <div class="empty-in">
+          <strong>等待板端上报</strong>
+          <p>接上 USB 或让板子连上 WiFi，数值会自己出现。<br>没收到数据时，这里不显示任何数字。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card span2">
+      <h2>三通道波形</h2>
+      <div id="scopeBody">
+        <div class="scope-key">
+          <span><i class="key k-x"></i>X 轴</span>
+          <span><i class="key k-y"></i>Y 轴</span>
+          <span><i class="key k-z"></i>Z 轴</span>
+        </div>
+        <canvas class="scope" id="scope"></canvas>
+        <div class="scope-axis"><span>-10 秒</span><span>-5 秒</span><span>现在</span></div>
+        <p class="hint">面积用 <b>Bayer 4×4 抖动</b>表示幅度：越靠近曲线点越密。画布先按 1/3 分辨率渲染，再关掉插值放大 —— 锯齿是设计，不是 bug。</p>
+      </div>
+      <div id="scopeEmpty" class="empty hidden">
+        <canvas data-noise="soft"></canvas>
+        <div class="empty-in"><strong>没有波形</strong><p>离线时不会拿旧数据补画面。</p></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <section class="card">
+        <h2>来源与时间核对</h2>
+        <div class="kv"><span class="k">设备标识</span><span class="v">S3EYE-GROUP01</span></div>
+        <div class="kv"><span class="k">MAC</span><span class="v">94A9901C70D0</span></div>
+        <div class="kv"><span class="k">传输方式</span><span class="v">USB 串口　COM4</span></div>
+        <div class="kv"><span class="k">板端时间</span><span class="v">09:14:26.350</span></div>
+        <div class="kv"><span class="k">服务端收到</span><span class="v">09:14:26.402</span></div>
+        <div class="kv"><span class="k">时间偏差</span><span class="v">+52 毫秒</span></div>
+        <div class="kv"><span class="k">最近更新</span><span class="v">0.3 秒前</span></div>
+      </section>
+
+      <section class="card">
+        <h2>采集控制</h2>
+        <p class="hint">下发一次立即采集命令。本次结果只认带 <b>request_id</b> 的新观测，绝不拿库里的旧值冒充。</p>
+        <div class="row">
+          <button class="btn btn-primary">采集一次</button>
+          <button class="btn">暂停上报</button>
+        </div>
+        <div class="note">通道状态：串口已连接　下行可用</div>
+      </section>
+    </div>
+
+  </section>
+
+  <!-- ================= 摄像头 ================= -->
+  <section class="page hidden" data-page="cam">
+    <div class="card span2">
+      <h2>板载摄像头　OV2640</h2>
+      <div class="cam">
+        <canvas id="static" aria-label="无信号静电噪点"></canvas>
+        <span class="cam-cap">320 × 240　JPEG　板端推流</span>
+      </div>
+      <div class="row">
+        <button class="btn btn-primary">开启实时画面</button>
+        <button class="btn" disabled>停止</button>
+        <button class="btn">抓拍一帧</button>
+      </div>
+      <div class="note">
+        画面是真像素：OV2640 只输出 320×240 JPEG，浏览器用 <b>image-rendering: pixelated</b> 放大，
+        不插值也不抹平。这里的像素感来自硬件本身 —— 全站唯一一处不用抖动伪造的地方。
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 记录与设备 ================= -->
+  <section class="page hidden" data-page="records">
+    <div class="card span2">
+      <h2>原始记录</h2>
+      <div class="row" style="margin-top:0">
+        <button class="btn">查询</button>
+        <button class="btn">导出 CSV</button>
+        <label class="switch"><input type="checkbox" id="offline" /> 模拟设备离线</label>
+      </div>
+      <div class="records">
+        <table>
+          <thead><tr><th>时间</th><th>SEQ</th><th>acc_x_g</th><th>acc_y_g</th><th>acc_z_g</th><th>温度</th><th>RSSI</th></tr></thead>
+          <tbody>
+            <tr><td>09:14:26.402</td><td>2926</td><td>-0.3174</td><td>-0.5116</td><td>-0.7815</td><td>47.8</td><td>-24</td></tr>
+            <tr><td>09:14:25.611</td><td>2925</td><td>-0.3161</td><td>-0.5130</td><td>-0.7802</td><td>47.8</td><td>-24</td></tr>
+            <tr><td>09:14:24.803</td><td>2924</td><td>-0.3188</td><td>-0.5101</td><td>-0.7831</td><td>47.6</td><td>-25</td></tr>
+            <tr><td>09:14:24.010</td><td>2923</td><td>-0.3155</td><td>-0.5122</td><td>-0.7798</td><td>47.7</td><td>-24</td></tr>
+            <tr><td>09:14:23.205</td><td>2922</td><td>-0.3190</td><td>-0.5098</td><td>-0.7840</td><td>47.5</td><td>-25</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="hint">一帧观测等于一条记录，落盘在 <b>data/records.ndjson</b>。</p>
+    </div>
+  </section>
+  </main>
+
+  <p class="foot">设计提案　波形与数值均为排版示意，不是真实采样</p>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+const BAYER = [[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]];
+const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const REDRAW = [];                                  // 主题切换 / resize 时重画的东西
+
+/* ---------------------------------------------------- 工具：颜色与离屏缓冲 */
+const hex2rgb = (h) => {
+  const s = h.trim().replace('#','');
+  return [parseInt(s.slice(0,2),16), parseInt(s.slice(2,4),16), parseInt(s.slice(4,6),16)];
+};
+const v = (n) => (getComputedStyle(document.documentElement).getPropertyValue(n) || '').trim();
+function palette() {
+  return {
+    bg: hex2rgb(v('--c0') || '#0b0f1a'),
+    grid: hex2rgb(v('--c4') || '#0f1630'),
+    ink: hex2rgb(v('--c2') || '#fff1e8'),
+    mute: hex2rgb(v('--c3') || '#83769c'),
+    x: hex2rgb(v('--x') || '#ff77a8'),
+    y: hex2rgb(v('--y') || '#ffec27'),
+    z: hex2rgb(v('--z') || '#29adff'),
+  };
+}
+const off = document.createElement('canvas');
+const offCtx = off.getContext('2d');
+function lowRes(cv, block, cssH) {
+  const W = Math.max(24, Math.floor((cv.clientWidth || cv.width) / block));
+  const H = Math.max(8, Math.floor(cssH / block));
+  off.width = W; off.height = H;
+  return { W, H, img: offCtx.createImageData(W, H) };
+}
+function blit(cv, block) {                          // 关插值放大 ×block
+  cv.width = off.width * block; cv.height = off.height * block;
+  const c = cv.getContext('2d');
+  c.imageSmoothingEnabled = false;
+  c.clearRect(0, 0, cv.width, cv.height);
+  c.drawImage(off, 0, 0, off.width * block, off.height * block);
+}
+const put = (d, i, c) => { d[i] = c[0]; d[i+1] = c[1]; d[i+2] = c[2]; d[i+3] = 255; };
+
+/* ------------------------------------------- 顶栏抖动渐变带（不用 CSS 渐变） */
+function drawWash() {
+  const cv = document.getElementById('wash');
+  const P = palette();
+  const block = 3;
+  const { W, H, img } = lowRes(cv, block, 84);
+  const d = img.data;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const u = x / W, w = y / H;
+    const val = (1 - u) * 0.55 + (1 - w) * 0.35 + 0.05;      // 左上到右下衰减
+    const th = (BAYER[y & 3][x & 3] + 0.5) / 16;
+    put(d, (y * W + x) * 4, val > th ? P.ink : (val > th * 0.45 ? P.grid : P.bg));
+  }
+  offCtx.putImageData(img, 0, 0);
+  blit(cv, block);
+}
+REDRAW.push(drawWash);
+
+/* ------------------------------------------------ 三通道抖动示波器 */
+const SERIES = [
+  { c: 'x', amp: 0.42, f: 0.8, ph: 0.0 },
+  { c: 'y', amp: 0.62, f: 1.3, ph: 1.1 },
+  { c: 'z', amp: 0.80, f: 0.5, ph: 2.2 },
+];
+let phase = 0;
+function drawScope() {
+  const cv = document.getElementById('scope');
+  if (!cv || cv.clientWidth === 0) return;
+  const P = palette();
+  const block = 3, H_CSS = 300;
+  const { W, H, img } = lowRes(cv, block, H_CSS);
+  const d = img.data;
+
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {          // 底 + 网格
+    const grid = (x % 12 === 0) || (y % 9 === 0);
+    put(d, (y * W + x) * 4, grid ? P.grid : P.bg);
+  }
+
+  const chH = Math.floor(H / 3);
+  SERIES.forEach((s, ci) => {
+    const col = P[s.c];
+    const top = ci * chH, mid = top + chH / 2, half = chH / 2 - 2;
+    for (let x = 0; x < W; x++) {
+      const t = x / W;
+      const val = Math.sin(t * Math.PI * 2 * s.f + s.ph + phase) * s.amp
+                + Math.sin(t * Math.PI * 2 * s.f * 3.3 + s.ph * 2) * s.amp * 0.22;
+      const yLine = Math.round(mid - val * half);
+      for (let y = top; y < top + chH; y++) {
+        const i = (y * W + x) * 4;
+        if (y === yLine) { put(d, i, col); continue; }
+        if (y > yLine) {
+          const depth = 1 - (y - yLine) / chH;                        // 越靠曲线越密
+          if ((BAYER[y & 3][x & 3] + 0.5) / 16 < depth * 0.85) put(d, i, col);
+        }
+      }
+    }
+    for (let x = 0; x < W; x++) put(d, (top * W + x) * 4, P.grid);     // 通道分隔线
+  });
+
+  offCtx.putImageData(img, 0, 0);
+  blit(cv, block);
+}
+REDRAW.push(drawScope);
+
+/* ------------------------------------------------ 像素水平仪（40×40 → 160） */
+function drawLevel(ax, ay) {
+  const cv = document.getElementById('level');
+  const P = palette();
+  const N = 40, block = 4;
+  off.width = N; off.height = N;
+  const img = offCtx.createImageData(N, N), d = img.data;
+  const cx = (N - 1) / 2, cy = (N - 1) / 2, R = 17;
+  const dx = Math.round(cx + ax * 12), dy = Math.round(cy + ay * 12);   // 量化到格子
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const i = (y * N + x) * 4;
+    const dist = Math.hypot(x - cx, y - cy);
+    let col = P.bg;
+    const th = (BAYER[y & 3][x & 3] + 0.5) / 16;
+    if (Math.abs(dist - R) < 1.2 && th < 0.75) col = P.mute;            // 抖出来的圆
+    if (dist < R && (x === Math.round(cx) || y === Math.round(cy))) col = P.grid;
+    if (Math.abs(x - dx) <= 1 && Math.abs(y - dy) <= 1) col = P.ink;    // 3×3 光标
+    put(d, i, col);
+  }
+  offCtx.putImageData(img, 0, 0);
+  blit(cv, block);
+}
+REDRAW.push(() => drawLevel(0.28, 0.36));
+
+/* ------------------------------------------------ 静电噪点（无信号 / 空状态） */
+let seed = 20260930;
+const noise = (() => { const a = []; for (let i = 0; i < 8192; i++) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; a.push(seed / 0x7fffffff); } return a; })();
+let scan = 0;
+function drawNoise(cv, hot) {
+  if (!cv || cv.clientWidth === 0) return;
+  const P = palette();
+  const block = 3;
+  const cssH = cv.clientHeight || 200;
+  const { W, H, img } = lowRes(cv, block, cssH);
+  const d = img.data;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4;
+    if (hot && y === scan % H) { put(d, i, P.ink); continue; }          // 扫描线
+    const n = noise[((y * 97 + x * 31) % noise.length)];
+    const val = (n * 0.5 + 0.28) * (1 - Math.abs(y / H - 0.5) * 0.6);
+    const th = (BAYER[y & 3][x & 3] + 0.5) / 16;
+    put(d, i, val > th ? P.mute : P.bg);
+  }
+  offCtx.putImageData(img, 0, 0);
+  blit(cv, block);
+}
+function drawAllNoise() {
+  document.querySelectorAll('[data-noise]').forEach((cv) => drawNoise(cv, false));
+  const st = document.getElementById('static');
+  if (st && !st.closest('.page').classList.contains('hidden')) drawNoise(st, true);
+}
+REDRAW.push(drawAllNoise);
+
+/* ------------------------------------------------ 8 fps 步进动画 */
+if (!reduced) {
+  setInterval(() => { phase += 0.075; scan++; drawScope(); }, 125);
+  setInterval(() => {
+    const camPage = document.querySelector('.page[data-page="cam"]');
+    if (!camPage.classList.contains('hidden')) drawNoise(document.getElementById('static'), true);
+  }, 125);
+}
+
+/* ------------------------------------------------ 主题 */
+const html = document.documentElement;
+document.getElementById('btnTheme').onclick = () => {
+  html.setAttribute('data-theme', html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+  REDRAW.forEach((f) => f());
+};
+
+/* ------------------------------------------------ 分页 */
+const pages = [...document.querySelectorAll('.page')];
+const tabs = [...document.querySelectorAll('.tab')];
+tabs.forEach((t) => t.onclick = () => {
+  const name = t.dataset.page;
+  pages.forEach((p) => p.classList.toggle('hidden', p.dataset.page !== name));
+  tabs.forEach((b) => b.setAttribute('aria-selected', String(b === t)));
+  if (name === 'cam') drawNoise(document.getElementById('static'), true);
+  if (name === 'live') { drawScope(); }
+});
+
+/* ------------------------------------------------ 离线开关 */
+const led = document.getElementById('led'), sig = document.getElementById('sig'), st = document.getElementById('statusText');
+document.getElementById('offline').onchange = (e) => {
+  const off2 = e.target.checked;
+  document.getElementById('liveBody').classList.toggle('hidden', off2);
+  document.getElementById('liveEmpty').classList.toggle('hidden', !off2);
+  document.getElementById('scopeBody').classList.toggle('hidden', off2);
+  document.getElementById('scopeEmpty').classList.toggle('hidden', !off2);
+  led.className = 'led ' + (off2 ? 'off' : 'on');
+  sig.className = 'sig ' + (off2 ? 'cold' : 'hot');
+  st.textContent = off2 ? '设备离线' : '实时';
+  if (off2) drawAllNoise();
+};
+
+/* ------------------------------------------------ 首次绘制 */
+drawWash(); drawScope(); drawLevel(0.28, 0.36); drawAllNoise();
+let rt = 0;
+addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => REDRAW.forEach((f) => f()), 150); });
+})();
+</script>
+</body>
+</html>

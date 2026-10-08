@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ESP32-S3-EYE 三轴传感器监控</title>
-<link rel="stylesheet" href="/style.css?v=9" />
+<link rel="stylesheet" href="/style.css?v=10" />
 <script>
 /* 主题防闪烁：样式生效前先把用户选择写到 <html data-theme>，
    否则深色用户每次刷新都会看到一帧浅色底闪一下。
@@ -442,6 +442,55 @@
           </div>
         </section>
 
+        <!-- 云端大模型自定义配置 -->
+        <section class="card">
+          <div class="card-head">
+            <h2>模型设置</h2>
+            <span id="llmStatusTag" class="tag">加载中…</span>
+          </div>
+          <p class="hint">
+            接入任意 OpenAI 兼容的云端大模型（DeepSeek、通义、OpenAI 等）。密钥只保存在服务端
+            <code>config.local.json</code>（已 gitignore），页面仅显示脱敏值，可随时修改或删除。
+          </p>
+
+          <div id="llmSavedInfo" class="llm-saved hidden"></div>
+
+          <form id="llmForm">
+            <div class="controls">
+              <div class="ctrl" style="flex:1 1 240px">
+                <label for="llmEndpoint">API 地址（Base URL）</label>
+                <input id="llmEndpoint" class="inp" autocomplete="off" spellcheck="false"
+                       placeholder="https://api.deepseek.com" />
+              </div>
+              <div class="ctrl" style="flex:1 1 240px">
+                <label for="llmApiKey">API Key</label>
+                <input id="llmApiKey" class="inp" type="password" autocomplete="new-password"
+                       placeholder="保存后仅显示脱敏值；修改时重新填写" />
+              </div>
+              <div class="ctrl" style="flex:1 1 160px">
+                <label for="llmModel">模型名称</label>
+                <input id="llmModel" class="inp" autocomplete="off" spellcheck="false"
+                       placeholder="deepseek-chat" />
+              </div>
+              <div class="ctrl">
+                <label for="llmTimeout">超时（毫秒）</label>
+                <input id="llmTimeout" class="inp inp-num" type="number" min="1000" max="30000" step="500" value="8000" />
+              </div>
+              <div class="ctrl btns">
+                <button id="btnLlmTest" class="btn" type="button">测试连接</button>
+                <button id="btnLlmSave" class="btn btn-primary" type="submit">保存配置</button>
+                <button id="btnLlmDelete" class="btn btn-danger" type="button">删除配置</button>
+              </div>
+            </div>
+          </form>
+          <div id="llmMsg" class="llm-msg hidden"></div>
+
+          <div class="ctrl-note">
+            未配置或配置无效时自动降级为内置规则解析（功能仍可用）。通过环境变量
+            NL_ENDPOINT / NL_API_KEY 配置时界面为只读。
+          </div>
+        </section>
+
       </div>
     </section>
 
@@ -449,6 +498,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=22"></script>
+<script src="/app.js?v=23"></script>
 </body>
 </html>

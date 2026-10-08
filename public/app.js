@@ -59,6 +59,13 @@ const els = {
   nlEngine: $('nlEngine'), nlCap: $('nlCap'), nlChat: $('nlChat'),
   nlForm: $('nlForm'), nlInput: $('nlInput'), nlSend: $('nlSend'),
 
+  // 云端大模型自定义配置
+  llmStatusTag: $('llmStatusTag'), llmSavedInfo: $('llmSavedInfo'),
+  llmForm: $('llmForm'), llmEndpoint: $('llmEndpoint'), llmApiKey: $('llmApiKey'),
+  llmModel: $('llmModel'), llmTimeout: $('llmTimeout'),
+  btnLlmTest: $('btnLlmTest'), btnLlmSave: $('btnLlmSave'), btnLlmDelete: $('btnLlmDelete'),
+  llmMsg: $('llmMsg'),
+
   // 主题切换（浅色 / 深色）
   btnTheme: $('btnTheme'),
 };
@@ -1228,6 +1235,101 @@ if (els.nlForm) {
     els.nlInput.value = '';
     nlSend(t);
   });
+}
+
+// ---------------------------------------------------------------- 云端大模型自定义配置
+/* 密钥只留服务端：前端只拿到脱敏值；保存/删除/测试均走 /api/nl/config。
+ * 测试连接用表单当前值（不落盘），方便"先测后存"；表单留空 key 时测试要求补全。 */
+function llmMsg(kind, html) {
+  els.llmMsg.className = 'llm-msg ' + kind;
+  els.llmMsg.innerHTML = html;
+  els.llmMsg.classList.remove('hidden');
+}
+
+function llmFormParams() {
+  return {
+    endpoint: els.llmEndpoint.value.trim(),
+    apiKey: els.llmApiKey.value.trim(),
+    model: els.llmModel.value.trim(),
+    timeoutMs: Number(els.llmTimeout.value) || 8000,
+  };
+}
+
+async function loadLlmConfig() {
+  try {
+    const j = await (await fetch('/api/nl/config')).json();
+    if (!j.ok) throw new Error('bad response');
+    els.llmStatusTag.textContent = j.configured
+      ? (j.source === 'env' ? '已配置（环境变量）' : '已配置')
+      : '未配置（规则解析兜底）';
+    if (j.configured) {
+      els.llmSavedInfo.innerHTML =
+        `<span>当前：<b>${escHtml(j.model || '—')}</b></span>` +
+        `<span>地址：<b>${escHtml(j.llm_host || j.endpoint || '—')}</b></span>` +
+        `<span>Key：<b>${escHtml(j.apiKey_masked || '—')}</b></span>` +
+        `<span>超时：<b>${escHtml(String(j.timeoutMs || 8000))} ms</b></span>`;
+      els.llmSavedInfo.classList.remove('hidden');
+      els.llmEndpoint.value = j.endpoint || '';
+      els.llmModel.value = j.model || '';
+      els.llmTimeout.value = j.timeoutMs || 8000;
+      els.llmApiKey.value = '';
+      els.llmApiKey.placeholder = j.env_locked ? '由环境变量提供（界面只读）' : `已保存（${j.apiKey_masked}），修改时重新填写`;
+    } else {
+      els.llmSavedInfo.classList.add('hidden');
+      els.llmApiKey.placeholder = 'sk-...';
+    }
+    const ro = !!j.env_locked;
+    for (const el of [els.llmEndpoint, els.llmApiKey, els.llmModel, els.llmTimeout]) el.disabled = ro;
+    els.btnLlmSave.disabled = ro;
+    els.btnLlmDelete.disabled = ro;
+    els.btnLlmTest.disabled = false;   // 测试允许用表单值验证环境变量是否可用
+  } catch (_) {
+    els.llmStatusTag.textContent = '服务端未连接';
+  }
+}
+
+if (els.llmForm) {
+  els.llmForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const p = llmFormParams();
+    if (!p.apiKey) { llmMsg('err', '保存前请填写 <b>API Key</b>（服务端不会回显完整密钥，只存脱敏展示）。'); return; }
+    els.btnLlmSave.disabled = true;
+    try {
+      const r = await fetch('/api/nl/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+      const j = await r.json();
+      if (j.ok) { llmMsg('ok', `已保存。模型 <b>${escHtml(j.model)}</b> @ ${escHtml(j.llm_host || '')}，Key <b>${escHtml(j.apiKey_masked)}</b>。`); await loadLlmConfig(); loadNlCap(); }
+      else llmMsg('err', `保存失败（HTTP ${r.status}）：${escHtml(j.message || j.error || '未知错误')}`);
+    } catch (e) { llmMsg('err', '保存失败：服务端未响应。'); }
+    els.btnLlmSave.disabled = false;
+  });
+
+  els.btnLlmDelete.addEventListener('click', async () => {
+    if (!confirm('确定删除已保存的模型配置？删除后将降级为规则解析（可用环境变量重新配置）。')) return;
+    try {
+      const r = await fetch('/api/nl/config', { method: 'DELETE' });
+      const j = await r.json();
+      if (j.ok) { llmMsg('ok', '配置已删除。' + (j.configured ? '' : '当前使用规则解析兜底。')); els.llmEndpoint.value = ''; els.llmApiKey.value = ''; els.llmModel.value = ''; els.llmTimeout.value = 8000; await loadLlmConfig(); loadNlCap(); }
+      else llmMsg('err', `删除失败（HTTP ${r.status}）：${escHtml(j.message || j.error || '未知错误')}`);
+    } catch (e) { llmMsg('err', '删除失败：服务端未响应。'); }
+  });
+
+  els.btnLlmTest.addEventListener('click', async () => {
+    const p = llmFormParams();
+    els.btnLlmTest.disabled = true;
+    llmMsg('ok', '正在测试连接…');
+    try {
+      const r = await fetch('/api/nl/config/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+      const j = await r.json();
+      if (j.ok === true && j.latencyMs !== undefined && !j.error) {
+        llmMsg('ok', `连接成功：模型 <b>${escHtml(j.model || '')}</b> 响应 <b>${j.latencyMs} ms</b>。保存配置后即可用于对话推理。`);
+      } else {
+        llmMsg('err', `连接失败：${escHtml(j.error || j.message || '未知错误')}${j.detail ? '<br><small>' + escHtml(j.detail) + '</small>' : ''}`);
+      }
+    } catch (e) { llmMsg('err', '测试失败：服务端未响应。'); }
+    els.btnLlmTest.disabled = false;
+  });
+
+  loadLlmConfig();
 }
 
 // ---------------------------------------------------------------- 分页路由

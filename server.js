@@ -396,6 +396,15 @@ function sendCommand(obj, device) {
   return wifiDownlinkActive();
 }
 
+/* 幂等闸门：返回仍在进行中的采集请求（submitted/dispatched/acked），没有则 null。
+   防止并发点击、页面刷新重发、NL 助手与前端同时发起 → 多个在途采集命令 */
+function findActiveCollectRequest() {
+  for (const r of REQUESTS.values()) {
+    if (r.status === 'submitted' || r.status === 'dispatched' || r.status === 'acked') return r;
+  }
+  return null;
+}
+
 /* 创建一次采集请求并下发 */
 function createCollectRequest() {
   const r = {
@@ -748,18 +757,128 @@ function goStale(reason) {
 /*      无位置数据时如实说明，绝不生成坐标。                              */
 /* ------------------------------------------------------------------ */
 
-/* ---- LLM 配置（OpenAI 兼容协议；教师授权服务 / 任意兼容服务均可接入） ---- */
-const NL_LOCAL_PATH = path.join(ROOT, 'config.local.json');
-let nlFileCfg = {};
-try {
-  if (fs.existsSync(NL_LOCAL_PATH)) nlFileCfg = JSON.parse(fs.readFileSync(NL_LOCAL_PATH, 'utf8'));
-} catch (e) { console.warn('[nl] config.local.json 读取失败：', e.message); }
-const NL = {
-  endpoint: process.env.NL_ENDPOINT || nlFileCfg.nlEndpoint || null,   // 如 https://api.deepseek.com
-  apiKey:   process.env.NL_API_KEY  || nlFileCfg.nlApiKey  || null,
-  model:    process.env.NL_MODEL    || nlFileCfg.nlModel   || 'deepseek-chat',
-  timeoutMs: Number(process.env.NL_TIMEOUT_MS || nlFileCfg.nlTimeoutMs || 8000),
-};
+/* ---- LLM 配置（OpenAI 兼容协议；任意兼容服务均可接入） ----
+ * 密钥只落 config.local.json（gitignored）或环境变量；前端任何时刻只能拿到脱敏值。
+ * 环境变量优先级高于文件：设了 NL_ENDPOINT/NL_API_KEY 时界面只读（409 提示）。
+ * NL_CONFIG_PATH 可指定其它配置文件路径（并行测试/多实例隔离用）。 */
+const NL_LOCAL_PATH = process.env.NL_CONFIG_PATH || path.join(ROOT, 'config.local.json');
+const NL_ENV_ACTIVE = !!(process.env.NL_ENDPOINT || process.env.NL_API_KEY);
+
+function readNlFileCfg() {
+  try {
+    if (fs.existsSync(NL_LOCAL_PATH)) return JSON.parse(fs.readFileSync(NL_LOCAL_PATH, 'utf8'));
+  } catch (e) { console.warn('[nl] config.local.json 读取失败：', e.message); }
+  return {};
+}
+
+/* 运行期配置：env 覆盖文件；文件改动后调 reloadNlConfig() 重载 */
+const NL = { endpoint: null, apiKey: null, model: 'deepseek-chat', timeoutMs: 8000 };
+function reloadNlConfig() {
+  const f = readNlFileCfg();
+  NL.endpoint = process.env.NL_ENDPOINT || f.nlEndpoint || null;
+  NL.apiKey   = process.env.NL_API_KEY  || f.nlApiKey  || null;
+  NL.model    = process.env.NL_MODEL    || f.nlModel   || 'deepseek-chat';
+  NL.timeoutMs = Number(process.env.NL_TIMEOUT_MS || f.nlTimeoutMs || 8000);
+}
+reloadNlConfig();
+
+/* 密钥脱敏：只回前 3 + 后 4 位，任何接口不得返回完整 key */
+function maskKey(k) {
+  if (!k) return null;
+  const s = String(k);
+  return s.length <= 7 ? '********' : s.slice(0, 3) + '****' + s.slice(-4);
+}
+
+/* 把 nl* 补丁合并写入 config.local.json（保留文件里其它键），返回是否成功 */
+function writeNlFileCfg(patch) {
+  const all = readNlFileCfg();
+  for (const k of Object.keys(patch)) {
+    if (patch[k] === null) delete all[k];
+    else all[k] = patch[k];
+  }
+  fs.writeFileSync(NL_LOCAL_PATH, JSON.stringify(all, null, 2), 'utf8');
+}
+
+/* 校验 + 规范化一组 LLM 配置参数；不合法抛 Error（消息即用户提示） */
+function validateNlParams(raw, { requireKey }) {
+  const out = {};
+  const ep = String(raw.endpoint ?? '').trim();
+  if (!ep) throw new Error('API 地址不能为空');
+  let u;
+  try { u = new URL(ep); } catch (_) { throw new Error('API 地址不是合法 URL（示例：https://api.deepseek.com）'); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('API 地址只支持 http:// 或 https://');
+  out.endpoint = ep.replace(/\/+$/, '');
+  const key = String(raw.apiKey ?? '').trim();
+  if (requireKey && !key) throw new Error('API Key 不能为空');
+  if (key.length > 300) throw new Error('API Key 过长（>300 字符）');
+  if (/\s/.test(key)) throw new Error('API Key 不能包含空白字符');
+  out.apiKey = key || null;
+  const model = String(raw.model ?? '').trim();
+  if (!model) throw new Error('模型名称不能为空');
+  if (model.length > 100) throw new Error('模型名称过长（>100 字符）');
+  out.model = model;
+  const tm = Number(raw.timeoutMs ?? 8000);
+  if (!Number.isFinite(tm) || tm < 1000 || tm > 30000) throw new Error('超时时间需在 1000~30000 毫秒之间');
+  out.timeoutMs = Math.round(tm);
+  return out;
+}
+
+/* 脱敏视图：查看/保存/删除/测试都返回同一形状，绝不带完整 key */
+function nlConfigView() {
+  const src = NL_ENV_ACTIVE ? 'env' : (NL.endpoint && NL.apiKey ? 'file' : 'none');
+  let host = null;
+  try { if (NL.endpoint) host = new URL(NL.endpoint).host; } catch (_) {}
+  return {
+    ok: true,
+    configured: !!(NL.endpoint && NL.apiKey),
+    source: src,
+    env_locked: NL_ENV_ACTIVE,
+    endpoint: NL.endpoint,
+    model: NL.model,
+    timeoutMs: NL.timeoutMs,
+    apiKey_masked: maskKey(NL.apiKey),
+    llm_host: host,
+  };
+}
+
+/* 连通性测试：用给定参数发一次最小 chat 请求（不落盘） */
+async function nlTestConnection({ endpoint, apiKey, model, timeoutMs }) {
+  const started = Date.now();
+  const url = endpoint.replace(/\/+$/, '') + '/v1/chat/completions';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 1, temperature: 0,
+      }),
+      signal: ac.signal,
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      let hint = 'HTTP ' + r.status;
+      if (r.status === 401 || r.status === 403) hint += '（认证失败：API Key 无效或无权限）';
+      else if (r.status === 404) hint += '（地址或模型不存在：检查 API 地址与模型名称）';
+      else if (r.status === 429) hint += '（额度/速率超限）';
+      else if (r.status === 400) hint += '（请求参数被服务端拒绝：检查模型名称）';
+      const snippet = body.slice(0, 160).replace(/\s+/g, ' ');
+      return { ok: false, latencyMs: Date.now() - started, httpStatus: r.status, error: hint, detail: snippet || null };
+    }
+    return { ok: true, latencyMs: Date.now() - started, model };
+  } catch (e) {
+    const msg = e.name === 'AbortError' ? `连接超时（>${timeoutMs}ms）：地址不可达或服务无响应`
+      : (e.cause && e.cause.code === 'ENOTFOUND' ? '域名解析失败：检查 API 地址'
+      : (e.cause && e.cause.code === 'ECONNREFUSED' ? '连接被拒绝：检查地址与端口'
+      : '请求失败：' + e.message));
+    return { ok: false, latencyMs: Date.now() - started, error: msg };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const NL_INTENTS = new Set(['query_last', 'collect_once', 'ambiguous', 'out_of_scope', 'location_query', 'other']);
 
@@ -874,11 +993,13 @@ function nlRunQueryLast() {
 /* ---- 受限工具 2：collect_once —— 发起采集并等待真实完成证据 ---- */
 function nlRunCollectOnce() {
   return new Promise((resolve) => {
-    const r = createCollectRequest();
+    const active = findActiveCollectRequest();
+    const r = active || createCollectRequest();   // 幂等：已有进行中的采集则等待它，不重复下发
+    const deduped = !!active;
     const deadline = Date.now() + collectTimeoutMs() + 2000;
     const iv = setInterval(() => {
       const cur = REQUESTS.get(r.request_id);
-      if (!cur) { clearInterval(iv); return resolve({ reply: '采集请求状态丢失（内部错误），没有完成证据。', evidence: { status: 'lost', request_id: r.request_id } }); }
+      if (!cur) { clearInterval(iv); return resolve({ reply: '采集请求状态丢失（内部错误），没有完成证据。', evidence: { status: 'lost', request_id: r.request_id, deduped } }); }
       if (cur.status === 'completed') {
         clearInterval(iv);
         const o = cur.observation || {};
@@ -890,6 +1011,7 @@ function nlRunCollectOnce() {
             seq_before: cur.seq_before ?? null, seq_observed: o.seq ?? null,
             completed_iso: new Date(cur.completed_at).toISOString(),
             checks: o.checks || null, simulated: !!cur.simulated, fields: o.fields || null,
+            deduped,
           },
         });
       }
@@ -900,13 +1022,13 @@ function nlRunCollectOnce() {
             + (cur.note ? ' 说明：' + cur.note : ''),
           evidence: {
             status: cur.status, request_id: r.request_id, error: cur.error || null,
-            note: cur.note || null, ack_status: cur.ack_status || null,
+            note: cur.note || null, ack_status: cur.ack_status || null, deduped,
           },
         });
       }
       if (Date.now() > deadline) {
         clearInterval(iv);
-        return resolve({ reply: '等待超时（内部兜底），没有完成证据。', evidence: { status: 'watchdog_timeout', request_id: r.request_id } });
+        return resolve({ reply: '等待超时（内部兜底），没有完成证据。', evidence: { status: 'watchdog_timeout', request_id: r.request_id, deduped } });
       }
     }, 200);
   });
@@ -1710,8 +1832,10 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // ---- 远程采集：创建一次请求并下发 ----
+  // ---- 远程采集：创建一次请求并下发（幂等：有进行中的请求则复用，不产生并发命令）----
   if (p === '/api/collect' && req.method === 'POST') {
+    const active = findActiveCollectRequest();
+    if (active) return json(res, 200, { ok: true, request: publicRequest(active), deduped: true });
     const r = createCollectRequest();
     return json(res, 200, { ok: r.status !== 'failed', request: publicRequest(r) });
   }
@@ -1907,6 +2031,65 @@ const server = http.createServer(async (req, res) => {
         collect_once: '请求设备立即采集一帧新数据，等待真实完成证据',
       },
     });
+  }
+
+  // ---- LLM 自定义配置：查看（脱敏） ----
+  if (p === '/api/nl/config' && req.method === 'GET') {
+    return json(res, 200, nlConfigView());
+  }
+
+  // ---- LLM 自定义配置：保存（校验 → 写 config.local.json → 重载） ----
+  if (p === '/api/nl/config' && req.method === 'PUT') {
+    if (NL_ENV_ACTIVE) {
+      return json(res, 409, { ok: false, error: 'env_override', message: '当前已通过环境变量 NL_ENDPOINT/NL_API_KEY/NL_MODEL 配置，优先级高于文件。请改用环境变量管理，或取消环境变量后再通过界面保存。' });
+    }
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    let v;
+    try { v = validateNlParams(body, { requireKey: true }); }
+    catch (e) { return json(res, 400, { ok: false, error: 'invalid_config', message: e.message }); }
+    try {
+      writeNlFileCfg({ nlEndpoint: v.endpoint, nlApiKey: v.apiKey, nlModel: v.model, nlTimeoutMs: v.timeoutMs });
+    } catch (e) {
+      return json(res, 500, { ok: false, error: 'write_failed', message: 'config.local.json 写入失败：' + e.message });
+    }
+    reloadNlConfig();
+    console.log('[nl] LLM 配置已更新：', v.endpoint, v.model);
+    return json(res, 200, nlConfigView());
+  }
+
+  // ---- LLM 自定义配置：删除（只清 nl* 键，保留文件其它内容） ----
+  if (p === '/api/nl/config' && req.method === 'DELETE') {
+    if (NL_ENV_ACTIVE) {
+      return json(res, 409, { ok: false, error: 'env_override', message: '当前配置来自环境变量，界面删除无效。请取消环境变量 NL_ENDPOINT/NL_API_KEY。' });
+    }
+    try { writeNlFileCfg({ nlEndpoint: null, nlApiKey: null, nlModel: null, nlTimeoutMs: null }); }
+    catch (e) {
+      return json(res, 500, { ok: false, error: 'write_failed', message: 'config.local.json 写入失败：' + e.message });
+    }
+    reloadNlConfig();
+    console.log('[nl] LLM 配置已删除（config.local.json 中 nl* 键已清空）');
+    return json(res, 200, nlConfigView());
+  }
+
+  // ---- LLM 自定义配置：测试连接（用请求体里的参数，不落盘；为空则用已保存配置） ----
+  if (p === '/api/nl/config/test' && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    let params;
+    if (body.endpoint || body.apiKey || body.model) {
+      let v;
+      try { v = validateNlParams(body, { requireKey: true }); }
+      catch (e) { return json(res, 400, { ok: false, error: 'invalid_config', message: e.message }); }
+      params = v;
+    } else {
+      if (!NL.endpoint || !NL.apiKey) {
+        return json(res, 400, { ok: false, error: 'not_configured', message: '尚未保存任何 LLM 配置，请先在表单填写并保存，或在测试请求中带上完整参数。' });
+      }
+      params = { endpoint: NL.endpoint, apiKey: NL.apiKey, model: NL.model, timeoutMs: NL.timeoutMs };
+    }
+    const result = await nlTestConnection(params);
+    return json(res, 200, { ok: true, ...result });
   }
 
   // ---- 波特率探测 ----
