@@ -58,6 +58,9 @@ const els = {
   // 自然语言助手（第 4 周）
   nlEngine: $('nlEngine'), nlCap: $('nlCap'), nlChat: $('nlChat'),
   nlForm: $('nlForm'), nlInput: $('nlInput'), nlSend: $('nlSend'),
+
+  // 主题切换（浅色 / 深色）
+  btnTheme: $('btnTheme'),
 };
 
 // ---------------------------------------------------------------- 状态
@@ -399,8 +402,65 @@ function fitCanvas(canvas) {
   return { ctx, w, h };
 }
 
-// 三轴曲线颜色（红/绿/蓝，与卡片图例一致）
+// 三轴曲线颜色（红/绿/蓝，与卡片图例一致）——仅作兜底，实际取 CSS 变量（见 chartTheme）
 const AXIS_COLOR = { x: '#e24b4a', y: '#639922', z: '#378add' };
+
+// ---------------------------------------------------------------- 主题（浅色 / 深色）
+/* 主题由 <html data-theme="light|dark"> 控制；没设置时跟随系统 prefers-color-scheme
+ * （CSS 侧用 :root:not([data-theme]) + prefers-color-scheme 实现，见 style.css）。
+ *
+ * canvas 是 JS 画出来的，拿不到 CSS 变量，所以这里把图表配色从 CSS 变量里读出来缓存；
+ * 主题一变就清缓存 + 置 needDraw，下一帧立即用新配色重画。
+ */
+const THEME_KEY = 'imu-theme';
+let _chartTheme = null;
+
+function chartTheme() {
+  if (_chartTheme) return _chartTheme;
+  const cs = getComputedStyle(document.documentElement);
+  const g = (name, fallback) => (cs.getPropertyValue(name) || '').trim() || fallback;
+  _chartTheme = {
+    grid: g('--chart-grid', '#eef1f6'),
+    gridStrong: g('--chart-grid-strong', '#d8dfe9'),
+    gridV: g('--chart-grid-v', '#f4f7fb'),
+    label: g('--chart-label', '#8a94a6'),
+    muted: g('--chart-muted', '#9aa5b5'),
+    dotRing: g('--chart-dot-ring', '#ffffff'),
+    axis: {
+      x: g('--chart-axis-x', AXIS_COLOR.x),
+      y: g('--chart-axis-y', AXIS_COLOR.y),
+      z: g('--chart-axis-z', AXIS_COLOR.z),
+    },
+  };
+  return _chartTheme;
+}
+
+function currentTheme() {
+  const attr = document.documentElement.getAttribute('data-theme');
+  if (attr === 'light' || attr === 'dark') return attr;
+  return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+}
+
+function applyTheme(theme, persist) {
+  document.documentElement.setAttribute('data-theme', theme);
+  if (persist) { try { localStorage.setItem(THEME_KEY, theme); } catch { /* 隐私模式下写不进，忽略 */ } }
+  _chartTheme = null;   // 配色缓存失效，下一帧按新主题重取
+  needDraw = true;      // 立即用新配色重画曲线
+  if (els.btnTheme) els.btnTheme.setAttribute('aria-pressed', String(theme === 'dark'));
+}
+
+if (els.btnTheme) {
+  els.btnTheme.onclick = () => applyTheme(currentTheme() === 'dark' ? 'light' : 'dark', true);
+}
+// 用户没手动选过时，系统主题一变要跟着走（选过就以选择为准）
+if (window.matchMedia) {
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const onSysChange = () => {
+    try { if (!localStorage.getItem(THEME_KEY)) { _chartTheme = null; needDraw = true; } } catch { /* noop */ }
+  };
+  if (mq.addEventListener) mq.addEventListener('change', onSysChange);
+  else if (mq.addListener) mq.addListener(onSysChange);
+}
 
 // 「去直流」模式：减去各轴窗口均值，三条曲线叠在同一水平线上，
 // 便于像示波器那样对比三轴波形（绝对值仍在卡片左上角照常显示）。默认开启。
@@ -412,42 +472,61 @@ let CHART_PAUSED = false;
 const DC_REF = {};
 const RANGE_SMOOTH = {};
 
-function drawMainChart() {
+/* 图表数据缓存：三轴平滑序列（滑动平均 + 去直流基准）只在「有新数据 / 切开关」时重算；
+ * 绘制本身每帧都做（60fps）。
+ * 拆分原因：老实现"数据来一帧才画一帧"（≈1.75 次/秒），每次还按数据点整窗重映射，
+ * 曲线是"一帧一帧跳"；改成"连续时间窗口 + 每帧重绘"后平滑滚动。 */
+let _chartCache = { key: null, series: null };
+
+function _chartKey() {
+  const suffix = els.chartUnit && els.chartUnit.value === 'ms2' ? 'ms2' : 'g';
+  const arr = S.history.get('acc_x_' + suffix) || [];
+  const lastT = arr.length ? arr[arr.length - 1].t : 0;
+  return [lastT, suffix, CHART_AC ? 1 : 0].join('|');
+}
+
+/* 构建三轴平滑序列（滑动平均 + 去直流基准慢速跟随）。
+ * 先对「整段历史」做 9 点滑动平均再截取窗口 —— 若只对窗口内数据做因果滑动平均，
+ * 窗口最左侧（最旧）的点会因为之前的样本已移出窗口而平滑不足，噪声裸露、幅度看着变大。
+ * 600 点滑动平均 + 排序相对贵，不能每帧做，只在有新数据时重算。 */
+function buildChartCache() {
   const unit = els.chartUnit ? els.chartUnit.value : 'g';
   const suffix = unit === 'ms2' ? 'ms2' : 'g';
-  const { ctx, w, h } = fitCanvas(els.mainChart);
-  ctx.clearRect(0, 0, w, h);
-
-  // 只取最近 WINDOW 个点。参照老师的示波器（缓冲仅 3.1s、X 轴约 -9s~0s），
-  // 窗口取 10 秒（10Hz → 100 点），曲线不会被密集的点堆成一团。
-  const WINDOW = 100;
-  // 三轴历史（三者同帧上报，时间轴一致）。
-  // 关键：先对「整段历史」做 9 点滑动平均，再截取显示窗口。
-  // 若只对窗口内数据做因果滑动平均，窗口最左侧（最旧）的点会因为
-  // 之前的样本已移出窗口而平滑不足，原噪声裸露、幅度看着变大
-  // —— 同一段数据在不同位置观感不一致，就是这个原因。
   const series = ['x', 'y', 'z'].map((ax) => {
     const full = S.history.get('acc_' + ax + '_' + suffix) || [];
     const smFull = smooth(full.map((p) => p.v), 9);
-    const start = Math.max(0, full.length - WINDOW);
-    const arr = full.slice(start);
-    const sm = smFull.slice(start);
-    if (CHART_AC && sm.length) {
+    if (CHART_AC && smFull.length) {
       // 用中位数作直流基准（比均值稳）；再做慢速跟随，
       // 否则窗口滑动时中位数跳变会让整条曲线上下抖
-      const sorted = [...sm].sort((a, b) => a - b);
+      const sorted = [...smFull].sort((a, b) => a - b);
       const raw = sorted[Math.floor(sorted.length / 2)];
       const key = ax + '_' + suffix;
       const prev = DC_REF[key];
       const ref = prev == null ? raw : prev + 0.12 * (raw - prev);
       DC_REF[key] = ref;
-      for (let i = 0; i < sm.length; i++) sm[i] -= ref;
+      for (let i = 0; i < smFull.length; i++) smFull[i] -= ref;
     }
-    return { ax, n: full.length, lastAbs: arr.length ? arr[arr.length - 1].v : 0, pts: arr.map((p, i) => ({ t: p.t, v: sm[i] })) };
+    const start = Math.max(0, full.length - 300);
+    const pts = [];
+    for (let i = start; i < full.length; i++) pts.push({ t: full[i].t, v: smFull[i] });
+    return { ax, n: full.length, lastAbs: full.length ? full[full.length - 1].v : 0, pts };
   }).filter((s) => s.pts.length >= 2);
+  _chartCache = { key: _chartKey(), series };
+}
+
+const CHART_WINDOW_MS = 10000;   // 显示窗口固定为最近 10 秒（与老师示波器 -9s~0s 一致）
+
+function drawMainChart() {
+  const unit = els.chartUnit ? els.chartUnit.value : 'g';
+  const suffix = unit === 'ms2' ? 'ms2' : 'g';
+  if (!_chartCache.series || _chartCache.key !== _chartKey()) buildChartCache();
+  const { series } = _chartCache;
+  const C = chartTheme();   // 画布配色：跟随当前主题（浅色 / 深色）
+  const { ctx, w, h } = fitCanvas(els.mainChart);
+  ctx.clearRect(0, 0, w, h);
 
   if (!series.length) {
-    ctx.fillStyle = '#9aa5b5';
+    ctx.fillStyle = C.muted;
     ctx.font = '13px "Microsoft YaHei", sans-serif';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(S.connected ? '等待设备数据…' : '设备未连接，无曲线', w / 2, h / 2);
@@ -457,20 +536,24 @@ function drawMainChart() {
   const padL = 58, padR = 14, padT = 18, padB = 26;
   const cw = w - padL - padR, ch = h - padT - padB;
 
-  // Y 轴量程：默认「自动」——量程随波形自适应，静止平稳、剧烈晃动撑满；
-  // 也可锁定固定档位（±0.5g / ±1g / ±2g）。
+  /* X 轴：固定为「最近 10 秒」连续时间窗口 [now-10s, now]，不随数据点重映射。
+   * 数据点按自身采样时刻落到对应横坐标，窗口随时间平滑左移 → 曲线连续滚动。 */
+  const latestT = series[0].pts.length ? series[0].pts[series[0].pts.length - 1].t : 0;
+  const now = CHART_PAUSED ? latestT : Date.now();   // 暂停时窗口冻结在最新数据时刻
+  const tStart = now - CHART_WINDOW_MS;
+
+  // Y 轴量程：默认「自动」（2%~98% 分位定标 + 慢速跟随）；可锁定固定档位。
+  // 只用窗口内的点定标，每帧重算（~50 点排序很便宜），指数平滑保证量程不抖。
   const rangeSel = els.chartRange ? els.chartRange.value : 'auto';
   let min, max;
   if (rangeSel !== 'auto') {
     const half = Number(rangeSel) * (unit === 'ms2' ? 9.80665 : 1);
     min = -half; max = half;
   } else {
-    // 自动：取 2%~98% 分位定标，偶发尖峰不参与；量程会随晃动幅度自适应扩大，
-    // 剧烈晃动也能撑满画面且不削顶。
     const vals = [];
-    for (const s of series) for (const p of s.pts) vals.push(p.v);
+    for (const s of series) for (const p of s.pts) if (p.t >= tStart) vals.push(p.v);
     vals.sort((a, b) => a - b);
-    const pick = (f) => vals[Math.min(vals.length - 1, Math.max(0, Math.round((vals.length - 1) * f)))];
+    const pick = (f) => vals.length ? vals[Math.min(vals.length - 1, Math.max(0, Math.round((vals.length - 1) * f)))] : 0;
     min = pick(0.02); max = pick(0.98);
     if (!Number.isFinite(min) || !Number.isFinite(max)) { min = -1; max = 1; }
     if (min === max) { const d = Math.abs(min) * 0.05 || 1; min -= d; max += d; }
@@ -480,7 +563,6 @@ function drawMainChart() {
     // 轻微晃动约 25%（可见但不过度），剧烈晃动仍会自动扩量程撑满。
     const minSpan = unit === 'ms2' ? 8 : 0.8;
     if (max - min < minSpan) { const mid = (min + max) / 2; min = mid - minSpan / 2; max = mid + minSpan / 2; }
-
     // 量程慢速跟随：窗口滑动时 2%~98% 分位会小幅跳变，
     // 直接定标会让整幅画面抖动，这里做指数平滑跟随。
     const rk = 'r_' + suffix + (CHART_AC ? '_ac' : '');
@@ -489,11 +571,7 @@ function drawMainChart() {
     RANGE_SMOOTH[rk] = { min, max };
   }
 
-  const t0 = series[0].pts[0].t;
-  let t1 = t0;
-  for (const s of series) t1 = Math.max(t1, s.pts[s.pts.length - 1].t);
-  if (t1 <= t0) t1 = t0 + 1;
-  const X = (t) => padL + ((t - t0) / (t1 - t0)) * cw;
+  const X = (t) => padL + ((t - tStart) / CHART_WINDOW_MS) * cw;
   const Y = (v) => padT + ch - ((v - min) / (max - min)) * ch;
 
   ctx.font = '11px Consolas, monospace';
@@ -501,51 +579,53 @@ function drawMainChart() {
   for (let i = 0; i <= 4; i++) {
     const v = min + ((max - min) * i) / 4;
     const y = Y(v);
-    ctx.strokeStyle = i === 0 ? '#d8dfe9' : '#eef1f6';
+    ctx.strokeStyle = i === 0 ? C.gridStrong : C.grid;
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
-    ctx.fillStyle = '#8a94a6';
+    ctx.fillStyle = C.label;
     ctx.fillText(fmtAxis(v, max - min), padL - 8, y);
   }
 
-  // X 轴：相对时间（-10s … 现在）+ 竖向网格，与老师示波器的 -9s~0s 一致
+  // X 轴：-10s … 现在（绝对时间，随窗口滚动），与老师示波器的 -9s~0s 一致
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-  const spanMs = t1 - t0;
   for (let i = 0; i <= 5; i++) {
-    const t = t0 + (spanMs * i) / 5;
+    const t = tStart + (CHART_WINDOW_MS * i) / 5;
     const x = X(t);
     if (i > 0 && i < 5) {
-      ctx.strokeStyle = '#f2f5fa'; ctx.lineWidth = 1;
+      ctx.strokeStyle = C.gridV; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ch); ctx.stroke();
     }
-    const secs = Math.round((t1 - t) / 1000);
-    ctx.fillStyle = '#8a94a6';
+    const secs = Math.round((now - t) / 1000);
+    ctx.fillStyle = C.label;
     ctx.fillText(secs <= 0 ? '现在' : `-${secs}s`, x, padT + ch + 7);
   }
 
   // 三条曲线（各自颜色）——用二次贝塞尔画平滑曲线（穿过相邻点中点），
-  // 比直线段折线视觉上更柔顺，接近示波器观感
+  // 比直线段折线视觉上更柔顺，接近示波器观感。
+  // 只画窗口内的点；左边缘多留 300ms，让曲线出画时不生硬截断。
   for (const s of series) {
-    const c = AXIS_COLOR[s.ax];
-    const n = s.pts.length;
+    const c = C.axis[s.ax];
+    const pts = s.pts.filter((p) => p.t >= tStart - 300);
+    const n = pts.length;
+    if (n < 2) continue;
     ctx.beginPath();
-    ctx.moveTo(X(s.pts[0].t), Y(s.pts[0].v));
+    ctx.moveTo(X(pts[0].t), Y(pts[0].v));
     if (n === 2) {
-      ctx.lineTo(X(s.pts[1].t), Y(s.pts[1].v));
+      ctx.lineTo(X(pts[1].t), Y(pts[1].v));
     } else {
       for (let i = 1; i < n - 1; i++) {
-        const cx = X(s.pts[i].t), cy = Y(s.pts[i].v);
-        const nx = X(s.pts[i + 1].t), ny = Y(s.pts[i + 1].v);
+        const cx = X(pts[i].t), cy = Y(pts[i].v);
+        const nx = X(pts[i + 1].t), ny = Y(pts[i + 1].v);
         ctx.quadraticCurveTo(cx, cy, (cx + nx) / 2, (cy + ny) / 2);
       }
-      ctx.lineTo(X(s.pts[n - 1].t), Y(s.pts[n - 1].v));
+      ctx.lineTo(X(pts[n - 1].t), Y(pts[n - 1].v));
     }
     ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
     ctx.stroke();
-    const last = s.pts[n - 1];
+    const last = pts[n - 1];
     ctx.beginPath(); ctx.arc(X(last.t), Y(last.v), 3.2, 0, Math.PI * 2);
     ctx.fillStyle = c; ctx.fill();
-    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.strokeStyle = C.dotRing; ctx.lineWidth = 1.5; ctx.stroke();
   }
 
   // 左上角：三轴当前绝对值读数（去直流模式下仍显示绝对值）+ 采样点数
@@ -558,7 +638,7 @@ function drawMainChart() {
     ctx.fillText(txt, lx, 2);
     lx += ctx.measureText(txt).width + 14;
   }
-  ctx.fillStyle = CHART_PAUSED ? '#e24b4a' : '#9aa5b5';
+  ctx.fillStyle = CHART_PAUSED ? C.axis.x : C.muted;
   ctx.fillText(`· 最近 ${series[0].pts.length} 点${CHART_AC ? ' · 去直流' : ''}${CHART_PAUSED ? ' · 已暂停' : ''}`, lx, 2);
 }
 
@@ -575,9 +655,17 @@ function smooth(data, n) {
 }
 
 function frame() {
-  // 只在「实时监控」页绘制：其他页面画布不可见（尺寸为 0）。
-  // 切回实时页时 showPage() 会把 needDraw 置回 true，立即补画。
-  if (needDraw && S.page === 'live') { needDraw = false; drawMainChart(); }
+  // 实时页：每帧重绘（X 轴按当前时间连续滚动，曲线平滑左移）—— 流畅的关键。
+  // 暂停时冻结波形：只在需要时（主题切换/窗口缩放）重画，窗口冻结在最新数据时刻。
+  // 其他页面画布不可见（尺寸为 0），不绘制。
+  if (S.page === 'live') {
+    if (CHART_PAUSED) {
+      if (needDraw) { needDraw = false; drawMainChart(); }
+    } else {
+      needDraw = false;
+      drawMainChart();
+    }
+  }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
