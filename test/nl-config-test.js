@@ -6,7 +6,7 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const PORT = 8098;
+const PORT = 8095;
 const ROOT = path.join(__dirname, '..');
 const TEST_DATA = path.join(__dirname, '.test-data-nlcfg');
 const NL_CFG_PATH = path.join(__dirname, '.test-nl-local.json');

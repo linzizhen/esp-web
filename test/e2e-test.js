@@ -38,7 +38,7 @@ async function post(payload) {
 (async () => {
   let srv = null;
   if (ISOLATED) {
-    srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: path.join(__dirname, '.test-config.json'), DATA_DIR: path.join(__dirname, '.test-data') }), stdio: 'ignore' });
+    srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: path.join(__dirname, '.test-config.json'), DATA_DIR: path.join(__dirname, '.test-data') , NL_CONFIG_PATH: __dirname + '/.test-nl-local-absent.json', NL_ENDPOINT: '', NL_API_KEY: ''}), stdio: 'ignore' });
     await sleep(1200);
   }
   console.log(`ESP32 监控平台 —— 链路自检 (${ISOLATED ? '隔离模式 PORT='+PORT : '生产模式 PORT='+PORT})\n`);

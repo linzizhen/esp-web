@@ -35,7 +35,7 @@ function nowMs() { return Date.now(); }
 
   // 必须用隔离配置：默认配置 autoDetect=true 会打开真实板子的串口，
   // 板子持续上报会让"停采"场景无法成立，测试出现假失败。
-  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: path.join(__dirname, '.test-config.json') }), stdio: 'ignore' });
+  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: path.join(__dirname, '.test-config.json') , NL_CONFIG_PATH: __dirname + '/.test-nl-local-absent.json', NL_ENDPOINT: '', NL_API_KEY: ''}), stdio: 'ignore' });
   await sleep(1200);
 
   try {

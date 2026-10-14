@@ -20,7 +20,7 @@ function req(opts, body) {
 const post = (p, obj) => req({ host: '127.0.0.1', port: PORT, path: p, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(JSON.stringify(obj)) } }, JSON.stringify(obj));
 
 (async () => {
-  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: path.join(ROOT, 'test', '.test-config.json') }), stdio: 'ignore' });
+  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: path.join(ROOT, 'test', '.test-config.json') , NL_CONFIG_PATH: __dirname + '/.test-nl-local-absent.json', NL_ENDPOINT: '', NL_API_KEY: ''}), stdio: 'ignore' });
   await sleep(1200);
   try {
     // 设置本组期望标识

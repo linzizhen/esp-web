@@ -25,7 +25,7 @@ function req(opts, body) {
   const ndjson = require('node:path').join(TEST_DATA, 'records.ndjson');
   if (fs.existsSync(ndjson)) fs.unlinkSync(ndjson);
 
-  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: require('node:path').join(__dirname, '.test-config.json'), DATA_DIR: TEST_DATA }), stdio: 'ignore' });
+  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: require('node:path').join(__dirname, '.test-config.json'), DATA_DIR: TEST_DATA , NL_CONFIG_PATH: __dirname + '/.test-nl-local-absent.json', NL_ENDPOINT: '', NL_API_KEY: ''}), stdio: 'ignore' });
   await sleep(1200);
 
   try {

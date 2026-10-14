@@ -57,6 +57,7 @@ const HELP = (extra) => Object.assign({
       PORT: String(PORT),
       HOST: '127.0.0.1',
       CONFIG_PATH: path.join(ROOT, 'test', '.test-config.json'),
+      NL_CONFIG_PATH: __dirname + '/.test-nl-local-absent.json', NL_ENDPOINT: '', NL_API_KEY: '',
     }),
     stdio: 'ignore',
   });

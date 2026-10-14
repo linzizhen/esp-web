@@ -68,6 +68,8 @@ const FRAME = (seq, extra) => Object.assign({
       CONFIG_PATH: path.join(ROOT, 'test', '.test-nl-config.json'),
       DATA_DIR,
       NL_ENDPOINT: '', NL_API_KEY: '',   // 显式确保走规则兜底（备用路径）
+      // 隔离真实 config.local.json：否则本机若已配置 LLM，会读到真实密钥而使本用例误判
+      NL_CONFIG_PATH: path.join(ROOT, 'test', '.test-nl-local-absent.json'),
     }),
     stdio: 'ignore',
   });
