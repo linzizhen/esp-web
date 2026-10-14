@@ -90,16 +90,27 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 ├── .gitignore                # 排除构建产物 / 依赖 / 运行时数据
 ├── scripts/
 │   ├── idfwrap.py            # ESP-IDF 构建/烧录封装（自动注入工具链环境）
-│   └── set_wifi.py           # 一键切换板端 WiFi 配置（自动检测本机 IP，写入 gitignore 的本地文件）
+│   ├── set_wifi.py           # 一键切换板端 WiFi 配置（自动检测本机 IP，写入 gitignore 的本地文件）
+│   ├── audit-unused.js       # 代码审计：未使用的函数/常量、空 catch、注释掉的死代码（只读）
+│   ├── audit-api.js          # 代码审计：前后端接口交叉核对，找潜在 404（只读）
+│   └── audit-dup.js          # 代码审计：重复函数体 / ≥85% 相似函数（只读）
 ├── docs/
 │   ├── week2-remote-collect.md  # 第 2 周：远程采集协议、状态图、时序图、实测记录
-│   └── week3-button-feedback.md # 第 3 周：按键触发与物理反馈闭环（协议/状态图/时序图/实测）
+│   ├── week3-button-feedback.md # 第 3 周：按键触发与物理反馈闭环（协议/状态图/时序图/实测）
+│   ├── week4-nl-assistant.md    # 第 4 周：自然语言查询与请求采集（受限工具 + 诚实性回复）
+│   ├── week4-test-guide.md      # 第 4 周：LLM 配置与验收步骤
+│   ├── week3-flash-evidence.txt # 第 3 周烧录留存证据
+│   ├── code-issues-review.md    # 代码问题评审记录
+│   ├── course-weeks-review.md   # 课程周次对照检查
+│   ├── ui-concept.html          # UI 设计原型 A：克制极简 + 像素材质
+│   ├── ui-concept-pixel.html    # UI 设计原型 B：纯像素抖动风（Fusion Pixel 点阵中文）
+│   └── *.png                    # 界面截图（help-page / week4-ask-page）
 ├── data/                     # NDJSON 原始记录（持久化存储，运行后生成）
 ├── recordings/               # 录制导出的 CSV（运行后生成）
 ├── public/
-│   ├── index.html            # 监控页面（分页：实时监控 / 远程采集 / 记录与设备）
-│   ├── style.css
-│   └── app.js                # WebSocket 接收、卡片渲染、Canvas 绘制（含滑动平均）、记录查询、分页路由
+│   ├── index.html            # 监控页面（分页：实时监控 / 远程采集 / 记录与设备 / LLM 配置）
+│   ├── style.css             # 全部样式（CSS 变量 token 体系 + 浅色/深色双主题）
+│   └── app.js                # WebSocket 接收、卡片渲染、Canvas 绘制（含滑动平均）、记录查询、分页路由、主题切换
 ├── firmware/
 │   ├── s3eye_imu_idf/        # ★ 当前使用：ESP-IDF 工程（QMA7981 三轴 + 10Hz 上报 + 校准）
 │   │   ├── CMakeLists.txt
@@ -115,15 +126,22 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   └── s3eye_imu_wifi/          # （旧）Arduino S3-EYE 专用草稿
 │       └── s3eye_imu_wifi.ino
 └── test/
+    ├── run-all.js            # ★ 全套测试编排器（npm test 入口，自动分配隔离端口）
+    ├── .test-config.json     # 测试隔离配置夹具（autoDetect:false）—— 必须提交
+    ├── .test-nl-config.json  # NL 测试夹具 —— 必须提交
     ├── acceptance-test.js    # 全链路验收：固件帧→落盘→页面→停采（隔离端口 8096）
-    ├── e2e-test.js           # 链路自检：空状态 / 上报解析 / 停采保留 / 断开清空
+    ├── e2e-test.js           # 链路自检：空状态 / 上报解析 / 停采保留 / 断开清空（E2E_PORT，默认 8080）
+    ├── storage-test.js       # 持久化 + 查询 + 停采保留（隔离端口 8099）
+    ├── p0-dedup-test.js      # 请求去重/幂等（隔离端口 8097）
     ├── verify-test.js        # 本组身份校验：device ↔ expectedDeviceId（隔离端口 8095）
-    ├── feature-test.js       # 诊断接口 / 录制导出 / CSV
-    ├── parse-test.js         # 通用解析：JSON / 键值 / 中文键
-    ├── storage-test.js       # 持久化 + 查询 + 停采保留
-    ├── ws-test.js            # WebSocket sample/stale/cleared 推送结构
-    ├── help-test.js          # 第 3 周：教学求助闭环（状态不前进 / 回执确认 / 不污染数据链路）
-    └── listen.js COM4 25     # 原样监听某串口 N 秒，看板子在发什么
+    ├── feature-test.js       # 诊断接口 / 录制导出 / CSV（隔离端口 8093）
+    ├── parse-test.js         # 通用解析：JSON / 键值 / 中文键（隔离端口 8094）
+    ├── ws-test.js            # WebSocket sample/stale/cleared 推送结构（隔离端口 8098）
+    ├── help-test.js          # 第 3 周：教学求助闭环（隔离端口 8097）
+    ├── nl-test.js            # 第 4 周：意图解析与诚实性回复（隔离端口 8098）
+    ├── nl-config-test.js     # 第 4 周：LLM 配置增删改查与降级（隔离端口 8095）
+    ├── week4-verify.js       # 第 4 周：按设计直连 8080 现网验证
+    └── listen.js COM4 25     # 原样监听某串口 N 秒，看板子在发什么（调试用，不参与断言）
 ```
 
 > 所有文件均在本目录内；除 ESP-IDF 工具链（`C:\Espressif`）与本机 Node.js 外，
@@ -465,23 +483,61 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 - 录制期间一条数据都没有 → 不生成文件
 - 上限 20 万行，超出丢弃最早的
 
-## 九、自检
+## 九、自检与代码审计
 
-全套 **110 项**。测试实例统一使用 `test/.test-config.json` 隔离配置（`autoDetect:false`），
-所以**开发板插着也能跑**，不会互相干扰（此前板子在线会导致"停采保留"类断言假失败，已修复）。
+### 跑测试
+
+全套 **11 个测试文件、205 项断言**，一条命令：
 
 ```bash
-# 下面三个需要先在 8080 起服务：npm start
-node test/e2e-test.js      # 数据链路：空状态 / 上报解析 / 离线清空 / 非法报文过滤（14 项）
-node test/feature-test.js  # 诊断接口 / 录制导出 / CSV 内容（14 项）
-node test/parse-test.js    # 通用解析：JSON / 键值 / 中文键 / 误解析防护（10 项）
-
-# 以下自带服务，无需先启动（各自独立端口）
-node test/help-test.js     # 第 3 周：教学求助闭环（端口 8097，26 项）
-node test/listen.js COM4 25  # 原样监听某个串口 25 秒，看板子到底在发什么
+npm test
 ```
 
-## 八、常见问题
+编排器（`test/run-all.js`）会**自动给每个测试分配隔离端口与独立数据目录**，
+所以**开发板插着、服务没起也能跑**，不会互相干扰。
+
+> 关键前提：板子自 2026-09-28 起会 WiFi 常驻 POST 到 8080，**任何直连 8080 的测试都会被真实数据污染**。
+> 因此除 e2e 外所有测试都自建隔离实例；e2e 由编排器自动注入 `E2E_PORT=8099` 走隔离模式，
+> 不依赖「生产服务是否在跑」这个环境前提（直接 `node test/e2e-test.js` 会去连 8080，服务没起就 ECONNREFUSED —— 那不是 bug）。
+
+按分组跑：
+
+```bash
+npm run test:unit          # 纯解析/格式化，无需硬件，快（parse + feature）
+npm run test:integration   # 服务端链路（storage/p0/verify/ws/help/acceptance）
+npm run test:nl            # 第 4 周自然语言模块
+node test/run-all.js e2e   # 只跑端到端
+node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在发什么（调试用，不算断言）
+```
+
+当前端口分配（改端口时注意别撞车）：`8093` feature ｜ `8094` parse ｜ `8095` verify+nl-config
+｜ `8096` acceptance ｜ `8097` help+p0 ｜ `8098` ws+nl ｜ `8099` storage+e2e ｜ `8080` 生产实例。
+
+### 跑代码审计
+
+改动代码后建议执行，三个脚本都是**只读**，不改任何文件：
+
+```bash
+npm run audit
+```
+
+| 脚本 | 检查什么 |
+|---|---|
+| `scripts/audit-unused.js` | 定义了但从未调用的函数 / 常量；空 `catch`；注释掉的死代码块 |
+| `scripts/audit-api.js` | **前后端接口交叉核对** —— 找出前端调用了但服务端没有的接口（潜在 404） |
+| `scripts/audit-dup.js` | 重复函数体：完全相同 + 相似度 ≥85% 的拷贝粘贴 |
+
+> `audit-api.js` 有个易踩的坑：前端大量用模板字符串拼接口（`` `/api/records?limit=${n}` ``），
+> 只用 `fetch('...')` 正则会漏掉一大半，必须扫所有以 `/api/` 开头的字符串字面量。
+
+### 已知的环境坑
+
+- **不要用 `spawnSync` 从 managed node 目录启动 node 自身**，Windows 会 `EBUSY`（errno -4082），
+  表现为「所有测试 0.0s 失败且无任何输出」，很容易误判成测试全挂。改用异步 `spawn`。
+- `git ls-files --others` 对**空目录零输出**（git 不跟踪空目录）。清理项目时必须另跑
+  `find . -type d -empty`，否则会漏掉外来工具创建的垃圾目录。
+
+## 十、常见问题
 
 **串口打不开 / 一直「未检测到开发板」**
 - 确认 Arduino IDE 的串口监视器已关闭（串口被独占）
