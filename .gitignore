@@ -23,15 +23,31 @@ recordings/*.csv
 _*.log
 _idf*.log
 server.log
-# 注意：test/.test-config.json 是测试夹具（无敏感信息，被 acceptance/e2e/verify/
-# help/storage/ws 等多个测试引用），必须纳入版本控制 —— 否则 clone 后各测试
-# 会退回到默认配置（autoDetect=true），连上真实板子产生"停采"类假失败。
-test/.test-data/
+# 注意：test/.test-config.json 与 test/.test-nl-config.json 是测试夹具（无敏感
+# 信息，被 acceptance/e2e/verify/help/storage/ws/nl/nl-config 等测试引用），必须纳入
+# 版本控制 —— 否则 clone 后各测试会退回到默认配置（autoDetect=true），连上真实板子
+# 产生"停采"类假失败。
+#
+# 但测试的运行时 DATA_DIR 是临时输出（server.js 会 mkdir 自动重建），需全部忽略。
+# 这里用 test/.test-data* 通配，覆盖 .test-data / .test-data-nlcfg / .test-data-p0
+# 三个目录 —— 漏掉任何一个，跑完对应测试后 git status 就会冒出未跟踪文件，
+# 误 `git add .` 会把测试期配置/数据带进仓库。
+test/.test-data*
+
+# ---- 外来工具产生的垃圾目录 ----
+# 某些 Windows 程序（如 NVIDIA 驱动安装 / CUDA 工具链）用相对路径创建
+# "NVIDIA Corporation/umdlogs" 日志目录，会落在当时的 CWD 里。与本项目无关，
+# 且未跟踪（git 不跟踪空目录）却也不被忽略，一旦程序写入文件就会污染 git status。
+NVIDIA Corporation/
 
 # ---- 系统文件 ----
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
 
 # ---- 本地备份（临时）----
 *.bak.*
