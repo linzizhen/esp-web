@@ -151,12 +151,24 @@ let lineBuffer = '';        // 串口行缓冲
 let scanTimer = null;
 let manualClose = false;    // 是否是用户主动断开
 let openingPath = null;     // 正在打开的端口，防重入
+const OPEN_TIMEOUT_MS = Number(process.env.OPEN_TIMEOUT_MS || 6000);  // 打开串口的看门狗上限
 let portOpenedAt = null;    // 端口打开时刻（用于判断"开了但一直没数据"）
 const rawLog = [];          // 最近若干条原始上报（仅真实数据）
 const RAW_LOG_MAX = 200;
 
+/* 串口是否打开 / 当前下行命令通道类型（此前 16+ 处手写同一判断） */
+const serialOpen = () => !!(port && port.isOpen);
+const currentChannelKind = () => (serialOpen() ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null));
+
 // 真实数据录制（只写入设备实际上报的采样，不生成任何数据）
 const recording = { active: false, rows: [], startedAt: null, maxRows: 200000 };
+const REC_TRIM_MARGIN = 1000;   // 录制缓冲裁剪余量（摊薄裁剪开销，见 appendRecording）
+
+/* CSV 单元格转义：含逗号/引号/换行时加引号并把引号翻倍 —— 录制导出与 /api/records.csv 共用 */
+const csvEsc = (v) => {
+  const s = String(v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+};
 
 function writeRecording() {
   if (!recording.rows.length) return null;
@@ -167,10 +179,7 @@ function writeRecording() {
   for (const r of recording.rows) {
     for (const k of Object.keys(r.f)) if (!seen.has(k)) { seen.add(k); keys.push(k); }
   }
-  const esc = (v) => {
-    const s = String(v);
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-  };
+  const esc = csvEsc;
   const header = ['timestamp_ms', 'iso_time', ...keys].join(',');
   const lines = recording.rows.map((r) =>
     [r.ts, new Date(r.ts).toISOString(), ...keys.map((k) => (r.f[k] !== undefined ? esc(r.f[k]) : ''))].join(',')
@@ -423,25 +432,23 @@ function createCollectRequest() {
   if (sent) {
     r.status = 'dispatched';
     r.dispatched_at = Date.now();
-    r.channel = (port && port.isOpen) ? 'serial' : 'wifi';
-    r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
+    r.channel = serialOpen() ? 'serial' : 'wifi';
   } else if (config.mockDevice) {
     // 模拟板端：明确标注 simulated，绝不冒充实物命令
     r.simulated = true;
     r.status = 'dispatched';
     r.dispatched_at = Date.now();
     r.note = '模拟模式：未走真实串口，由服务端自答回执与观测（仅供联调/演示）';
-    r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
     mockDeviceReply(r.request_id);
   } else {
     // 命令通道不可用（设备关闭 / 串口未连接）：
     // 不伪造完成，也不立刻判死 —— 按作业要求「请求等待 / 超时」处理，
     // 但立刻给出原因提示，避免用户干等。
-    r.status = 'submitted';
     r.error = '命令通道不可用（串口未打开，开发板也未在轮询）';
     r.note = '已提交，但命令尚未送达设备（串口未打开、开发板也未通过 WiFi 取命令）。命令已入队，若开发板在 15 秒内上线会被取走；否则按超时处理。超时≠硬件故障。';
-    r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
   }
+  // 三个分支共用同一条超时定时器（此前每个分支各写一遍）
+  r.timer = setTimeout(() => onRequestTimeout(r.request_id), collectTimeoutMs());
   pushRequest(r);
   return r;
 }
@@ -562,8 +569,8 @@ function publicHelp() {
     history: help.history.slice(-HELP_KEEP),
     mockDevice: !!config.mockDevice,
     // 下行是否可用：串口在线，或板端正通过 WiFi 轮询来取命令
-    channelReady: !!(port && port.isOpen) || wifiDownlinkActive(),
-    channelKind: (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null),
+    channelReady: serialOpen() || wifiDownlinkActive(),
+    channelKind: currentChannelKind(),
     pendingCommands: cmdQueue.length,
   };
 }
@@ -682,9 +689,9 @@ function pushStatus(reason) {
     type: 'status',
     connected: state.connected,
     live: state.live,           // true=实时流动；false=停采保留（保留旧值旧时间）
-    portOpen: !!(port && port.isOpen),
+    portOpen: serialOpen(),
     wifiDownlink: wifiDownlinkActive(),   // 板端正通过 WiFi 轮询取命令
-    downlinkKind: (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null),
+    downlinkKind: currentChannelKind(),
     transport: state.transport,
     device: state.device,
     deviceId: state.deviceId,   // 设备身份标识（核对数据来自本组设备）
@@ -1290,6 +1297,7 @@ function onCameraFrame(obj) {
  * ------------------------------------------------------------------ */
 const DEDUP_WINDOW_MS = 5000;
 const dedupSeen = new Map();     // "device#seq" -> 首次到达时间戳
+let dedupSweptAt = 0;            // 上次过期清理时刻（限频用）
 
 function isDuplicateFrame(device, seq) {
   if (typeof seq !== 'number' || !device) return false;
@@ -1298,7 +1306,10 @@ function isDuplicateFrame(device, seq) {
   const seenAt = dedupSeen.get(key);
   if (seenAt != null && now - seenAt < DEDUP_WINDOW_MS) return true;
   dedupSeen.set(key, now);
-  if (dedupSeen.size > 500) {    // 顺手清理过期项，避免无限增长
+  /* 过期清理限频到 1 秒一次：此前每个新帧只要表长超过 500 就全表扫描，
+   * 高帧率时等于每个样本都多花一次 O(n) 遍历。 */
+  if (dedupSeen.size > 500 && now - dedupSweptAt > 1000) {
+    dedupSweptAt = now;
     for (const [k, t] of dedupSeen) if (now - t > DEDUP_WINDOW_MS) dedupSeen.delete(k);
   }
   return false;
@@ -1441,7 +1452,12 @@ function handleLine(line, source) {
   });
   if (recording.active) {
     recording.rows.push({ ts: recvTs, f: disp });
-    if (recording.rows.length > recording.maxRows) recording.rows.shift();
+    /* 到上限后一次性裁掉一批，而不是每帧 shift 一次：
+     * shift 在 20 万行数组上是 O(n) 搬移，10Hz 下每秒要搬 200 万次；
+     * 批量裁剪把开销摊薄成每帧 O(1)（滚动窗口语义不变，始终 ≤ maxRows）。 */
+    if (recording.rows.length > recording.maxRows) {
+      recording.rows.splice(0, recording.rows.length - recording.maxRows + REC_TRIM_MARGIN);
+    }
   }
 }
 
@@ -1465,6 +1481,17 @@ function scorePort(p) {
   else if (/silicon labs|cp210/.test(text)) score += 20;
   else if (/wch|ch34|usb-serial/.test(text)) score += 10;
   return score;
+}
+
+/* 串口对象 → 前端展示字段（此前在扫描广播、/api/ports、/api/diag 三处重复手写） */
+function serializePort(p) {
+  return {
+    path: p.path,
+    manufacturer: p.manufacturer || '',
+    vendorId: p.vendorId || '',
+    productId: p.productId || '',
+    score: scorePort(p),
+  };
 }
 
 function pickBestPort(ports) {
@@ -1526,49 +1553,70 @@ function openSerial(target, baudRate, portInfo) {
 
   return new Promise((resolve) => {
     let p;
+    let settled = false;
+    let guard = null;
+    /* 统一的收尾口：无论成功、失败还是看门狗超时，都保证 openingPath 被释放、
+     * 定时器被清理、resolve 只发生一次。 */
+    const done = (ok, msg) => {
+      if (settled) return;
+      settled = true;
+      if (guard) clearTimeout(guard);
+      openingPath = null;
+      if (!ok) {
+        stats.lastOpenError = msg;
+        pushRaw(`[串口] ${msg}`, false);
+      }
+      resolve(ok);
+    };
+
     try {
       p = new SerialPort({ path: target, baudRate: baudRate || config.baudRate, autoOpen: false });
     } catch (e) {
-      openingPath = null;
-      stats.lastOpenError = e.message;
-      pushRaw(`[串口打开失败] ${e.message}`, false);
-      return resolve(false);
+      return done(false, `[串口打开失败] ${e.message}`);
     }
 
-    const onFail = (msg) => {
+    /* 看门狗：某些 USB 转串口驱动/被占用端口下 open 回调可能永不返回。
+     * 没有兜底时 openingPath 会永久留在该端口上（第 1716 行的重入判断），
+     * 该端口在进程生命周期内再也没法打开。 */
+    guard = setTimeout(() => {
       try { p.removeAllListeners(); } catch (_) {}
-      openingPath = null;
-      stats.lastOpenError = msg;
-      pushRaw(`[串口] ${msg}`, false);
-      resolve(false);
-    };
+      done(false, `打开 ${target} 超时（${OPEN_TIMEOUT_MS / 1000}s 无响应），已释放重入锁`);
+    }, OPEN_TIMEOUT_MS);
 
     p.open((err) => {
-      if (err) return onFail(`无法打开 ${target}：${err.message}`);
-      port = p;
-      lineBuffer = '';
-      portOpenedAt = Date.now();
-      stats.bytesReceived = 0;
-      stats.lastOpenError = null;
-      attachPortHandlers();
-      state.transport = 'serial';
-      state.connected = false; // 收到第一条真实数据后才置为 true
-      state.live = false;
-      state.deviceId = null;
-      state.deviceMac = null;
-      state.seq = null;
-      state.device = {
-        path: target,
-        baudRate: baudRate || config.baudRate,
-        vendorId: (portInfo && portInfo.vendorId) || '',
-        productId: (portInfo && portInfo.productId) || '',
-        manufacturer: (portInfo && portInfo.manufacturer) || '',
-      };
-      console.log(`[serial] 已打开 ${target} @ ${baudRate || config.baudRate}`);
-      pushRaw(`[串口] 已连接 ${target}，等待设备数据…`, false);
-      pushStatus('opened');
-      openingPath = null;
-      resolve(true);
+      if (err) {
+        try { p.removeAllListeners(); } catch (_) {}
+        return done(false, `无法打开 ${target}：${err.message}`);
+      }
+      try {
+        port = p;
+        lineBuffer = '';
+        portOpenedAt = Date.now();
+        stats.bytesReceived = 0;
+        stats.lastOpenError = null;
+        attachPortHandlers();
+        state.transport = 'serial';
+        state.connected = false; // 收到第一条真实数据后才置为 true
+        state.live = false;
+        state.deviceId = null;
+        state.deviceMac = null;
+        state.seq = null;
+        state.device = {
+          path: target,
+          baudRate: baudRate || config.baudRate,
+          vendorId: (portInfo && portInfo.vendorId) || '',
+          productId: (portInfo && portInfo.productId) || '',
+          manufacturer: (portInfo && portInfo.manufacturer) || '',
+        };
+        console.log(`[serial] 已打开 ${target} @ ${baudRate || config.baudRate}`);
+        pushRaw(`[串口] 已连接 ${target}，等待设备数据…`, false);
+        pushStatus('opened');
+        done(true);
+      } catch (e) {
+        // 初始化阶段抛错也当作打开失败处理（否则锁不释放、状态半开）
+        try { p.removeAllListeners(); } catch (_) {}
+        done(false, `初始化串口 ${target} 失败：${e.message}`);
+      }
     });
   });
 }
@@ -1578,13 +1626,7 @@ async function scanAndConnect() {
   if (manualClose) return;
   try {
     const ports = await SerialPort.list();
-    broadcast({ type: 'ports', ports: ports.map((p) => ({
-      path: p.path,
-      manufacturer: p.manufacturer || '',
-      vendorId: p.vendorId || '',
-      productId: p.productId || '',
-      score: scorePort(p),
-    })) });
+    broadcast({ type: 'ports', ports: ports.map(serializePort) });
 
     let target = null;
     if (config.portPath) {
@@ -1656,13 +1698,36 @@ function readBody(req) {
   });
 }
 
+/* 解析 POST JSON body（解析失败/空 body 一律返回 {}，不抛错）。
+ * 替代此前散落 11 处的 `let body={}; try{...JSON.parse...}catch{}` 样板。 */
+async function readJsonBody(req) {
+  try { return JSON.parse((await readBody(req)) || '{}'); } catch (_) { return {}; }
+}
+
 function json(res, code, obj) {
   const s = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(s);
 }
 
-const server = http.createServer(async (req, res) => {
+/* 统一错误边界：异步处理器里任何未捕获异常（fetch 失败、JSON 解析、串口库异常…）
+ * 都在这里兜住并返回 500，避免请求挂死或演变成 unhandled rejection。
+ * 之前 handler 是裸 async 回调，抛错时客户端只会一直等到超时。 */
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((e) => {
+    console.error('[http] 请求处理异常：', req.method, req.url, e && e.stack ? e.stack.split('\n')[0] : e);
+    try {
+      if (!res.headersSent) json(res, 500, { ok: false, error: 'internal_error', message: (e && e.message) || '未知错误' });
+      else res.end();
+    } catch (_) { /* 响应已不可写，忽略 */ }
+  });
+});
+
+process.on('unhandledRejection', (e) => {
+  console.error('[process] 未处理的 Promise 拒绝：', (e && e.stack) ? e.stack.split('\n')[0] : e);
+});
+
+async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const p = url.pathname;
 
@@ -1738,7 +1803,7 @@ const server = http.createServer(async (req, res) => {
       const keys = new Set();
       for (const r of rows) for (const k of Object.keys(r.fields)) keys.add(k);
       const fieldKeys = Array.from(keys);
-      const esc = (v) => { const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+      const esc = csvEsc;
       const header = ['seq', 'recv_iso', 'device_id', 'device_mac', 'transport', 'src_ip', 'board_iso', 'board_ts', 'recv_ts', 'skew_ms', ...fieldKeys].join(',');
       const lines = rows.map((r) => [
         r.seq, r.recv_iso, r.device_id || '', r.device_mac || '', r.transport || '', r.src_ip || '',
@@ -1757,10 +1822,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/ports') {
     try {
       const ports = await SerialPort.list();
-      return json(res, 200, { ports: ports.map((x) => ({
-        path: x.path, manufacturer: x.manufacturer || '',
-        vendorId: x.vendorId || '', productId: x.productId || '', score: scorePort(x),
-      })) });
+      return json(res, 200, { ports: ports.map(serializePort) });
     } catch (e) { return json(res, 500, { error: e.message }); }
   }
 
@@ -1768,10 +1830,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/diag') {
     let ports = [];
     try {
-      ports = (await SerialPort.list()).map((x) => ({
-        path: x.path, manufacturer: x.manufacturer || '',
-        vendorId: x.vendorId || '', productId: x.productId || '', score: scorePort(x),
-      }));
+      ports = (await SerialPort.list()).map(serializePort);
     } catch (e) { ports = [{ error: e.message }]; }
 
     const hints = [];
@@ -1802,7 +1861,7 @@ const server = http.createServer(async (req, res) => {
       serviceUptime: Math.round((Date.now() - stats.startedAt) / 1000),
       ports,
       currentPort: state.device && state.device.path ? state.device.path : null,
-      portOpen: !!(port && port.isOpen),
+      portOpen: serialOpen(),
       baudRate: config.baudRate,
       connected: state.connected,
       transport: state.transport,
@@ -1819,7 +1878,7 @@ const server = http.createServer(async (req, res) => {
       lastOpenError: stats.lastOpenError,
       recording: { active: recording.active, rows: recording.rows.length },
       downlink: {
-        serial: !!(port && port.isOpen),
+        serial: serialOpen(),
         wifiPolling: wifiDownlinkActive(),
         lastPollAt: stats.lastCmdPollAt || null,
         pollCount: stats.cmdPollCount || 0,
@@ -1845,9 +1904,9 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, {
       mockDevice: !!config.mockDevice,
       channel: {
-        portOpen: !!(port && port.isOpen),
+        portOpen: serialOpen(),
         wifiDownlink: wifiDownlinkActive(),   // 板端正通过 WiFi 来取命令
-        kind: (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null),
+        kind: currentChannelKind(),
         cmdSent: stats.cmdSent || 0,
         pending: cmdQueue.length,
       },
@@ -1866,8 +1925,7 @@ const server = http.createServer(async (req, res) => {
 
   // ---- 周期上报开关（暂停 / 恢复；命令通道保持）----
   if (p === '/api/report' && req.method === 'POST') {
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     const action = body.action === 'resume' ? 'resume' : 'pause';
     const ok = sendCommand({ cmd: action }, state.deviceId || null);
     if (ok) state.reportPaused = (action === 'pause');
@@ -1926,8 +1984,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (p === '/api/cam' && req.method === 'POST') {
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
 
     const action = (body.action === 'stop' || body.action === 'set' || body.action === 'shot')
       ? body.action : 'start';
@@ -1982,14 +2039,13 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, {
       ok: true,
       help: publicHelp(),
-      channel: { portOpen: !!(port && port.isOpen), cmdSent: stats.cmdSent || 0 },
+      channel: { portOpen: serialOpen(), cmdSent: stats.cmdSent || 0 },
     });
   }
 
   // ---- 教学求助：查看者回应 / 取消 / 复位 ----
   if (p === '/api/help' && req.method === 'POST') {
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     if (body.action === 'ack') {
       const r = createHelpAck();
       return json(res, 200, { ok: r.ok, note: r.note, help: publicHelp() });
@@ -2007,8 +2063,7 @@ const server = http.createServer(async (req, res) => {
 
   // ---- 自然语言助手（第 4 周）：自然语言 → 受限工具 ----
   if (p === '/api/nl' && req.method === 'POST') {
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     const text = String(body.text || '').trim();
     if (!text) return json(res, 400, { error: 'empty text' });
     if (text.length > 200) return json(res, 400, { error: 'text too long (max 200)' });
@@ -2131,8 +2186,7 @@ const server = http.createServer(async (req, res) => {
 
   // ---- 真实数据录制（仅记录设备实际上报的数据）----
   if (p === '/api/record' && req.method === 'POST') {
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     if (body.action === 'start') {
       recording.active = true;
       recording.rows = [];
@@ -2165,8 +2219,7 @@ const server = http.createServer(async (req, res) => {
 
   // ---- 连接 / 断开 ----
   if (p === '/api/connect' && req.method === 'POST') {
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     manualClose = false;
     if (body.portPath !== undefined) config.portPath = body.portPath || null;
     if (body.baudRate) config.baudRate = Number(body.baudRate) || config.baudRate;
@@ -2193,8 +2246,7 @@ const server = http.createServer(async (req, res) => {
   // ---- 配置 ----
   if (p === '/api/config') {
     if (req.method === 'GET') return json(res, 200, config);
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     for (const k of ['baudRate', 'portPath', 'autoDetect', 'autoReconnect', 'staleAfterMs', 'wifiTimeoutMs', 'expectedDeviceId', 'storageEnabled', 'stalePolicy', 'collectTimeoutMs', 'mockDevice']) {
       if (body[k] !== undefined) config[k] = body[k];
     }
@@ -2207,7 +2259,13 @@ const server = http.createServer(async (req, res) => {
   // ESP32:  HTTP POST http://<host>:8080/api/data   body: {"temp_c":26.5,...}
   if (p === '/api/data' && req.method === 'POST') {
     let body = '';
-    try { body = await readBody(req); } catch (e) { return json(res, 413, { error: e.message }); }
+    try {
+      body = await readBody(req);
+    } catch (e) {
+      // 超限时 readBody 已 req.destroy()，socket 不可写 —— 再写响应只会抛错，直接结束
+      console.warn('[http] /api/data 载荷超过 1MB，连接已丢弃');
+      return;
+    }
     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString();
     // 串口优先：串口在线时忽略 WiFi 上报，避免数据源混乱
     if (state.transport === 'serial' && state.connected) {
@@ -2216,13 +2274,26 @@ const server = http.createServer(async (req, res) => {
     state.transport = 'wifi';
     state.wifiSource = { ip };
     state.device = { path: `WiFi(${ip})`, ip };
-    // 支持 JSON 或 key=value 两种上报；WiFi 固件走 JSON，提取 device/mac/ts 等元数据
-    handleLine(body, { transport: 'wifi', ip });
+    /* 支持 JSON 或 key=value 两种上报；WiFi 固件走 JSON，提取 device/mac/ts 等元数据。
+     * 分帧规则：整体是合法 JSON（允许跨行美化格式）→ 当作一帧；
+     * 否则含多行（NDJSON / 多行 key=value 批量上报）→ 逐行当一帧。
+     * 之前把整个 body 当一行，多行 payload 会 JSON 解析失败并落进键值解析器，
+     * 可能从日志/错误文本里误提取出假的传感器字段。 */
+    const whole = body.trim();
+    let isSingleJson = false;
+    if (whole[0] === '{') { try { JSON.parse(whole); isSingleJson = true; } catch (_) { /* 落到按行 */ } }
+    const src = { transport: 'wifi', ip };
+    if (isSingleJson) {
+      handleLine(whole, src);
+    } else {
+      const lines = whole.split('\n').map((s) => s.trim()).filter(Boolean);
+      for (const l of (lines.length ? lines : [whole])) handleLine(l, src);
+    }
     return json(res, 200, { ok: true });
   }
 
   json(res, 404, { error: 'not found' });
-});
+}
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -2249,9 +2320,9 @@ wss.on('connection', (ws) => {
     type: 'hello',
     connected: state.connected,
     live: state.live,
-    portOpen: !!(port && port.isOpen),
+    portOpen: serialOpen(),
     wifiDownlink: wifiDownlinkActive(),
-    downlinkKind: (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null),
+    downlinkKind: currentChannelKind(),
     transport: state.transport,
     device: state.device,
     deviceId: state.deviceId,
@@ -2283,7 +2354,7 @@ wss.on('connection', (ws) => {
 /* 下行通道变化时主动推送：板端开始 / 停止经 WiFi 轮询取命令 */
 let lastDownlinkKind = null;
 setInterval(() => {
-  const kind = (port && port.isOpen) ? 'serial' : (wifiDownlinkActive() ? 'wifi' : null);
+  const kind = currentChannelKind();
   if (kind !== lastDownlinkKind) {
     lastDownlinkKind = kind;
     pushStatus('downlink');
