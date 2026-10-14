@@ -135,6 +135,7 @@
               <span class="lg lg-x">X</span><span class="lg lg-y">Y</span><span class="lg lg-z">Z</span>
               <button id="btnChartPause" class="mini-btn" type="button" title="暂停/继续波形刷新（其他面板仍实时）">暂停</button>
               <button id="btnChartAC" class="mini-btn on" type="button" title="去直流：减去各轴均值，三条曲线叠在同一水平线上，便于对比波形">去直流</button>
+              <button id="btnChartSmooth" class="mini-btn" type="button" title="平滑播放：把曲线整体延后约 2 秒绘制，用于吸收设备上报的偶发空档（设备每帧同步上传，偶发重试会造成 1~4 秒间隔，表现为曲线走走停停）。开启后画面更匀速，代价是曲线比真实时刻晚约 2 秒，右端刻度会从「现在」变为「-2s」如实标注。">平滑播放</button>
               <select id="chartRange" class="mini-select" title="Y 轴量程：自动=按波形自适应（推荐）；固定档位可锁死刻度">
                 <option value="auto" selected>自动</option>
                 <option value="0.5">±0.5g</option>
@@ -512,6 +513,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=23"></script>
+<script src="/app.js?v=29"></script>
 </body>
 </html>

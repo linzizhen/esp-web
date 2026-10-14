@@ -24,7 +24,7 @@ const els = {
   boardTime: $('boardTime'), recvTime: $('recvTime'), skew: $('skew'), lastUpdate: $('lastUpdate'),
 
   chartUnit: $('chartUnit'), chartRange: $('chartRange'), mainChart: $('mainChart'), chartHint: $('chartHint'),
-  btnChartAC: $('btnChartAC'), btnChartPause: $('btnChartPause'),
+  btnChartAC: $('btnChartAC'), btnChartPause: $('btnChartPause'), btnChartSmooth: $('btnChartSmooth'),
 
   portSelect: $('portSelect'), baudSelect: $('baudSelect'),
   btnConnect: $('btnConnect'), btnDisconnect: $('btnDisconnect'), btnRefresh: $('btnRefresh'),
@@ -126,9 +126,13 @@ function fmtAxis(v, span) {
   return out;
 }
 const escHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const labelOf = (k) => (S.meta.labels && S.meta.labels[k]) || k;
-const unitOf = (k) => (S.meta.units && S.meta.units[k]) || '';
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// 注意：服务端仍在每次推送里下发 meta.units / meta.labels（来自 config.json 的
+// fieldUnits / fieldLabels，见 server.js 的 /api/state 与 WS hello），但本前端目前
+// 没有消费它们 —— 传感器名走下面的 IMU_RE + AXIS_LABEL 静态映射，CSV 列名走
+// config.sensorFields。原先的 labelOf() / unitOf() 两个辅助函数已删除（审计发现从未
+// 被调用）。这里留注释说明协议字段仍然存在，以免误以为可以连服务端一起删。
 
 // ---------------------------------------------------------------- 三轴加速度面板
 const IMU_RE = /^acc_([xyz])_(raw|g|ms2)$/;
@@ -366,6 +370,7 @@ function renderSample(fields, ts) {
 
   // 用服务端采样时刻作横轴（比浏览器接收时刻稳），无则退回本地时间
   const t = Number.isFinite(ts) ? ts : Date.now();
+  noteArrival();   // 记录到达节奏（用于"等待设备上报"提示与平滑播放说明）
   for (const [k, v] of Object.entries(fields)) {
     if (typeof v !== 'number' || !Number.isFinite(v)) continue;
     if (!S.history.has(k)) S.history.set(k, []);
@@ -434,6 +439,8 @@ function chartTheme() {
     label: g('--chart-label', '#8a94a6'),
     muted: g('--chart-muted', '#9aa5b5'),
     dotRing: g('--chart-dot-ring', '#ffffff'),
+    waitBand: g('--chart-wait-band', 'rgba(255,176,32,0.07)'),
+    waitText: g('--chart-wait-text', '#b8860b'),
     axis: {
       x: g('--chart-axis-x', AXIS_COLOR.x),
       y: g('--chart-axis-y', AXIS_COLOR.y),
@@ -475,16 +482,55 @@ if (window.matchMedia) {
 let CHART_AC = true;
 // 波形暂停：冻结曲线（停止往历史缓冲里追加），其他面板继续实时刷新
 let CHART_PAUSED = false;
+
+/* 平滑播放（抗抖动缓冲）。
+ *
+ * 成因：板端每帧「同步 HTTP POST + printf」，偶发上传失败会重试，导致数据到达间隔
+ * 从中位 ~0.5s 抖动到 1.5~4s（实测 p95=1.5s、最大 4.2s）。曲线右端只能在"有数据的时刻"
+ * 前进，于是表现为「匀速流动 → 停住几秒 → 突然跳一段」，主观上像帧率下降。
+ * 渲染本身没问题（受控长跑 60fps、0 长任务），所以修法不是"画得更快"，而是把不规则到达
+ * 变成匀速播放：整幅曲线统一延后 CHART_DELAY_MS 绘制，落在缓冲里的点按时间轴匀速出场，
+ * 空档 ≤ 延时即被完全吸收。
+ * 取舍：曲线比真实时刻晚约 2 秒 —— 因此右端刻度不再写"现在"而是"-2s"如实标注；
+ * 数据点位置、坐标刻度、时间轴同步关系都不变。默认关闭，用户可自行开启。 */
+const CHART_DELAY_KEY = 'imu-smooth-delay';
+const CHART_DELAY_MAX_MS = 2000;
+let CHART_DELAY_MS = 0;
+
+/* 数据到达节奏（用于判断"是不是在等设备上报"，只做展示用统计，不参与数据计算） */
+const ARRIVAL_KEEP = 24;
+const arrivalIntervals = [];
+let lastArrivalAt = 0;
+let newestPointAt = 0;      // 最新一个数据点入库的时刻（用于新点淡入）
+function noteArrival() {
+  const now = Date.now();
+  if (lastArrivalAt) {
+    arrivalIntervals.push(now - lastArrivalAt);
+    if (arrivalIntervals.length > ARRIVAL_KEEP) arrivalIntervals.shift();
+  }
+  lastArrivalAt = now;
+  newestPointAt = now;
+}
+/* 中位到达间隔：比均值更抗偶发空档的影响，用来定"多久没数据算异常" */
+function medianArrivalMs() {
+  if (!arrivalIntervals.length) return 0;
+  const s = [...arrivalIntervals].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
 // 去直流基准 / 量程的平滑跟随状态。窗口每滑动一帧，中位数与分位数都会小幅跳变，
 // 直接拿来定标会让整幅画面抖动，这里做慢速跟随（指数平滑）。
 const DC_REF = {};
 const RANGE_SMOOTH = {};
+/* 每帧复用的临时缓冲：量程分位计算不再每帧新建数组（避免 60 次/秒的分配与 GC 压力） */
+const RANGE_BUF = [];
 
 /* 图表数据缓存：三轴平滑序列（滑动平均 + 去直流基准）只在「有新数据 / 切开关」时重算；
  * 绘制本身每帧都做（60fps）。
  * 拆分原因：老实现"数据来一帧才画一帧"（≈1.75 次/秒），每次还按数据点整窗重映射，
  * 曲线是"一帧一帧跳"；改成"连续时间窗口 + 每帧重绘"后平滑滚动。 */
 let _chartCache = { key: null, series: null };
+let _chartBuildTs = 0;                 // 上次重建序列的时刻（批量更新限速用）
+const CHART_REBUILD_MS = 100;          // 序列重建最小间隔
 
 function _chartKey() {
   const suffix = els.chartUnit && els.chartUnit.value === 'ms2' ? 'ms2' : 'g';
@@ -524,10 +570,58 @@ function buildChartCache() {
 
 const CHART_WINDOW_MS = 10000;   // 显示窗口固定为最近 10 秒（与老师示波器 -9s~0s 一致）
 
+/* 二分查找：首个 t >= target 的索引（O(log n)），替代每帧 filter 全量扫描 + 新数组分配 */
+function lowerBoundByTime(pts, target) {
+  let lo = 0, hi = pts.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pts[mid].t < target) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+/* 抽稀缓冲（复用，避免每帧分配）。仅在点数远多于像素列时启用。 */
+const DEC_BUF = [];
+
+/* 按像素列抽稀：每列保留该列的最小值与最大值（按时间先后输出），
+   既减少绘制点数，又不会丢掉尖峰与包络。返回索引数组（复用缓冲）。 */
+function decimateIdx(pts, lo, cnt, cw, X) {
+  DEC_BUF.length = 0;
+  let col = -1, iMin = -1, iMax = -1;
+  const flush = () => {
+    if (iMin < 0) return;
+    if (iMax === iMin) DEC_BUF.push(iMin);
+    else if (iMin < iMax) { DEC_BUF.push(iMin); DEC_BUF.push(iMax); }
+    else { DEC_BUF.push(iMax); DEC_BUF.push(iMin); }
+  };
+  for (let k = 0; k < cnt; k++) {
+    const i = lo + k;
+    const cc = Math.round(X(pts[i].t));
+    if (cc !== col) {
+      flush();
+      col = cc; iMin = i; iMax = i;
+    } else {
+      if (pts[i].v < pts[iMin].v) iMin = i;
+      if (pts[i].v > pts[iMax].v) iMax = i;
+    }
+  }
+  flush();
+  return DEC_BUF;
+}
+
 function drawMainChart() {
   const unit = els.chartUnit ? els.chartUnit.value : 'g';
   const suffix = unit === 'ms2' ? 'ms2' : 'g';
-  if (!_chartCache.series || _chartCache.key !== _chartKey()) buildChartCache();
+  /* 批量更新：序列重建（600 点滑动平均 + 去直流中位数）最多每 100ms 一次。
+     数据突发（如回放/高帧率上报）时不再每个样本都重建一遍；限速期间沿用上一帧序列，
+     窗口仍在连续滚动，视觉无差异（最多滞后 100ms 的新点）。 */
+  if (!_chartCache.series || _chartCache.key !== _chartKey()) {
+    const tn = Date.now();
+    if (!_chartCache.series || tn - _chartBuildTs >= CHART_REBUILD_MS) {
+      buildChartCache();
+      _chartBuildTs = tn;
+    }
+  }
   const { series } = _chartCache;
   const C = chartTheme();   // 画布配色：跟随当前主题（浅色 / 深色）
   const { ctx, w, h } = fitCanvas(els.mainChart);
@@ -544,10 +638,13 @@ function drawMainChart() {
   const padL = 58, padR = 14, padT = 18, padB = 26;
   const cw = w - padL - padR, ch = h - padT - padB;
 
-  /* X 轴：固定为「最近 10 秒」连续时间窗口 [now-10s, now]，不随数据点重映射。
-   * 数据点按自身采样时刻落到对应横坐标，窗口随时间平滑左移 → 曲线连续滚动。 */
+  /* X 轴：固定为「最近 10 秒」连续时间窗口，不随数据点重映射。
+   * 数据点按自身采样时刻落到对应横坐标，窗口随时间平滑左移 → 曲线连续滚动。
+   * 开启平滑播放时整幅曲线统一延后 CHART_DELAY_MS：落在缓冲里的点按时间轴匀速出场，
+   * 从而吸收设备偶发的上报空档（位置仍是真实时刻，只是"播放进度"稍晚）。 */
   const latestT = series[0].pts.length ? series[0].pts[series[0].pts.length - 1].t : 0;
-  const now = CHART_PAUSED ? latestT : Date.now();   // 暂停时窗口冻结在最新数据时刻
+  const nowReal = Date.now();
+  const now = CHART_PAUSED ? latestT : (nowReal - CHART_DELAY_MS);   // 暂停时窗口冻结在最新数据时刻
   const tStart = now - CHART_WINDOW_MS;
 
   // Y 轴量程：默认「自动」（2%~98% 分位定标 + 慢速跟随）；可锁定固定档位。
@@ -558,7 +655,9 @@ function drawMainChart() {
     const half = Number(rangeSel) * (unit === 'ms2' ? 9.80665 : 1);
     min = -half; max = half;
   } else {
-    const vals = [];
+    // 复用同一个缓冲数组（每帧 new Array 会产生 60 次/秒的垃圾）
+    const vals = RANGE_BUF;
+    vals.length = 0;
     for (const s of series) for (const p of s.pts) if (p.t >= tStart) vals.push(p.v);
     vals.sort((a, b) => a - b);
     const pick = (f) => vals.length ? vals[Math.min(vals.length - 1, Math.max(0, Math.round((vals.length - 1) * f)))] : 0;
@@ -603,7 +702,7 @@ function drawMainChart() {
       ctx.strokeStyle = C.gridV; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ch); ctx.stroke();
     }
-    const secs = Math.round((now - t) / 1000);
+    const secs = Math.round((nowReal - t) / 1000);
     ctx.fillStyle = C.label;
     ctx.fillText(secs <= 0 ? '现在' : `-${secs}s`, x, padT + ch + 7);
   }
@@ -611,29 +710,65 @@ function drawMainChart() {
   // 三条曲线（各自颜色）——用二次贝塞尔画平滑曲线（穿过相邻点中点），
   // 比直线段折线视觉上更柔顺，接近示波器观感。
   // 只画窗口内的点；左边缘多留 300ms，让曲线出画时不生硬截断。
+  //
+  // 性能：不再每帧对三轴各做一次 filter（3 个新数组/帧 → 每秒约 180 次分配），
+  // 改用「二分定位窗口起点 + 按索引遍历」；点数远多于像素列时才按列抽稀。
+  const tMin = tStart - 300;
   for (const s of series) {
     const c = C.axis[s.ax];
-    const pts = s.pts.filter((p) => p.t >= tStart - 300);
-    const n = pts.length;
-    if (n < 2) continue;
+    const pts = s.pts;
+    const lo = lowerBoundByTime(pts, tMin);      // 窗口起点索引（O(log n)）
+    const cnt = pts.length - lo;
+    if (cnt < 2) continue;
+    // 抽稀：每个像素列最多保留 2 个点（该列的最小/最大值，按时间顺序），
+    // 保证视觉包络与峰值不丢。当前数据率（约 2 帧/秒、窗口约 25 点）远低于阈值，不会触发。
+    const list = (cnt > cw * 2) ? decimateIdx(pts, lo, cnt, cw, X) : null;
+    const n = list ? list.length : cnt;
+    const at = (k) => (list ? pts[list[k]] : pts[lo + k]);
     ctx.beginPath();
-    ctx.moveTo(X(pts[0].t), Y(pts[0].v));
+    ctx.moveTo(X(at(0).t), Y(at(0).v));
     if (n === 2) {
-      ctx.lineTo(X(pts[1].t), Y(pts[1].v));
+      ctx.lineTo(X(at(1).t), Y(at(1).v));
     } else {
       for (let i = 1; i < n - 1; i++) {
-        const cx = X(pts[i].t), cy = Y(pts[i].v);
-        const nx = X(pts[i + 1].t), ny = Y(pts[i + 1].v);
+        const cx = X(at(i).t), cy = Y(at(i).v);
+        const nx = X(at(i + 1).t), ny = Y(at(i + 1).v);
         ctx.quadraticCurveTo(cx, cy, (cx + nx) / 2, (cy + ny) / 2);
       }
-      ctx.lineTo(X(pts[n - 1].t), Y(pts[n - 1].v));
+      ctx.lineTo(X(at(n - 1).t), Y(at(n - 1).v));
     }
     ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
     ctx.stroke();
-    const last = pts[n - 1];
+    const last = at(n - 1);
     ctx.beginPath(); ctx.arc(X(last.t), Y(last.v), 3.2, 0, Math.PI * 2);
     ctx.fillStyle = c; ctx.fill();
     ctx.strokeStyle = C.dotRing; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+
+  /* 「等待设备上报」可视化。
+   * 实测：板端每帧同步上传，偶发重试让数据到达间隔从中位 ~0.5s 抖到 1.5~4s。
+   * 空档期曲线右端必然停住 —— 这是"数据还没到"，不是"画面卡了"。
+   * 把它如实画出来（淡色等待带 + 虚线 + 真实等待秒数），既解释停顿也便于判断板端状态。
+   * 等待带只覆盖"确实没有任何数据到达"的区间，不绘制任何推测值。 */
+  if (!CHART_PAUSED && latestT) {
+    const waitMs = nowReal - latestT;
+    const waitThresh = Math.max(1500, medianArrivalMs() * 2.5);
+    const xLast = X(latestT);
+    if (waitMs > waitThresh && xLast < w - padR - 20) {
+      const bandW = (w - padR) - xLast;
+      ctx.fillStyle = C.waitBand;
+      ctx.fillRect(xLast, padT, bandW, ch);
+      ctx.strokeStyle = C.waitText; ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(xLast, padT); ctx.lineTo(xLast, padT + ch); ctx.stroke();
+      ctx.setLineDash([]);
+      if (bandW > 104) {
+        ctx.fillStyle = C.waitText;
+        ctx.font = '12px "Microsoft YaHei", sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(`等待设备上报 ${(waitMs / 1000).toFixed(1)}s`, xLast + bandW / 2, padT + ch / 2);
+      }
+    }
   }
 
   // 左上角：三轴当前绝对值读数（去直流模式下仍显示绝对值）+ 采样点数
@@ -647,7 +782,8 @@ function drawMainChart() {
     lx += ctx.measureText(txt).width + 14;
   }
   ctx.fillStyle = CHART_PAUSED ? C.axis.x : C.muted;
-  ctx.fillText(`· 最近 ${series[0].pts.length} 点${CHART_AC ? ' · 去直流' : ''}${CHART_PAUSED ? ' · 已暂停' : ''}`, lx, 2);
+  const smoothTag = CHART_DELAY_MS > 0 ? ` · 平滑播放 -${Math.round(CHART_DELAY_MS / 1000)}s` : '';
+  ctx.fillText(`· 最近 ${series[0].pts.length} 点${CHART_AC ? ' · 去直流' : ''}${CHART_PAUSED ? ' · 已暂停' : ''}${smoothTag}`, lx, 2);
 }
 
 /* 滑动平均：仅用历史值（因果滤波），窗口=n 点时噪声幅度降低约 √n 倍 */
@@ -1482,6 +1618,24 @@ els.btnChartPause.onclick = () => {
   els.btnChartPause.classList.toggle('on', CHART_PAUSED);
   els.btnChartPause.textContent = CHART_PAUSED ? '继续' : '暂停';
   needDraw = true;
+};
+
+// 平滑播放（抗抖动缓冲）：整幅曲线延后约 2s 绘制，吸收设备偶发上报空档
+function applySmoothUI() {
+  const on = CHART_DELAY_MS > 0;
+  els.btnChartSmooth.classList.toggle('on', on);
+  els.btnChartSmooth.textContent = on ? '平滑播放 · 开' : '平滑播放';
+  els.btnChartSmooth.title = on
+    ? '平滑播放已开启：曲线整体延后约 2 秒绘制（右端刻度显示 -2s，不是"现在"）。用于吸收设备偶发上报空档，画面更匀速。'
+    : '平滑播放：把曲线整体延后约 2 秒绘制，用于吸收设备上报的偶发空档（设备每帧同步上传，偶发重试会造成 1~4 秒间隔，表现为曲线走走停停）。开启后画面更匀速，代价是曲线比真实时刻晚约 2 秒，右端刻度会从「现在」变为「-2s」如实标注。';
+  needDraw = true;
+}
+try { if (localStorage.getItem(CHART_DELAY_KEY) === '1') CHART_DELAY_MS = CHART_DELAY_MAX_MS; } catch (_) {}
+applySmoothUI();
+els.btnChartSmooth.onclick = () => {
+  CHART_DELAY_MS = CHART_DELAY_MS > 0 ? 0 : CHART_DELAY_MAX_MS;
+  try { localStorage.setItem(CHART_DELAY_KEY, CHART_DELAY_MS > 0 ? '1' : '0'); } catch (_) {}
+  applySmoothUI();
 };
 
 // 水平归零：把当前 X/Y 记为水平基准；再点一次清除
