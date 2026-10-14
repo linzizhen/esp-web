@@ -294,17 +294,29 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（共 110 项，全部通过）
+## 7. 自检脚本（11 个测试文件、205 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
 > "停采保留"类断言失效 —— 那是**假失败**，不是代码问题（2026-09-28 已定位并修复）。
+> 同理，测试实例统一注入 `NL_CONFIG_PATH=<test>/.test-nl-local-absent.json`，
+> 避免读到本机 `config.local.json` 里的真实 LLM 密钥而使断言受本机环境影响。
+
+一条命令跑全量（推荐）：
 
 ```bash
-# 需先在 8080 启动服务：npm start
+npm test                      # 编排器自动分配隔离端口，板子插着、服务没起都能跑
+npm run test:unit             # 纯解析/格式化，无需硬件，快
+npm run test:integration      # 服务端链路
+npm run test:nl               # 第 4 周自然语言模块
+```
+
+也可逐个跑：
+
+```bash
 node test/parse-test.js       # 10 项  通用解析：JSON/键值/中文键/误解析防护
 node test/e2e-test.js         # 14 项  空状态 / 上报 / 停采保留 / 断开清空
-                              #        （E2E_PORT=8081 可自起隔离服务，不占用 8080）
+                              #        （E2E_PORT=8099 自起隔离服务，不占用 8080）
 node test/feature-test.js     # 14 项  诊断接口 / 录制导出 / CSV
 
 # 自带服务，无需先启动（各自用独立端口）
@@ -313,6 +325,14 @@ node test/ws-test.js          #  9 项  WebSocket sample/stale/cleared 推送结
 node test/acceptance-test.js  # 12 项  全链路验收：固件形状数据→落盘→页面→停采
 node test/verify-test.js      #  6 项  本组设备身份校验（本组/非本组/关闭校验）
 node test/help-test.js        # 26 项  第 3 周教学求助闭环（状态不前进 / 回执确认 / 不污染数据链路）
+node test/nl-test.js          # 37 项  第 4 周意图解析与诚实性回复
+node test/nl-config-test.js   # 44 项  第 4 周 LLM 配置增删改查与降级
+```
+
+改完代码后可再跑只读审计（不改任何文件）：
+
+```bash
+npm run audit                 # 未使用函数 / 接口交叉核对 / 重复函数体
 ```
 
 ---
