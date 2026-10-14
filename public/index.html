@@ -449,8 +449,13 @@
             <span id="llmStatusTag" class="tag">加载中…</span>
           </div>
           <p class="hint">
-            接入任意 OpenAI 兼容的云端大模型（DeepSeek、通义、OpenAI 等）。密钥只保存在服务端
-            <code>config.local.json</code>（已 gitignore），页面仅显示脱敏值，可随时修改或删除。
+            接入任意 OpenAI 兼容的云端大模型（DeepSeek、智谱、通义、书生·端砚等）。密钥只保存在服务端
+            <code>config.local.json</code>（已 gitignore），页面仅显示脱敏值，可随时修改或删除。<br>
+            <b>API 地址</b>填厂商文档给的 Base URL：带 <code>/v1</code>（如 <code>https://api.deepseek.com/v1</code>）
+            或不带（<code>https://api.deepseek.com</code>）都支持，服务端会自动补全 <code>/chat/completions</code>，
+            不会重复拼接。<br>
+            <b>推理型模型</b>（会输出思考过程的，如 Agents-A1）耗时更长，建议把<b>超时</b>调到
+            <code>15000~30000</code>；超时会自动降级为规则解析，不影响功能。
           </p>
 
           <div id="llmSavedInfo" class="llm-saved hidden"></div>
@@ -473,10 +478,18 @@
                        placeholder="deepseek-chat" />
               </div>
               <div class="ctrl">
-                <label for="llmTimeout">超时（毫秒）</label>
+                <label for="llmTimeout" title="推理型（reasoning）模型会先输出思考过程，耗时更长，建议 15000~30000">超时（毫秒）</label>
                 <input id="llmTimeout" class="inp inp-num" type="number" min="1000" max="30000" step="500" value="8000" />
               </div>
+              <div class="ctrl">
+                <label for="llmReplyMode" title="模型润色：把服务端已核实的结论改写成更自然的话；服务端会核对数字与结论，编造内容一律作废并回落模板">回复文案</label>
+                <select id="llmReplyMode" class="inp">
+                  <option value="llm">模型润色（带服务端核对）</option>
+                  <option value="template">服务端模板</option>
+                </select>
+              </div>
               <div class="ctrl btns">
+                <button id="btnLlmModels" class="btn" type="button">拉取可用模型</button>
                 <button id="btnLlmTest" class="btn" type="button">测试连接</button>
                 <button id="btnLlmSave" class="btn btn-primary" type="submit">保存配置</button>
                 <button id="btnLlmDelete" class="btn btn-danger" type="button">删除配置</button>
@@ -484,6 +497,7 @@
             </div>
           </form>
           <div id="llmMsg" class="llm-msg hidden"></div>
+          <div id="llmModels" class="llm-models hidden"></div>
 
           <div class="ctrl-note">
             未配置或配置无效时自动降级为内置规则解析（功能仍可用）。通过环境变量

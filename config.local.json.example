@@ -3,5 +3,7 @@
   "nlEndpoint": "https://api.deepseek.com",
   "nlApiKey": "sk-在这里填你的密钥",
   "nlModel": "deepseek-chat",
-  "nlTimeoutMs": 8000
+  "nlTimeoutMs": 8000,
+  "//nlReplyMode": "回复文案来源。llm = 模型改写措辞（服务端会核对数字与结论，编造内容一律作废并回落模板）；template = 直接用服务端模板。留默认 llm 即可。推理型模型耗时更长，nlTimeoutMs 建议调到 15000~30000。",
+  "nlReplyMode": "llm"
 }

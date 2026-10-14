@@ -129,6 +129,18 @@ const FRAME = (seq, extra) => Object.assign({
     r = await jpost('/api/nl', { text: '删除所有记录' });
     ok(r.intent === 'out_of_scope', '删除数据 → 拒绝');
 
+    // 话术里的"能力清单"必须由任务注册表生成：新增任务后澄清/拒绝话术自动跟随，
+    // 不会出现"注册了新任务但话术还写着只能做两件事"的不一致。
+    ok(/查看上次数据/.test(r.reply) && /重新采集一次/.test(r.reply),
+      '越界话术的能力清单来自任务注册表（含全部已注册任务）');
+    r = await jpost('/api/nl', { text: '数据' });   // 模糊表达 → 澄清
+    if (r.intent === 'ambiguous') {
+      ok(/查看上次数据/.test(r.reply) && /重新采集一次/.test(r.reply),
+        '澄清话术的选项来自任务注册表');
+    } else {
+      ok(true, `「数据」被解析为 ${r.intent}（非 ambiguous，跳过澄清话术检查）`);
+    }
+
     console.log('— ⑤ 位置问题：说明不提供，绝不生成坐标 —');
     r = await jpost('/api/nl', { text: '设备在哪里' });
     ok(r.intent === 'location_query' && r.error === 'no_location_data', '位置问题 → location_query');

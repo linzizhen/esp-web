@@ -62,8 +62,9 @@ const els = {
   // 云端大模型自定义配置
   llmStatusTag: $('llmStatusTag'), llmSavedInfo: $('llmSavedInfo'),
   llmForm: $('llmForm'), llmEndpoint: $('llmEndpoint'), llmApiKey: $('llmApiKey'),
-  llmModel: $('llmModel'), llmTimeout: $('llmTimeout'),
+  llmModel: $('llmModel'), llmTimeout: $('llmTimeout'), llmReplyMode: $('llmReplyMode'),
   btnLlmTest: $('btnLlmTest'), btnLlmSave: $('btnLlmSave'), btnLlmDelete: $('btnLlmDelete'),
+  btnLlmModels: $('btnLlmModels'), llmModels: $('llmModels'),
   llmMsg: $('llmMsg'),
 
   // 主题切换（浅色 / 深色）
@@ -1216,6 +1217,8 @@ async function nlSend(text) {
     const chips = [`<span class="chip chip-intent">${escHtml(r.intent || '?')}</span>`];
     if (r.tool) chips.push(`<span class="chip chip-tool">${escHtml(r.tool)}</span>`);
     chips.push(`<span class="chip chip-engine">${escHtml(r.engine === 'llm' ? 'LLM' : '规则')}</span>`);
+    // 文案来源如实标注：模型改写通过数字核对才会显示 LLM，否则是服务端模板
+    if (r.tool) chips.push(`<span class="chip chip-engine">文案 ${r.reply_by === 'llm' ? 'LLM' : '模板'}</span>`);
     waiting.innerHTML =
       `<div class="nl-chips">${chips.join('')}</div>` +
       `<div class="nl-reply">${escHtml(r.reply || '(无回复)')}</div>` +
@@ -1252,6 +1255,7 @@ function llmFormParams() {
     apiKey: els.llmApiKey.value.trim(),
     model: els.llmModel.value.trim(),
     timeoutMs: Number(els.llmTimeout.value) || 8000,
+    replyMode: els.llmReplyMode ? els.llmReplyMode.value : 'llm',
   };
 }
 
@@ -1267,11 +1271,13 @@ async function loadLlmConfig() {
         `<span>当前：<b>${escHtml(j.model || '—')}</b></span>` +
         `<span>地址：<b>${escHtml(j.llm_host || j.endpoint || '—')}</b></span>` +
         `<span>Key：<b>${escHtml(j.apiKey_masked || '—')}</b></span>` +
-        `<span>超时：<b>${escHtml(String(j.timeoutMs || 8000))} ms</b></span>`;
+        `<span>超时：<b>${escHtml(String(j.timeoutMs || 8000))} ms</b></span>` +
+        `<span>文案：<b>${j.replyMode === 'template' ? '服务端模板' : '模型润色'}</b></span>`;
       els.llmSavedInfo.classList.remove('hidden');
       els.llmEndpoint.value = j.endpoint || '';
       els.llmModel.value = j.model || '';
       els.llmTimeout.value = j.timeoutMs || 8000;
+      if (els.llmReplyMode) els.llmReplyMode.value = j.replyMode === 'template' ? 'template' : 'llm';
       els.llmApiKey.value = '';
       els.llmApiKey.placeholder = j.env_locked ? '由环境变量提供（界面只读）' : `已保存（${j.apiKey_masked}），修改时重新填写`;
     } else {
@@ -1279,7 +1285,7 @@ async function loadLlmConfig() {
       els.llmApiKey.placeholder = 'sk-...';
     }
     const ro = !!j.env_locked;
-    for (const el of [els.llmEndpoint, els.llmApiKey, els.llmModel, els.llmTimeout]) el.disabled = ro;
+    for (const el of [els.llmEndpoint, els.llmApiKey, els.llmModel, els.llmTimeout, els.llmReplyMode]) { if (el) el.disabled = ro; }
     els.btnLlmSave.disabled = ro;
     els.btnLlmDelete.disabled = ro;
     els.btnLlmTest.disabled = false;   // 测试允许用表单值验证环境变量是否可用
@@ -1313,6 +1319,31 @@ if (els.llmForm) {
     } catch (e) { llmMsg('err', '删除失败：服务端未响应。'); }
   });
 
+  /* 拉取该 Key 实际可用的模型 id：模型名不匹配是 404 的常见真凶，
+     直接点列表里的名字填进表单，避免手抄出错（区分大小写、带版本后缀/部署名）。 */
+  els.btnLlmModels.addEventListener('click', async () => {
+    const p = llmFormParams();
+    els.btnLlmModels.disabled = true;
+    els.llmModels.classList.add('hidden');
+    llmMsg('ok', '正在拉取可用模型列表…');
+    try {
+      const r = await fetch('/api/nl/config/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+      const j = await r.json();
+      if (j.ok && Array.isArray(j.models) && j.models.length) {
+        els.llmModels.innerHTML = `<div class="llm-models-hint">${j.models.length} 个可用模型（点击填入）：</div>`
+          + j.models.map((m, i) => `<button type="button" class="llm-chip" data-m="${escHtml(String(m))}">${escHtml(String(m))}${i === 0 ? ' <span class="llm-chip-tag">推荐</span>' : ''}</button>`).join('');
+        els.llmModels.classList.remove('hidden');
+        els.llmModels.querySelectorAll('.llm-chip').forEach((b) => {
+          b.addEventListener('click', () => { els.llmModel.value = b.getAttribute('data-m'); llmMsg('ok', `已填入模型：<b>${escHtml(els.llmModel.value)}</b>，再点“测试连接”验证。`); });
+        });
+        llmMsg('ok', `拉取成功：<b>${j.models.length}</b> 个模型。点列表中的名字即可填入模型名。`);
+      } else {
+        llmMsg('err', `拉取失败：${escHtml(j.error || j.message || '未知错误')}${j.detail ? '<br><small>' + escHtml(j.detail) + '</small>' : ''}<br><small>列表接口不可用时，请到厂商控制台复制准确的模型名。</small>`);
+      }
+    } catch (e) { llmMsg('err', '拉取失败：服务端未响应。'); }
+    els.btnLlmModels.disabled = false;
+  });
+
   els.btnLlmTest.addEventListener('click', async () => {
     const p = llmFormParams();
     els.btnLlmTest.disabled = true;
@@ -1322,8 +1353,8 @@ if (els.llmForm) {
       const j = await r.json();
       if (j.ok === true && j.latencyMs !== undefined && !j.error) {
         llmMsg('ok', `连接成功：模型 <b>${escHtml(j.model || '')}</b> 响应 <b>${j.latencyMs} ms</b>。保存配置后即可用于对话推理。`);
-      } else {
-        llmMsg('err', `连接失败：${escHtml(j.error || j.message || '未知错误')}${j.detail ? '<br><small>' + escHtml(j.detail) + '</small>' : ''}`);
+      } else {        const urlLine = j.url ? `<br><small>实际请求：<code>${escHtml(j.url)}</code></small>` : '';
+        llmMsg('err', `连接失败：${escHtml(j.error || j.message || '未知错误')}${j.detail ? '<br><small>' + escHtml(j.detail) + '</small>' : ''}${urlLine}`);
       }
     } catch (e) { llmMsg('err', '测试失败：服务端未响应。'); }
     els.btnLlmTest.disabled = false;

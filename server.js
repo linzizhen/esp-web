@@ -778,14 +778,17 @@ function readNlFileCfg() {
   return {};
 }
 
-/* 运行期配置：env 覆盖文件；文件改动后调 reloadNlConfig() 重载 */
-const NL = { endpoint: null, apiKey: null, model: 'deepseek-chat', timeoutMs: 8000 };
+/* 运行期配置：env 覆盖文件；文件改动后调 reloadNlConfig() 重载
+ * replyMode：回复文案由谁写 —— 'llm' = 模型基于真实证据组织（服务端数字核对，
+ * 校验不过自动回落模板）；'template' = 始终用服务端模板。 */
+const NL = { endpoint: null, apiKey: null, model: 'deepseek-chat', timeoutMs: 8000, replyMode: 'llm' };
 function reloadNlConfig() {
   const f = readNlFileCfg();
   NL.endpoint = process.env.NL_ENDPOINT || f.nlEndpoint || null;
   NL.apiKey   = process.env.NL_API_KEY  || f.nlApiKey  || null;
   NL.model    = process.env.NL_MODEL    || f.nlModel   || 'deepseek-chat';
   NL.timeoutMs = Number(process.env.NL_TIMEOUT_MS || f.nlTimeoutMs || 8000);
+  NL.replyMode = (process.env.NL_REPLY_MODE || f.nlReplyMode) === 'template' ? 'template' : 'llm';
 }
 reloadNlConfig();
 
@@ -827,6 +830,8 @@ function validateNlParams(raw, { requireKey }) {
   const tm = Number(raw.timeoutMs ?? 8000);
   if (!Number.isFinite(tm) || tm < 1000 || tm > 30000) throw new Error('超时时间需在 1000~30000 毫秒之间');
   out.timeoutMs = Math.round(tm);
+  // 仅在显式传入时改动回复模式，避免"测试连接"等调用顺手把它重置
+  if (raw.replyMode !== undefined) out.replyMode = raw.replyMode === 'template' ? 'template' : 'llm';
   return out;
 }
 
@@ -843,15 +848,43 @@ function nlConfigView() {
     endpoint: NL.endpoint,
     model: NL.model,
     timeoutMs: NL.timeoutMs,
+    replyMode: NL.replyMode,
     apiKey_masked: maskKey(NL.apiKey),
     llm_host: host,
+    // 可观测性：命中复用/熔断时为什么这次没真正调模型
+    cache_size: NL_CACHE.size,
+    breaker_open: nlBreakerOpen(),
+    breaker_open_ms: nlBreakerOpen() ? (NL_CB.openUntil - Date.now()) : 0,
   };
+}
+
+/* 拼接 models 列表地址（与 chat 端点同样的版本段处理，避免 /v1/v1） */
+function nlModelsUrl(endpoint) {
+  const base = String(endpoint || '').trim().replace(/\/+$/, '');
+  if (/\/chat\/completions$/i.test(base)) return base.replace(/\/chat\/completions$/i, '/models');
+  if (/\/openai$/i.test(base)) return base + '/models';
+  if (/\/v\d+[a-z0-9]*$/i.test(base)) return base + '/models';
+  return base + '/v1/models';
+}
+
+/* 拼接 chat/completions 请求地址。兼容三种常见写法，避免出现 /v1/v1/... 这类重复路径：
+ *   ① 纯域名                  https://api.deepseek.com          → +/v1/chat/completions
+ *   ② 已带版本段/兼容前缀      https://x.com/v1、/compatible-mode/v1、/api/paas/v4、/v1beta/openai
+ *                                                              → 只补 /chat/completions
+ *   ③ 已是完整端点             https://x.com/v1/chat/completions → 原样使用
+ * 这是 404「地址或模型不存在」最常见的成因：用户按厂商文档粘贴带 /v1 的 Base URL。 */
+function nlChatCompletionsUrl(endpoint) {
+  const base = String(endpoint || '').trim().replace(/\/+$/, '');
+  if (/\/chat\/completions$/i.test(base)) return base;                 // ③ 完整端点
+  if (/\/openai$/i.test(base)) return base + '/chat/completions';      // ② Gemini 兼容层 .../v1beta/openai
+  if (/\/v\d+[a-z0-9]*$/i.test(base)) return base + '/chat/completions'; // ② 已带 /v1、/v2、/v4、/v1beta…
+  return base + '/v1/chat/completions';                                // ① 纯域名补默认版本段
 }
 
 /* 连通性测试：用给定参数发一次最小 chat 请求（不落盘） */
 async function nlTestConnection({ endpoint, apiKey, model, timeoutMs }) {
   const started = Date.now();
-  const url = endpoint.replace(/\/+$/, '') + '/v1/chat/completions';
+  const url = nlChatCompletionsUrl(endpoint);
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
@@ -861,21 +894,24 @@ async function nlTestConnection({ endpoint, apiKey, model, timeoutMs }) {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'hi' }],
-        max_tokens: 1, temperature: 0,
+        // 推理型模型可能拒绝过小的 max_tokens，给一点余量（只校验连通性，不看内容）
+        max_tokens: 32, temperature: 0,
       }),
       signal: ac.signal,
     });
     if (!r.ok) {
       const body = await r.text().catch(() => '');
       let hint = 'HTTP ' + r.status;
-      if (r.status === 401 || r.status === 403) hint += '（认证失败：API Key 无效或无权限）';
+      if (r.status === 401 || r.status === 403) hint += '（认证失败：API Key 无效、过期或无该模型权限）';
       else if (r.status === 404) hint += '（地址或模型不存在：检查 API 地址与模型名称）';
       else if (r.status === 429) hint += '（额度/速率超限）';
-      else if (r.status === 400) hint += '（请求参数被服务端拒绝：检查模型名称）';
+      else if (r.status === 400) hint += '（请求参数被服务端拒绝：多为模型名称不对）';
       const snippet = body.slice(0, 160).replace(/\s+/g, ' ');
-      return { ok: false, latencyMs: Date.now() - started, httpStatus: r.status, error: hint, detail: snippet || null };
+      // 404 额外回传实际请求地址，便于一眼看出路径拼接问题（不含密钥）
+      const extra = r.status === 404 ? ` 实际请求地址：${url}` : null;
+      return { ok: false, latencyMs: Date.now() - started, httpStatus: r.status, error: hint + (extra || ''), url, detail: snippet || null };
     }
-    return { ok: true, latencyMs: Date.now() - started, model };
+    return { ok: true, latencyMs: Date.now() - started, model, url };
   } catch (e) {
     const msg = e.name === 'AbortError' ? `连接超时（>${timeoutMs}ms）：地址不可达或服务无响应`
       : (e.cause && e.cause.code === 'ENOTFOUND' ? '域名解析失败：检查 API 地址'
@@ -887,27 +923,250 @@ async function nlTestConnection({ endpoint, apiKey, model, timeoutMs }) {
   }
 }
 
-const NL_INTENTS = new Set(['query_last', 'collect_once', 'ambiguous', 'out_of_scope', 'location_query', 'other']);
+/* ------------------------------------------------------------------ */
+/* 任务注册表（NL 模块的扩展点核心）                                      */
+/*                                                                     */
+/* 新增任务只需在 NL_TASKS 里加一条定义：                                */
+/*   promptDesc —— 写进 system prompt 的任务描述（LLM 据此理解该意图）     */
+/*   apiDesc    —— /api/nl 能力说明里展示的一句话                         */
+/*   short/hint —— 「模糊澄清」回复里的自然语言任务名与说明                 */
+/*   run(ctx)   —— 执行体（ctx = { device }），返回 { reply, evidence }  */
+/* 加完后：system prompt、能力说明、ambiguous/out_of_scope/other 的回复    */
+/* 全部自动跟随，无需再改其他代码。                                        */
+/* 不执行任务的元意图（澄清/拒绝/说明）在 NL_META_INTENTS 声明。           */
+/* ------------------------------------------------------------------ */
+const NL_TASKS = {
+  query_last: {
+    promptDesc: '查看/询问最近一次或历史数据（"上次数据""最新记录""现在数据多少"）',
+    apiDesc: '查看设备最近一次（历史）记录，保留旧时间，不触发采集',
+    short: '查看上次数据',
+    hint: '只读历史记录，时间是旧的',
+    run: () => nlRunQueryLast(),
+  },
+  collect_once: {
+    promptDesc: '要求立即重新采集/再采一次（"重新采集""再采一帧""采新的"）',
+    apiDesc: '请求设备立即采集一帧新数据，等待真实完成证据',
+    short: '重新采集一次',
+    hint: '让设备立刻采一帧新的，并等待新结果',
+    run: () => nlRunCollectOnce(),
+  },
+};
 
-/* ---- 意图解析器 A：LLM（结构化 JSON 输出；任何失败一律降级规则解析） ---- */
+/* 元意图：不执行任务，只做澄清 / 拒绝 / 如实说明 */
+const NL_META_INTENTS = {
+  ambiguous: '只说"数据""采集"等，无法判断是查询还是发起',
+  out_of_scope: '要求操作其他设备、删除/修改/清空数据、打电话、发短信等越界或危险请求',
+  location_query: '询问设备位置/坐标/经纬度/在哪',
+  other: '以上都不是',
+};
+
+const NL_INTENTS = new Set([...Object.keys(NL_TASKS), ...Object.keys(NL_META_INTENTS)]);
+
+/* system prompt 由注册表生成 —— 新增任务无需改这里 */
 const NL_SYSTEM_PROMPT = [
   '你是嵌入式监测平台的任务路由器。把用户的话映射为结构化任务，只能输出 JSON。',
   '允许的 intent：',
-  '- query_last：查看/询问最近一次或历史数据（"上次数据""最新记录""现在数据多少"）',
-  '- collect_once：要求立即重新采集/再采一次（"重新采集""再采一帧""采新的"）',
-  '- ambiguous：只说"数据""采集"等，无法判断是查询还是发起',
-  '- out_of_scope：要求操作其他设备、删除/修改/清空数据、打电话、发短信等越界或危险请求',
-  '- location_query：询问设备位置/坐标/经纬度/在哪',
+  ...Object.entries(NL_TASKS).map(([name, t]) => `- ${name}：${t.promptDesc}`),
+  ...Object.entries(NL_META_INTENTS).map(([name, d]) => `- ${name}：${d}`),
   '参数：device（用户明确点名的设备号，未点名则为 null）',
   '输出格式（严格 JSON，不要任何多余文字）：{"intent":"...","device":null,"reason":"一句话"}',
 ].join('\n');
 
+/* 单次意图解析的输出额度。推理型（reasoning）模型会先把 token 花在思考上，
+   给小了会返回 HTTP 200 但 content 为空（实测 Agents-A1 思考约 550~640 token），故给足。 */
+const NL_MAX_TOKENS = 1200;
+/* 回复改写（compose)的输出额度：只需 1~3 句，留点余量给推理型模型的思考。 */
+const NL_REPLY_MAX_TOKENS = 800;
+
+/* ------------------------------------------------------------------ */
+/* 回复文案生成（可选）：模型把「服务端已核实的结论」改写成更自然的话        */
+/*                                                                     */
+/* 诚实性护栏（本项目红线，不能靠模型自觉）：                              */
+/*   ① 事实全部由服务端提供：模板结论 + 证据 JSON，模型只做改写不做推断；    */
+/*   ② 改写结果做「数字核对」：回复里出现的每个数字都必须在证据里找得到      */
+/*      （允许四舍五入级近似、毫秒→秒换算），对不上一律作废回落模板；        */
+/*   ③ 立场核对：模板没说"成功/失败/超时"时，改写文里也不许出现这些字眼。    */
+/* 任何一条不过 → 用服务端模板原文，功能不受影响。                          */
+/* ------------------------------------------------------------------ */
+
+/* 递归收集证据里的数字（含字符串中的数字片段，如 ISO 时间） */
+function collectEvidenceNumbers(node, out, keyHint) {
+  if (node == null) return;
+  if (typeof node === 'number' && Number.isFinite(node)) { out.push({ v: node, key: keyHint }); return; }
+  if (typeof node === 'string') {
+    const ms = node.match(/-?\d+(?:\.\d+)?/g);
+    if (ms) for (const m of ms.slice(0, 20)) out.push({ v: Number(m), key: keyHint });
+    return;
+  }
+  if (Array.isArray(node)) { for (const x of node) collectEvidenceNumbers(x, out, keyHint); return; }
+  if (typeof node === 'object') for (const k of Object.keys(node)) collectEvidenceNumbers(node[k], out, k);
+}
+
+/* 生成"允许出现的数字"白名单：证据里的数字 + extraTexts（服务端模板等可信文本）里的数字，
+ * 各取原值/四舍五入写法，毫秒字段再加秒写法。
+ * 注意：query_last 的 evidence 只带元数据（时间、seq），传感器数值只出现在服务端模板里，
+ * 所以模板必须一并纳入白名单，否则模型正当地引用真实读数会被误判为"编造"。 */
+function buildAllowedNumbers(evidence, extraTexts) {
+  const raw = [];
+  collectEvidenceNumbers(evidence, raw, null);
+  for (const t of (extraTexts || [])) {
+    const ms = String(t).match(/-?\d+(?:\.\d+)?/g);
+    if (ms) for (const m of ms) raw.push({ v: Number(m), key: null });
+  }
+  const allowed = [];
+  for (const { v, key } of raw) {
+    if (!Number.isFinite(v)) continue;
+    allowed.push(v, Math.round(v));
+    for (let d = 0; d <= 4; d++) allowed.push(Number(v.toFixed(d)));
+    if (key && /(^|_)ms$/.test(key)) {          // age_ms 等：模板话术里的"秒"由它换算而来
+      allowed.push(Math.round(v / 1000));
+      allowed.push(Number((v / 1000).toFixed(1)));
+    }
+  }
+  return allowed;
+}
+
+const nearlyEq = (a, b) => {
+  if (a === b) return true;
+  const diff = Math.abs(a - b);
+  return diff <= Math.max(1e-9, Math.max(Math.abs(a), Math.abs(b)) * 0.01);
+};
+
+/* 数字核对：回复里的每个数字都要能在证据白名单里找到近似值 */
+function verifyReplyNumbers(text, allowed) {
+  const found = String(text).match(/-?\d+(?:\.\d+)?/g) || [];
+  const bad = [];
+  for (const s of found) {
+    const n = Number(s);
+    if (!Number.isFinite(n)) continue;
+    if (allowed.some((a) => nearlyEq(a, n))) continue;
+    bad.push(s);
+  }
+  return { ok: bad.length === 0, bad: bad.slice(0, 5) };
+}
+
+/* 立场核对：关键结论词不得凭空出现（模板没说的，改写文里也不能有） */
+const NL_CLAIM_WORDS = ['成功', '失败', '超时', '已回执', '越界', '不支持'];
+function verifyReplyStance(reply, template) {
+  for (const w of NL_CLAIM_WORDS) {
+    if (reply.includes(w) && !template.includes(w)) return { ok: false, word: w };
+  }
+  return { ok: true };
+}
+
+async function composeReplyByLlm({ taskName, userText, evidence, templateReply }) {
+  if (NL.replyMode !== 'llm') return null;
+  if (!NL.endpoint || !NL.apiKey) return null;
+  if (nlBreakerOpen()) return null;     // 熔断中：不额外消耗一次远程调用
+  const sys = [
+    '你是嵌入式监测平台的助手，负责把「服务端已核实的事实」改写成更自然、口语化的中文回复。',
+    '硬性要求（违反即作废）：',
+    '1) 只能使用【已核实结论】和【事实】里给出的信息，不得添加、推测、补全任何未给出的数据；',
+    '2) 数字必须原样引用，不要换算、不要重算、不要改变位数含义；时间原样引用 ISO 字符串，不做时区换算；',
+    '3) 不得出现【已核实结论】里没有的结论性字眼（如"成功""失败""超时"）；',
+    '4) 只输出回复正文（1~3 句），不要 JSON、markdown、引号、前缀或解释。',
+  ].join('\n');
+  const user = `用户说：${userText}\n\n任务：${taskName}\n\n【已核实结论】\n${templateReply}\n\n【事实】\n${JSON.stringify(evidence || {})}`;
+  const ac = new AbortController();
+  /* 改写是"锦上添花"：模板本身已是完整正确的答案，因此给它独立的、更紧的上限，
+   * 不让"润色"把整体等待时间再拉长一截（模型慢就直接用模板）。 */
+  const composeTimeoutMs = Math.min(NL.timeoutMs, 8000);
+  const timer = setTimeout(() => ac.abort(), composeTimeoutMs);
+  try {
+    const r = await fetch(nlChatCompletionsUrl(NL.endpoint), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + NL.apiKey },
+      body: JSON.stringify({
+        model: NL.model,
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
+        temperature: 0.3,
+        max_tokens: NL_REPLY_MAX_TOKENS,
+        ...(nlThinkDisabledOk ? { thinking: { type: 'disabled' } } : {}),
+      }),
+      signal: ac.signal,
+    });
+    if (!r.ok) {
+      if (r.status === 429 || r.status >= 500) console.warn('[nl] 回复改写失败，保留模板文案：HTTP ' + r.status);
+      return null;
+    }
+    const j = await r.json();
+    const text = String((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '').trim();
+    if (!text) return null;
+    if (text.length > 400) { console.warn('[nl] 改写文过长，已作废回落模板'); return null; }
+    const stance = verifyReplyStance(text, templateReply);
+    if (!stance.ok) { console.warn(`[nl] 改写文出现结论里没有的字眼「${stance.word}」，已作废回落模板`); return null; }
+    /* 白名单只取「服务端生成」的两处：证据 + 模板文案。
+     * 故意不含用户原话 —— 否则用户随口说的数字会被模型当作事实回述，
+     * 反而制造出"看起来有依据"的编造。 */
+    const chk = verifyReplyNumbers(text, buildAllowedNumbers(evidence, [templateReply]));
+    if (!chk.ok) { console.warn('[nl] 改写文含证据外的数字 ' + chk.bad.join('/') + '，已作废回落模板'); return null; }
+    return text;
+  } catch (_) {
+    return null;   // 超时/网络问题：静默保留模板文案
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ---- 调用侧的两项开销控制（不改动调用语义，只减少无效远程调用） ----
+ * ① 结果复用：同一模型 + 同一句话在 TTL 内直接复用上一次的意图，
+ *    避免重复问同一句话时反复付一次网络往返（典型 0.8~3s）。
+ * ② 失败熔断：连续失败后短时间内不再调用，直接走规则解析。
+ *    否则模型不可用/超时时，用户每发一句话都要干等到超时才降级。 */
+const NL_CACHE = new Map();          // key -> { result, ts }
+const NL_CACHE_TTL_MS = 10 * 60 * 1000;
+const NL_CACHE_MAX = 100;
+const NL_CB = { fails: 0, openUntil: 0 };   // 连续失败计数 / 熔断截止时间戳
+const NL_CB_FAILS = 2;
+const NL_CB_COOLDOWN_MS = 60 * 1000;
+
+function nlCacheKey(text) {
+  return NL.model + '|' + String(text).trim().replace(/\s+/g, '');
+}
+function nlCacheGet(key) {
+  const hit = NL_CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > NL_CACHE_TTL_MS) { NL_CACHE.delete(key); return null; }
+  return hit.result;
+}
+function nlCacheSet(key, result) {
+  if (NL_CACHE.size >= NL_CACHE_MAX) NL_CACHE.delete(NL_CACHE.keys().next().value);
+  NL_CACHE.set(key, { result, ts: Date.now() });
+}
+/* 熔断状态：true = 正在熔断（跳过远程调用，直接用规则兜底） */
+function nlBreakerOpen() {
+  return Date.now() < NL_CB.openUntil;
+}
+function nlBreakerOk() { NL_CB.fails = 0; NL_CB.openUntil = 0; }
+function nlBreakerFail() {
+  NL_CB.fails++;
+  if (NL_CB.fails >= NL_CB_FAILS) {
+    NL_CB.openUntil = Date.now() + NL_CB_COOLDOWN_MS;
+    console.warn(`[nl] LLM 连续失败 ${NL_CB.fails} 次，熔断 ${NL_CB_COOLDOWN_MS / 1000}s（期间直接用规则解析）`);
+  }
+}
+/* 该模型是否支持「关闭思考」参数。首次调用若被服务端明确拒绝（如智谱 1210
+ * "该模型始终思考，不支持关闭思考"）就记为 false，之后直接跳过这一档，
+ * 避免每次解析都先白打一次必然失败的请求。换模型/地址时重置。 */
+let nlThinkDisabledOk = true;
+function nlInvalidateLlmCaches() { NL_CACHE.clear(); NL_CB.fails = 0; NL_CB.openUntil = 0; nlThinkDisabledOk = true; }
+
 async function parseIntentByLlm(text) {
   if (!NL.endpoint || !NL.apiKey) return null;
-  const url = NL.endpoint.replace(/\/+$/, '') + '/v1/chat/completions';
+  // 熔断中：不再发起远程调用，避免每句话都干等到超时（直接规则兜底，功能不受影响）
+  if (nlBreakerOpen()) return null;
+  const ck = nlCacheKey(text);
+  const cached = nlCacheGet(ck);
+  if (cached) return cached;
+  const url = nlChatCompletionsUrl(NL.endpoint);
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), NL.timeoutMs);
-  try {
+  /* 单次调用。
+   * useJson=false → 去掉 response_format（部分服务不支持会返回空内容）。
+   * noThink=true  → 关闭"思考过程"（意图路由是简单分类，不需要长思考）：
+   *   实测 Agents-A1 关闭后 思考 token 640→0、延迟 9s→2.2s，且正文不再为空。
+   *   若服务端不认这个参数会报错，外层会回退到不开该参数的调用。 */
+  const callOnce = async (useJson, noThink) => {
     const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + NL.apiKey },
@@ -918,20 +1177,73 @@ async function parseIntentByLlm(text) {
           { role: 'user', content: text },
         ],
         temperature: 0,
-        response_format: { type: 'json_object' },
-        max_tokens: 200,
+        // 推理型模型会把 token 先花在思考上（实测 Agents-A1 一次思考约 550~640 token），
+        // max_tokens 给小了会出现 HTTP 200 但 content 为空 —— 因此给足额度。
+        max_tokens: NL_MAX_TOKENS,
+        ...(useJson ? { response_format: { type: 'json_object' } } : {}),
+        ...(noThink ? { thinking: { type: 'disabled' } } : {}),
       }),
       signal: ac.signal,
     });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    if (!r.ok) {
+      const bodyText = await r.text().catch(() => '');
+      const err = new Error('HTTP ' + r.status);
+      // 429（限流/模型拥塞）与 5xx（服务端故障）：立刻放弃本次解析，
+      // 换参数重试同一个服务没有意义，只会让用户多等好几秒、多打几次请求。
+      if (r.status === 429 || r.status >= 500) err.nlBail = true;
+      // 记录服务端错误码与消息，便于定位（如智谱 1305=模型拥塞、1113=余额不足）
+      try {
+        const ej = JSON.parse(bodyText);
+        if (ej && ej.error && ej.error.code) err.nlCode = ej.error.code;
+        err.nlMsg = (ej && ej.error && ej.error.message) || bodyText.slice(0, 120);
+        // 模型明确表示"不支持关闭思考"（如智谱 1210）→ 记住，下次不再白试关思考
+        if (/不支持关闭思考|thinking/i.test(err.nlMsg) && r.status === 400) nlThinkDisabledOk = false;
+      } catch (_) {}
+      throw err;
+    }
     const j = await r.json();
-    const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-    if (!content) throw new Error('空响应');
+    const msg = (j.choices && j.choices[0] && j.choices[0].message) || {};
+    // 推理型模型可能把正文放在 content，思考放在 reasoning_content —— 只认 content
+    const content = msg.content;
+    if (!content) {
+      const why = msg.reasoning_content ? '内容为空（模型仅返回了思考过程 reasoning_content，可能是 max_tokens 不足或不支持 JSON 模式）' : '空响应';
+      throw new Error(why);
+    }
     const parsed = JSON.parse(content);
     if (!NL_INTENTS.has(parsed.intent)) throw new Error('非法 intent: ' + parsed.intent);
     return { intent: parsed.intent, device: parsed.device || null, reason: parsed.reason || null };
+  };
+
+  const isAbort = (e) => e && (e.name === 'AbortError' || /aborted/i.test(String(e.message)));
+  try {
+    /* 尝试顺序（越靠前越快，失败才降级到下一档）：
+     *   ① 关思考 + JSON 模式  —— 最快（实测 ~2.2s），适合意图分类这种简单任务
+     *   ② 带思考 + JSON 模式  —— 服务端不认 thinking 参数时
+     *   ③ 带思考 + 普通模式    —— 服务端不支持 response_format 时
+     * 超时（共用同一 deadline）时不再重试：继续等只会更慢，直接降级规则解析。 */
+    let out;
+    const detail = (e) => e.message + (e.nlCode ? ` [code=${e.nlCode}]` : '') + (e.nlMsg ? ` ${e.nlMsg}` : '');
+    try {
+      // ① 关思考 + JSON（最快）。若该模型已知不支持关思考，直接跳过这一档。
+      out = nlThinkDisabledOk ? await callOnce(true, true) : await callOnce(true, false);
+    } catch (e1) {
+      if (isAbort(e1) || e1.nlBail) throw e1;   // 超时/限流/服务端故障：不再换参数重试
+      console.warn('[nl] 关思考调用失败，回退带思考（JSON 模式）：', detail(e1));
+      try {
+        out = await callOnce(true, false);
+      } catch (e2) {
+        if (isAbort(e2) || e2.nlBail) throw e2;
+        console.warn('[nl] LLM 首次解析失败（JSON 模式），重试普通模式：', detail(e2));
+        out = await callOnce(false, false);
+      }
+    }
+    nlBreakerOk();
+    nlCacheSet(ck, out);   // 成功才入缓存（失败不缓存，便于恢复后立即重试）
+    return out;
   } catch (e) {
-    console.warn('[nl] LLM 解析失败，降级规则解析：', e.message);
+    const extra = (e.nlCode ? ` [code=${e.nlCode}]` : '') + (e.nlMsg ? ` ${e.nlMsg}` : '');
+    console.warn(`[nl] LLM 解析失败（${url}），降级规则解析：`, e.message + extra);
+    nlBreakerFail();
     return null;
   } finally {
     clearTimeout(timer);
@@ -1049,29 +1361,41 @@ async function nlHandle(text) {
   else parsed = parseIntentByRule(text);
 
   const allowed = config.expectedDeviceId || null;
-  const base = { engine, intent: parsed.intent, tool: null, params: {}, parser_note: parsed.reason || null };
+  // reply_by 如实标注文案来源：模板（服务端生成）/ llm（模型改写且通过核对）
+  const base = { engine, intent: parsed.intent, tool: null, params: {}, parser_note: parsed.reason || null, reply_by: 'template' };
 
-  /* 设备白名单统一闸门：任何意图只要点名了白名单外设备，一律拒绝（在解析之后、工具之前） */
+  /* 设备白名单统一闸门：任何意图只要点名了白名单外设备，一律拒绝（在解析之后、任务之前） */
   const v = nlValidateDevice(parsed);
   if (!v.ok) {
     return { ...base, intent: 'out_of_scope', error: 'device_out_of_scope', reply: v.reason };
   }
 
+  /* 任务分发：注册表命中 → 执行对应 run()；元意图 → 澄清 / 拒绝 / 如实说明。
+   * 所有回复里的"能力清单"都由注册表生成，新增任务自动出现在话术里。 */
+  const task = NL_TASKS[parsed.intent];
+  if (task) {
+    const out = await task.run({ device: v.device });
+    /* 可选：让模型把已核实的结论改写成更自然的话（数字/立场核对不过则回落模板）。
+     * reply_by 如实标注文案来源，前端会显示，便于一眼看出这次是不是模型写的。 */
+    const composed = await composeReplyByLlm({
+      taskName: task.short, userText: text, evidence: out.evidence, templateReply: out.reply,
+    });
+    return {
+      ...base, tool: parsed.intent, params: { device: v.device }, ...out,
+      reply: composed || out.reply,
+      reply_by: composed ? 'llm' : 'template',
+    };
+  }
+
+  const taskNames = Object.values(NL_TASKS).map((t) => `【${t.short}】`).join('、');
   switch (parsed.intent) {
-    case 'query_last': {
-      const out = nlRunQueryLast();
-      return { ...base, tool: 'query_last', params: { device: v.device }, ...out };
-    }
-    case 'collect_once': {
-      const out = await nlRunCollectOnce();
-      return { ...base, tool: 'collect_once', params: { device: v.device }, ...out };
-    }
-    case 'ambiguous':
+    case 'ambiguous': {
+      const opts = Object.values(NL_TASKS).map((t) => `【${t.short}】（${t.hint}）`).join('，');
       return {
         ...base, error: 'ambiguous',
-        reply: '这句话我无法确定任务。你是想【查看上次数据】（只读历史记录，时间是旧的），'
-          + '还是【重新采集一次】（让设备立刻采一帧新的，并等待新结果）？这是两个不同任务，请明确一个。',
+        reply: `这句话我无法确定任务。你是想${opts}？请明确一个。`,
       };
+    }
     case 'location_query':
       return {
         ...base, error: 'no_location_data',
@@ -1082,14 +1406,14 @@ async function nlHandle(text) {
       const d = parsed.device ? `（涉及设备 ${parsed.device}）` : '';
       return {
         ...base, error: 'out_of_scope',
-        reply: `这个请求超出我的允许范围${d}。我只能对 ${allowed || '当前设备'} 做两件事：`
-          + '查看上次数据、发起一次重新采集。删除/修改数据、控制其他设备、外呼等操作一律不执行。',
+        reply: `这个请求超出我的允许范围${d}。我只能对 ${allowed || '当前设备'} 做：${taskNames}。`
+          + '删除/修改数据、控制其他设备、外呼等操作一律不执行。',
       };
     }
     default:
       return {
         ...base, intent: 'other', error: 'unknown_intent',
-        reply: '我只能帮你两件事：【查看上次数据】或【重新采集一次】。请换一种说法，例如"上次数据是多少"或"重新采集一次"。',
+        reply: `我只能帮你：${taskNames}。请换一种说法。`,
       };
   }
 }
@@ -2081,10 +2405,7 @@ async function handleRequest(req, res) {
       engine: (NL.endpoint && NL.apiKey) ? 'llm (降级兜底: rule)' : 'rule',
       llm_host: NL.endpoint ? (new URL(NL.endpoint)).host : null,
       allowed_device: config.expectedDeviceId || null,
-      tools: {
-        query_last: '查看设备最近一次（历史）记录，保留旧时间，不触发采集',
-        collect_once: '请求设备立即采集一帧新数据，等待真实完成证据',
-      },
+      tools: Object.fromEntries(Object.entries(NL_TASKS).map(([k, t]) => [k, t.apiDesc])),
     });
   }
 
@@ -2098,17 +2419,19 @@ async function handleRequest(req, res) {
     if (NL_ENV_ACTIVE) {
       return json(res, 409, { ok: false, error: 'env_override', message: '当前已通过环境变量 NL_ENDPOINT/NL_API_KEY/NL_MODEL 配置，优先级高于文件。请改用环境变量管理，或取消环境变量后再通过界面保存。' });
     }
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     let v;
     try { v = validateNlParams(body, { requireKey: true }); }
     catch (e) { return json(res, 400, { ok: false, error: 'invalid_config', message: e.message }); }
     try {
-      writeNlFileCfg({ nlEndpoint: v.endpoint, nlApiKey: v.apiKey, nlModel: v.model, nlTimeoutMs: v.timeoutMs });
+      const patch = { nlEndpoint: v.endpoint, nlApiKey: v.apiKey, nlModel: v.model, nlTimeoutMs: v.timeoutMs };
+      if (v.replyMode !== undefined) patch.nlReplyMode = v.replyMode;
+      writeNlFileCfg(patch);
     } catch (e) {
       return json(res, 500, { ok: false, error: 'write_failed', message: 'config.local.json 写入失败：' + e.message });
     }
     reloadNlConfig();
+    nlInvalidateLlmCaches();   // 换模型/地址/Key 后，旧意图结果与熔断状态都不该沿用
     console.log('[nl] LLM 配置已更新：', v.endpoint, v.model);
     return json(res, 200, nlConfigView());
   }
@@ -2123,14 +2446,14 @@ async function handleRequest(req, res) {
       return json(res, 500, { ok: false, error: 'write_failed', message: 'config.local.json 写入失败：' + e.message });
     }
     reloadNlConfig();
+    nlInvalidateLlmCaches();
     console.log('[nl] LLM 配置已删除（config.local.json 中 nl* 键已清空）');
     return json(res, 200, nlConfigView());
   }
 
   // ---- LLM 自定义配置：测试连接（用请求体里的参数，不落盘；为空则用已保存配置） ----
   if (p === '/api/nl/config/test' && req.method === 'POST') {
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     let params;
     if (body.endpoint || body.apiKey || body.model) {
       let v;
@@ -2147,10 +2470,50 @@ async function handleRequest(req, res) {
     return json(res, 200, { ok: true, ...result });
   }
 
+  // ---- LLM 自定义配置：拉取可用模型列表（用表单参数，不落盘；模型名常是 404 的真凶） ----
+  if (p === '/api/nl/config/models' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    let endpoint, apiKey, timeoutMs;
+    if (body.endpoint || body.apiKey) {
+      const ep = body.endpoint || NL.endpoint;
+      if (!ep) return json(res, 400, { ok: false, error: 'invalid_config', message: '缺少 API 地址' });
+      let v;
+      try { v = validateNlParams({ endpoint: ep, apiKey: body.apiKey, model: body.model || '_', timeoutMs: body.timeoutMs }, { requireKey: true }); }
+      catch (e) { return json(res, 400, { ok: false, error: 'invalid_config', message: e.message }); }
+      endpoint = v.endpoint; apiKey = v.apiKey; timeoutMs = v.timeoutMs;
+    } else {
+      if (!NL.endpoint || !NL.apiKey) return json(res, 400, { ok: false, error: 'not_configured', message: '尚未保存配置，请先在表单填写地址与 Key。' });
+      endpoint = NL.endpoint; apiKey = NL.apiKey; timeoutMs = NL.timeoutMs;
+    }
+    const url = nlModelsUrl(endpoint);
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, { method: 'GET', headers: { Authorization: 'Bearer ' + apiKey }, signal: ac.signal });
+      const text = await r.text().catch(() => '');
+      if (!r.ok) {
+        let hint = 'HTTP ' + r.status;
+        if (r.status === 401 || r.status === 403) hint += '（API Key 无效或无列表权限——不影响对话，可直接填已知模型名测试）';
+        else if (r.status === 404) hint += '（该服务未开放 /models 列表接口）';
+        return json(res, 200, { ok: false, url, error: hint, detail: text.slice(0, 200).replace(/\s+/g, ' ') || null });
+      }
+      let ids = [];
+      try {
+        const j = JSON.parse(text);
+        ids = (j.data || j.models || []).map((m) => (typeof m === 'string' ? m : (m.id || m.name))).filter(Boolean);
+      } catch (_) {}
+      return json(res, 200, { ok: true, url, models: ids });
+    } catch (e) {
+      const msg = e.name === 'AbortError' ? `请求超时（>${timeoutMs}ms）` : '请求失败：' + e.message;
+      return json(res, 200, { ok: false, url, error: msg });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // ---- 波特率探测 ----
   if (p === '/api/probe' && req.method === 'POST') {
-    let body = {};
-    try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const body = await readJsonBody(req);
     const bauds = Array.isArray(body.baudRates) && body.baudRates.length
       ? body.baudRates : [9600, 19200, 38400, 57600, 74880, 115200, 230400, 460800, 921600];
     const ms = Math.min(5000, Math.max(300, Number(body.ms) || 1500));
