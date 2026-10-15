@@ -11,7 +11,12 @@ const fs = require('node:fs');
 
 const PORT = 8099;
 const ROOT = path.join(__dirname, '..');
-const DATA_FILE = path.join(ROOT, 'data', 'records.ndjson');
+/* ★ 必须用隔离的 DATA_DIR，绝不能指向仓库的 data/。
+ * 原实现写死 ROOT/data/records.ndjson 并在开头 unlinkSync 它 —— 每次跑测试都会
+ * 删除真实采集数据（2026-10-15 实测：414 条真实记录被抹成测试自己的 2 条）。
+ * 隔离目录放在 test/.test-data 下，已由 .gitignore 的 test/.test-data* 覆盖。 */
+const DATA_DIR = path.join(__dirname, '.test-data');
+const DATA_FILE = path.join(DATA_DIR, 'records.ndjson');
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log('  ✓', m); } else { fail++; console.error('  ✗', m); } };
@@ -30,12 +35,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function nowMs() { return Date.now(); }
 
 (async () => {
-  // 清理旧数据
-  if (fs.existsSync(DATA_FILE)) fs.unlinkSync(DATA_FILE);
+  // 清理隔离目录里的旧数据（只动 test/.test-data，不碰真实 data/）
+  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 
   // 必须用隔离配置：默认配置 autoDetect=true 会打开真实板子的串口，
   // 板子持续上报会让"停采"场景无法成立，测试出现假失败。
-  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: path.join(__dirname, '.test-config.json') , NL_CONFIG_PATH: __dirname + '/.test-nl-local-absent.json', NL_ENDPOINT: '', NL_API_KEY: ''}), stdio: 'ignore' });
+  const srv = spawn('node', ['server.js'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT), HOST: '127.0.0.1', CONFIG_PATH: path.join(__dirname, '.test-config.json'), DATA_DIR, NL_CONFIG_PATH: __dirname + '/.test-nl-local-absent.json', NL_ENDPOINT: '', NL_API_KEY: ''}), stdio: 'ignore' });
   await sleep(1200);
 
   try {

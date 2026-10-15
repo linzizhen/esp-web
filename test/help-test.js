@@ -17,6 +17,9 @@ const path = require('node:path');
 
 const PORT = 8097;
 const ROOT = path.join(__dirname, '..');
+/* ★ 隔离 DATA_DIR：本测试会向 /api/data 注入合成求助事件与传感帧，
+ * 若不隔离就会写进真实 data/records.ndjson（2026-10-15 发现并修复）。 */
+const DATA_DIR = path.join(__dirname, '.test-data');
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log('  ✓', m); } else { fail++; console.error('  ✗', m); } };
@@ -57,6 +60,7 @@ const HELP = (extra) => Object.assign({
       PORT: String(PORT),
       HOST: '127.0.0.1',
       CONFIG_PATH: path.join(ROOT, 'test', '.test-config.json'),
+      DATA_DIR,
       NL_CONFIG_PATH: __dirname + '/.test-nl-local-absent.json', NL_ENDPOINT: '', NL_API_KEY: '',
     }),
     stdio: 'ignore',
