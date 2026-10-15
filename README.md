@@ -105,7 +105,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   ├── ui-concept.html          # UI 设计原型 A：克制极简 + 像素材质
 │   ├── ui-concept-pixel.html    # UI 设计原型 B：纯像素抖动风（Fusion Pixel 点阵中文）
 │   └── *.png                    # 界面截图（help-page / week4-ask-page）
-├── data/                     # NDJSON 原始记录（持久化存储，运行后生成）
+├── data/                     # NDJSON 持久化（运行后生成）：records.ndjson 采样、help.ndjson 求助事件
 ├── recordings/               # 录制导出的 CSV（运行后生成）
 ├── public/
 │   ├── index.html            # 监控页面（分页：实时监控 / 远程采集 / 记录与设备 / LLM 配置）
@@ -130,6 +130,8 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── .test-config.json     # 测试隔离配置夹具（autoDetect:false）—— 必须提交
     ├── .test-nl-config.json  # NL 测试夹具 —— 必须提交
     ├── theme-contract-test.js # 前端主题变量契约：app.js 读取的 CSS 变量三套主题都要有（静态，0.1s）
+    ├── isolation-contract-test.js # 测试隔离契约：每个自建 server 的测试都必须隔离 DATA_DIR（静态）
+    ├── help-history-ui-test.js # 求助历史展示契约：事件名映射完整、元素 id 一致（静态）
     ├── serial-forensics.js   # 硬件在环：被动串口取证（复位/崩溃特征，只读）
     ├── backoff-hil.js        # 硬件在环：退避行为回归（需先停服务端）
     ├── firmware-backoff-test.js # 硬件在环：帧率与重启检查（需服务端在跑）
@@ -144,6 +146,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── parse-test.js         # 通用解析：JSON / 键值 / 中文键（隔离端口 8094）
     ├── ws-test.js            # WebSocket sample/stale/cleared 推送结构（隔离端口 8098）
     ├── help-test.js          # 第 3 周：教学求助闭环（隔离端口 8097）
+    ├── help-persist-test.js  # 第 3 周：求助事件落盘与启动回读（隔离端口 8092）
     ├── nl-test.js            # 第 4 周：意图解析与诚实性回复（隔离端口 8098）
     ├── nl-config-test.js     # 第 4 周：LLM 配置增删改查与降级（隔离端口 8095）
     ├── week4-verify.js       # 第 4 周：按设计直连 8080 现网验证
@@ -168,7 +171,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 | `wifiTimeoutMs` | 8000 | WiFi 上报心跳超时（预留，停采阈值统一用 `staleAfterMs`） |
 | `stalePolicy` | `keep` | 停采策略：`keep`=保留末次数据与旧时间并提示"未更新"（作业默认）；`clear`=超时后清空 |
 | `expectedDeviceId` | null | **本组设备身份校验**：设为固件里的 `DEVICE_ID` 后，平台标记每帧数据是否来自本组（前端显示 ✓本组/⚠非本组），避免邻组数据混显 |
-| `storageEnabled` | true | 是否把每帧真实采样落盘为 NDJSON（`data/records.ndjson`） |
+| `storageEnabled` | true | 是否把每帧真实采样落盘为 NDJSON（`data/records.ndjson`）。求助事件单独写 `data/help.ndjson`（只追加不滚动） |
 | `storageMaxMb` | 32 | 单记录文件超过该大小自动滚动归档 |
 | `fieldUnits` / `fieldLabels` | — | 字段单位与中文显示名映射 |
 
@@ -493,7 +496,7 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 
 ### 跑测试
 
-全套 **12 个测试文件、211 项断言**，一条命令：
+全套 **15 个测试文件、238 项断言**，一条命令：
 
 ```bash
 npm test
