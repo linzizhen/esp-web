@@ -958,9 +958,11 @@ static int build_frame(char *body, size_t cap, const char *request_id)
  * 注意：USB 串口输出不受影响，仍然每帧照常打印（保底通道）。 */
 static uint32_t s_consec_fail = 0;
 static int64_t  s_next_try_us  = 0;
+static int64_t  s_backoff_log_us = 0;   /* 上次输出「仍在退避」日志的时刻 */
 
 #define UPLOAD_FAIL_BACKOFF_AFTER 5       /* 连续失败几次后进入退避 */
 #define UPLOAD_BACKOFF_MS         10000   /* 退避期间每 10 秒重试一次 */
+#define UPLOAD_BACKOFF_LOG_MS     30000   /* 退避期间每 30 秒报一次「仍在退避」 */
 
 /* 构建并双通道发送一帧（USB 串口 + WiFi） */
 static void send_frame(const char *request_id)
@@ -984,18 +986,36 @@ static void send_frame(const char *request_id)
         }
         s_consec_fail = 0;
         s_next_try_us = 0;
+        s_backoff_log_us = 0;   /* 下次退避的日志间隔从零重算 */
         if (s_ok % 10 == 1) ESP_LOGI(TAG, "上传成功 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
     } else {
         s_fail++;
         s_consec_fail++;
-        if (s_consec_fail == UPLOAD_FAIL_BACKOFF_AFTER) {
+        /* ★ 必须用「跨过阈值」而不是「等于阈值」来判定进入退避。
+         * 原实现写 `s_consec_fail == UPLOAD_FAIL_BACKOFF_AFTER`：第 5 次失败时
+         * 进入退避（next_try_us = now+10s），但 10 秒后重试再次失败时计数变成 6，
+         * `== 5` 不再成立、`< 5` 也不成立 —— 两个分支都不进，next_try_us 从此
+         * 停留在过去，退避彻底失效：此后每一帧都尝试上传，每帧被 3 秒超时阻塞。
+         * 实测（2026-10-15，服务端关闭）：帧间隔恒为 3.017s、帧率 0.33 帧/秒
+         * （应为 ~10），即采样率掉到 1/30，且现场无任何日志提示。 */
+        if (s_consec_fail >= UPLOAD_FAIL_BACKOFF_AFTER) {
+            /* 每次失败都重算窗口，退避才真正持续生效 */
             s_next_try_us = now + (int64_t)UPLOAD_BACKOFF_MS * 1000;
-            ESP_LOGW(TAG, "★ WiFi 上传连续失败 %u 次，进入退避：每 %d 秒重试一次。"
-                          "请检查 APP_SERVER_HOST=%s:%d 是否可达、电脑防火墙是否放行。"
-                          "（USB 串口输出不受影响）",
-                     (unsigned)s_consec_fail, UPLOAD_BACKOFF_MS / 1000,
-                     APP_SERVER_HOST, APP_SERVER_PORT);
-        } else if (s_consec_fail < UPLOAD_FAIL_BACKOFF_AFTER) {
+            if (s_consec_fail == UPLOAD_FAIL_BACKOFF_AFTER) {
+                ESP_LOGW(TAG, "★ WiFi 上传连续失败 %u 次，进入退避：每 %d 秒重试一次。"
+                              "请检查 APP_SERVER_HOST=%s:%d 是否可达、电脑防火墙是否放行。"
+                              "（USB 串口输出不受影响）",
+                         (unsigned)s_consec_fail, UPLOAD_BACKOFF_MS / 1000,
+                         APP_SERVER_HOST, APP_SERVER_PORT);
+                s_backoff_log_us = now;
+            } else if (now - s_backoff_log_us >= (int64_t)UPLOAD_BACKOFF_LOG_MS * 1000) {
+                /* 退避期间按间隔报平安：否则现场只看到「板子不出数」，
+                 * 无法区分是退避中还是真的卡死。 */
+                s_backoff_log_us = now;
+                ESP_LOGW(TAG, "WiFi 上传仍在退避中（已连续失败 %u 次，每 %d 秒重试一次）",
+                         (unsigned)s_consec_fail, UPLOAD_BACKOFF_MS / 1000);
+            }
+        } else {
             ESP_LOGW(TAG, "上传失败 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
         }
     }
@@ -1399,10 +1419,23 @@ static void poll_task(void *arg)
                 ESP_LOGI(TAG, "WiFi 取到命令: %s", resp);
                 handle_command(resp);
             }
-        } else if (++fail_streak == 5) {
-            /* 只报一次，避免刷屏；但把排查线索给全 */
-            ESP_LOGW(TAG, "WiFi 取命令连续失败 %d 次 —— 检查 APP_SERVER_HOST=%s:%d 是否可达、"
-                          "电脑防火墙是否放行该端口", fail_streak, APP_SERVER_HOST, APP_SERVER_PORT);
+        } else {
+            fail_streak++;
+            /* 原实现写 `++fail_streak == 5`：只有恰好第 5 次会报，之后计数继续
+             * 增长却再也不打日志 —— 现场只能看到「板子收不到命令」却没有任何
+             * 后续提示。改为「跨过阈值时报一次 + 之后每 60 秒报一次」。 */
+            if (fail_streak == 5) {
+                ESP_LOGW(TAG, "WiFi 取命令连续失败 %d 次 —— 检查 APP_SERVER_HOST=%s:%d 是否可达、"
+                              "电脑防火墙是否放行该端口（已降频到每 5 秒重试）",
+                         fail_streak, APP_SERVER_HOST, APP_SERVER_PORT);
+                last_dbg = esp_timer_get_time() / 1000;
+            } else if (fail_streak > 5) {
+                int64_t nowms = esp_timer_get_time() / 1000;
+                if (nowms - last_dbg > 60000) {
+                    last_dbg = nowms;
+                    ESP_LOGW(TAG, "WiFi 取命令仍在失败（已连续 %d 次）", fail_streak);
+                }
+            }
         }
         int64_t now = esp_timer_get_time() / 1000;
         if (now - last_dbg > 60000) {         /* 每分钟一条心跳，便于确认通道活着 */
