@@ -129,6 +129,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── run-all.js            # ★ 全套测试编排器（npm test 入口，自动分配隔离端口）
     ├── .test-config.json     # 测试隔离配置夹具（autoDetect:false）—— 必须提交
     ├── .test-nl-config.json  # NL 测试夹具 —— 必须提交
+    ├── theme-contract-test.js # 前端主题变量契约：app.js 读取的 CSS 变量三套主题都要有（静态，0.1s）
     ├── acceptance-test.js    # 全链路验收：固件帧→落盘→页面→停采（隔离端口 8096）
     ├── e2e-test.js           # 链路自检：空状态 / 上报解析 / 停采保留 / 断开清空（E2E_PORT，默认 8080）
     ├── storage-test.js       # 持久化 + 查询 + 停采保留（隔离端口 8099）
@@ -487,7 +488,7 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 
 ### 跑测试
 
-全套 **11 个测试文件、205 项断言**，一条命令：
+全套 **12 个测试文件、211 项断言**，一条命令：
 
 ```bash
 npm test
@@ -503,7 +504,7 @@ npm test
 按分组跑：
 
 ```bash
-npm run test:unit          # 纯解析/格式化，无需硬件，快（parse + feature）
+npm run test:unit          # 纯静态/解析，无需硬件，快（theme + parse + feature）
 npm run test:integration   # 服务端链路（storage/p0/verify/ws/help/acceptance）
 npm run test:nl            # 第 4 周自然语言模块
 node test/run-all.js e2e   # 只跑端到端

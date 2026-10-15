@@ -1,8 +1,8 @@
 # 四周课程目标核对报告
 
 > 核对日期：2026-10-08　项目：ESP32-S3-EYE 三轴 IMU 监控平台（`imu-monitor`）
-> 核对方式：代码审查（server.js / 固件 main.c / 前端）+ 测试套件实跑（205 项断言全过）+ 实物验证记录
-> 测试现状：`nl-config 44 / nl 37 / help 26 / storage 19 / p0-dedup 14 / e2e 14 / feature 14 / acceptance 12 / parse 10 / ws 9 / verify 6` 全过（入口 `npm test`，编排器 `test/run-all.js`；`e2e` 由编排器注入 `E2E_PORT=8099` 走隔离模式）。
+> 核对方式：代码审查（server.js / 固件 main.c / 前端）+ 测试套件实跑（211 项断言全过）+ 实物验证记录
+> 测试现状：`nl-config 44 / nl 37 / help 26 / storage 19 / p0-dedup 14 / e2e 14 / feature 14 / acceptance 12 / parse 10 / ws 9 / verify 6 / theme 6` 全过（入口 `npm test`，编排器 `test/run-all.js`；`e2e` 由编排器注入 `E2E_PORT=8099` 走隔离模式）。
 
 ---
 
@@ -90,7 +90,7 @@ imu-monitor/
 
 ## 三、测试与文档覆盖
 
-- **测试**：11 个测试文件 205 项断言全过（含 `nl-test.js` 37、`nl-config-test.js` 44、`help-test.js` 26），入口 `npm test`（编排器 `test/run-all.js`）。`e2e` 由编排器注入 `E2E_PORT=8099` 走隔离模式。测试纪律见 §5.6（隔离实例防真实设备污染）。
+- **测试**：12 个测试文件 211 项断言全过（含 `nl-test.js` 37、`nl-config-test.js` 44、`help-test.js` 26、`theme-contract-test.js` 6），入口 `npm test`（编排器 `test/run-all.js`）。`e2e` 由编排器注入 `E2E_PORT=8099` 走隔离模式。测试纪律见 §5.6（隔离实例防真实设备污染）。
 - **文档**：`week2-remote-collect.md`、`week3-button-feedback.md`、`week4-nl-assistant.md`、`week4-test-guide.md` + 截图。
 
 ---
