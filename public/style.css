@@ -84,6 +84,9 @@
   --chart-axis-x:      #c8442a;
   --chart-axis-y:      #1f7a6b;
   --chart-axis-z:      #3d5aa0;
+  /* 等待带：设备未上报的区间底色与提示文字（浅色底上用低饱和暖色） */
+  --chart-wait-band:   rgba(255, 176, 32, .07);
+  --chart-wait-text:   #b8860b;
 }
 
 /* ---------------- 设计 token：深色（跟随系统） ---------------- */
@@ -133,6 +136,9 @@
     --chart-axis-x:      #e2685a;
     --chart-axis-y:      #3fa894;
     --chart-axis-z:      #7d94d6;
+    /* 等待带：深色底上提高一点透明度才看得出来，文字用深色主题的 warn 色 */
+    --chart-wait-band:   rgba(255, 176, 32, .10);
+    --chart-wait-text:   #d9a441;
   }
 }
 
@@ -182,6 +188,9 @@
   --chart-axis-x:      #e2685a;
   --chart-axis-y:      #3fa894;
   --chart-axis-z:      #7d94d6;
+  /* 等待带：深色底上提高一点透明度才看得出来，文字用深色主题的 warn 色 */
+  --chart-wait-band:   rgba(255, 176, 32, .10);
+  --chart-wait-text:   #d9a441;
 }
 
 /* ---------------- 基础 ---------------- */

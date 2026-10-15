@@ -30,6 +30,7 @@ const TEST = (...p) => path.join(__dirname, ...p);
 // 端口占用现状：8093 feature / 8094 parse / 8095 verify+nl-config
 //              8096 acceptance / 8097 help+p0 / 8098 ws+nl / 8099 storage+e2e
 const SUITES = [
+  { name: 'theme',        file: 'theme-contract-test.js', kind: 'unit' },
   { name: 'parse',        file: 'parse-test.js',       kind: 'unit' },
   { name: 'feature',      file: 'feature-test.js',     kind: 'unit' },
   { name: 'storage',      file: 'storage-test.js',     kind: 'integration' },
