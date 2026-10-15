@@ -28,3 +28,17 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# ---- 摄像头 JPEG 帧缓冲：必须显式给足，不能按 QVGA 自动算 ----
+# esp32-camera 在 cam_config() 里按【初始化时的分辨率】算缓冲：
+#   AUTO 模式 → recv_size = width * height / 5 = 320*240/5 = 15360 字节
+# 而运行时 set_framesize() 只改传感器寄存器，**不会重新分配缓冲**。
+# 后果（2026-10-15 实测）：切到 400x296 后帧率从 6.7 掉到 1.7 帧/秒，
+# 切到 640x480 直接卡死（JPEG 约 13.9KB 逼近 15360 上限，esp_camera_fb_get
+# 反复失败，且 streaming 状态仍为 true，界面不报错）。
+#
+# 这里改为 CUSTOM 并给到 64KB：足以容纳本项目允许的最高分辨率（SVGA 800x600
+# 实测 JPEG 约 15KB，留 4 倍余量），且 fb_count=2 双缓冲下 PSRAM 占用仅 128KB
+# （板载 8MB Octal PSRAM，完全充裕）。
+CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_CUSTOM=y
+CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE=65536

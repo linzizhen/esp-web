@@ -33,6 +33,7 @@ const SUITES = [
   { name: 'theme',        file: 'theme-contract-test.js', kind: 'unit' },
   { name: 'isolation',    file: 'isolation-contract-test.js', kind: 'unit' },
   { name: 'help-ui',      file: 'help-history-ui-test.js', kind: 'unit' },
+  { name: 'cam-config',   file: 'cam-config-contract-test.js', kind: 'unit' },
   { name: 'parse',        file: 'parse-test.js',       kind: 'unit' },
   { name: 'feature',      file: 'feature-test.js',     kind: 'unit' },
   { name: 'storage',      file: 'storage-test.js',     kind: 'integration' },

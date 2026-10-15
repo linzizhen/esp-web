@@ -49,9 +49,8 @@ const els = {
   camView: $('camView'), camPlaceholder: $('camPlaceholder'), camTag: $('camTag'),
   camStats: $('camStats'), camNote: $('camNote'),
   btnCamStart: $('btnCamStart'), btnCamStop: $('btnCamStop'), btnCamShot: $('btnCamShot'),
-  btnCamApply: $('btnCamApply'), camSize: $('camSize'), camQuality: $('camQuality'), camFps: $('camFps'),
   camShot: $('camShot'), camShotTag: $('camShotTag'), camShotPlaceholder: $('camShotPlaceholder'),
-  camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'), camShotSize: $('camShotSize'),
+  camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
   helpHistory: $('helpHistory'), helpHistoryCount: $('helpHistoryCount'),
@@ -1136,13 +1135,16 @@ async function camControl(action) {
   if (!els.camNote) return;
   els.camNote.textContent = action === 'start' ? '正在下发「开启画面」命令…' : '正在下发「停止」命令…';
   try {
+    /* 参数由固件默认值决定，前端不传 —— 用户点一次即可，无需理解取舍。 */
     const d = await (await fetch('/api/cam', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action }),
     })).json();
     els.camNote.textContent = d.ok
-      ? (action === 'start' ? '命令已送达板端，等待第一帧…' : '已下发停止命令。')
+      ? (action === 'start'
+          ? `命令已送达板端，等待第一帧…（320x240 · 画质 ${CAM_LIVE_QUALITY} · 目标 ${CAM_LIVE_FPS} 帧/秒）`
+          : '已下发停止命令。')
       : '⚠ ' + (d.note || '命令通道不可用，板端不会开始推流。');
     await loadCam();
   } catch (e) {
@@ -1168,6 +1170,18 @@ async function loadCam() {
     resolveShotPending();
   } catch (_) { /* 网络抖动忽略 */ }
 }
+
+/* 摄像头参数固定为实测最优点（2026-10-15 实测，WiFi 上行）：
+ *   分辨率/画质/帧率争夺同一条链路带宽（实测上限约 500 kbps），无法同时最大化：
+ *     240x240 → 6.3 帧/秒（单帧 7.4KB）
+ *     320x240 → 6.7 帧/秒（单帧 9.3KB）  ★ 最优点
+ *     400x296 → 1.7 帧/秒（单帧 13.9KB，带宽崩溃）
+ *     640x480 → 0   帧/秒（帧缓冲不足，彻底卡死）
+ *   帧率档位原本也不生效：选 15fps 实测仅 3.9 帧/秒（由链路带宽决定）。
+ * 因此不再让用户配置，固定为最优点；抓拍仍用高分辨率（单张，慢一点可接受）。 */
+const CAM_LIVE_QUALITY   = 12;   // 实测清晰度/带宽平衡点（直播档）
+const CAM_LIVE_FPS       = 10;   // 实测上限约 6.7，设 10 交由链路决定
+const CAM_SHOT_FRAMESIZE = 10;   // 640x480 VGA（抓拍单张，慢一点可接受）
 
 /* 抓拍是异步的：下发命令后要等板端抓完、编码、经链路回传。
  * 这里用「snapshotAt 是否变化」作为唯一判据 —— 变化了才算真拿到新帧，
@@ -1262,7 +1276,7 @@ if (els.btnCamShot) els.btnCamShot.onclick = async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action: 'shot',
-        framesize: Number(els.camShotSize ? els.camShotSize.value : 10),
+        framesize: CAM_SHOT_FRAMESIZE,
       }),
     })).json();
     if (!d.ok) {
@@ -1290,28 +1304,10 @@ if (els.btnCamShot) els.btnCamShot.onclick = async () => {
   }
 };
 
-if (els.btnCamApply) els.btnCamApply.onclick = async () => {
-  if (els.camNote) els.camNote.textContent = '正在下发摄像头参数…';
-  try {
-    const d = await (await fetch('/api/cam', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'set',
-        framesize: Number(els.camSize.value),
-        quality:   Number(els.camQuality.value),
-        fps:       Number(els.camFps.value),
-      }),
-    })).json();
-    if (els.camNote) {
-      els.camNote.textContent = d.ok
-        ? '参数已下发到板端（画面会在下一帧生效）'
-        : '⚠ ' + (d.note || '命令通道不可用，参数未送达板端。');
-    }
-  } catch (e) {
-    if (els.camNote) els.camNote.textContent = '下发失败：' + e.message;
-  }
-};
+/* 固定参数不再需要前端下发：固件默认值（cam_stream.c 的 CAM_DEF_FRAMESIZE /
+ * CAM_DEF_QUALITY 与 main.c 的 s_cam_fps）就是实测最优配置，是唯一真源。
+ * 前端只发 start/stop/shot，不再传任何参数 —— 避免两处配置漂移。
+ * 需要临时试别的档位时用 curl 调 /api/cam 的 set（服务端保留该调试路径）。 */
 
 // 停在摄像头页时定时刷新状态（画面本身由 MJPEG 推送，无需轮询）
 setInterval(() => { if (S.page === 'cam') loadCam(); }, 3000);

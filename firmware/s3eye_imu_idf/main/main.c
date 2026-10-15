@@ -1089,7 +1089,7 @@ static void cmd_collect_once(const char *request_id)
  * 服务端与网页都能直接复用，代价是 33% 体积开销。
  * ------------------------------------------------------------------ */
 static volatile bool s_cam_on  = false;
-static int           s_cam_fps = 5;      /* 目标帧率，实际受链路带宽限制 */
+static int           s_cam_fps = 10;     /* 目标帧率；实际受链路带宽限制（实测上限约 6.7 帧/秒） */
 static uint32_t      s_cam_seq = 0;
 static uint32_t      s_cam_sent = 0, s_cam_drop = 0;
 

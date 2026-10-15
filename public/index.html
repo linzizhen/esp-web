@@ -283,51 +283,21 @@
             <button id="btnCamStop"  class="btn btn-ghost" disabled>停止</button>
             <button id="btnCamShot"  class="btn btn-ghost">抓拍一帧</button>
           </div>
+          <!-- 摄像头参数固定为实测最优点，不再让用户选择。
+               实测（2026-10-15，WiFi 上行）：分辨率/画质/帧率争夺同一条链路带宽
+               （实测上限约 500 kbps），三者无法同时最大化：
+                   240x240 → 6.3 帧/秒（单帧 7.4KB）
+                   320x240 → 6.7 帧/秒（单帧 9.3KB）  ★ 最优点
+                   400x296 → 1.7 帧/秒（单帧 13.9KB，带宽崩溃）
+                   640x480 → 0   帧/秒（帧缓冲不足，彻底卡死）
+               帧率档位原本也不生效：选 15fps 实测仅 3.9 帧/秒。
+               故固定 320x240 + 画质12 + 10fps，移除全部选择项。 -->
           <div class="cam-controls">
-            <label>直播分辨率
-              <select id="camSize">
-                <option value="5">240x240</option>
-                <option value="6" selected>320x240（QVGA）</option>
-                <option value="8">400x296</option>
-                <option value="9">480x320</option>
-                <option value="10">640x480（VGA）</option>
-                <option value="11">800x600</option>
-                <option value="12">1024x768</option>
-              </select>
-            </label>
-            <label>画质
-              <select id="camQuality">
-                <option value="8">高（更清晰、更大）</option>
-                <option value="12" selected>中</option>
-                <option value="20">低（更省带宽）</option>
-                <option value="30">很低</option>
-              </select>
-            </label>
-            <label>帧率
-              <select id="camFps">
-                <option value="2">2 fps</option>
-                <option value="5" selected>5 fps</option>
-                <option value="10">10 fps</option>
-                <option value="15">15 fps</option>
-              </select>
-            </label>
-            <!-- 抓拍分辨率上限说明（2026-09-28 实测）：
-                 帧缓冲在摄像头初始化时按 QVGA 算死 —— esp32-camera 的 cam_config()
-                 里 fb_size = width*height/5 = 320*240/5 = 15360 字节，且只在 init 时
-                 分配一次；运行时 set_framesize() 只改传感器寄存器，不重分配缓冲。
-                 因此 JPEG 超过 15360 字节的分辨率，esp_camera_fb_get() 必然失败：
-                     640x480 → 10.4KB  OK（3/3）
-                     800x600 → 15.2KB  OK（3/3，但只剩 119 字节余量，已接近上限）
-                     1024x768 / 1600x1200 → 0/3，帧超限，抓不到
-                 故只提供到 800x600。详见 ASSIGNMENT.md §11.8 -->
-            <label>抓拍分辨率
-              <select id="camShotSize">
-                <option value="8">400x296</option>
-                <option value="10" selected>640x480（VGA，最稳）</option>
-                <option value="11">800x600（上限）</option>
-              </select>
-            </label>
-            <button id="btnCamApply" class="btn btn-ghost">应用参数</button>
+            <span class="ctrl-note">
+              画面参数已固定为实测最优点：<b>320x240 · 画质 12 · 10 帧/秒</b>（约 6~7 帧/秒，
+              WiFi 上行链路带宽上限约 500 kbps）。<br>
+              需要高清单张时用下方「抓拍一帧」（640x480）。
+            </span>
           </div>
           <div id="camNote" class="ctrl-note"></div>
         </section>
@@ -529,6 +499,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=30"></script>
+<script src="/app.js?v=31"></script>
 </body>
 </html>
