@@ -130,6 +130,11 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── .test-config.json     # 测试隔离配置夹具（autoDetect:false）—— 必须提交
     ├── .test-nl-config.json  # NL 测试夹具 —— 必须提交
     ├── theme-contract-test.js # 前端主题变量契约：app.js 读取的 CSS 变量三套主题都要有（静态，0.1s）
+    ├── serial-forensics.js   # 硬件在环：被动串口取证（复位/崩溃特征，只读）
+    ├── backoff-hil.js        # 硬件在环：退避行为回归（需先停服务端）
+    ├── firmware-backoff-test.js # 硬件在环：帧率与重启检查（需服务端在跑）
+    ├── upload-block-forensics.js # 硬件在环：上传阻塞对帧率的影响量化
+    ├── cam-repro.js          # 硬件在环：摄像头推流复现（含重启检测）
     ├── acceptance-test.js    # 全链路验收：固件帧→落盘→页面→停采（隔离端口 8096）
     ├── e2e-test.js           # 链路自检：空状态 / 上报解析 / 停采保留 / 断开清空（E2E_PORT，默认 8080）
     ├── storage-test.js       # 持久化 + 查询 + 停采保留（隔离端口 8099）
@@ -513,6 +518,21 @@ node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在�
 
 当前端口分配（改端口时注意别撞车）：`8093` feature ｜ `8094` parse ｜ `8095` verify+nl-config
 ｜ `8096` acceptance ｜ `8097` help+p0 ｜ `8098` ws+nl ｜ `8099` storage+e2e ｜ `8080` 生产实例。
+
+### 硬件在环取证（排查固件行为时用）
+
+下列脚本需要**真实开发板**，因此不并入 `npm test`（否则在没插板子的机器上必然失败）：
+
+| 命令 | 用途 |
+|---|---|
+| `npm run forensics:serial` | 被动监听串口（只读、不发任何字节），高亮 `rst:0x` / `Guru Meditation` / `stack overflow` / `Brownout` 等复位与崩溃特征，并给出事件时间线 |
+| `npm run forensics:upload` | 统计帧间隔分布，量化「上传阻塞」对帧率的影响（间隔 ≈3.0s 即撞上 `http_post` 的 `timeout_ms`） |
+| `npm run forensics:cam` | 摄像头推流复现：检测 seq 归零（板子重启）并对比推流前后帧率 |
+| `npm run test:firmware` | 板子在线时的帧率与重启检查（需服务端在跑） |
+| `npm run test:backoff` | **退避行为回归测试**：先停服务端制造「不可达」，测板子是否按 10s 间隔退避而非每帧阻塞。判据用**中位帧间隔**（退避生效 ≈0.1s；失效 ≈3.0s） |
+
+> `test:backoff` 会要求服务端**处于停止状态**（否则串口被独占、且上传成功不会触发退避），
+> 且含 40s 预热 + 30s 采样，约需 80 秒。改固件退避逻辑后务必跑它。
 
 ### 跑代码审计
 
