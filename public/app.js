@@ -54,6 +54,7 @@ const els = {
   camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'), camShotSize: $('camShotSize'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
+  helpHistory: $('helpHistory'), helpHistoryCount: $('helpHistoryCount'),
 
   // 自然语言助手（第 4 周）
   nlEngine: $('nlEngine'), nlCap: $('nlCap'), nlChat: $('nlChat'),
@@ -1075,6 +1076,40 @@ function renderHelp(h) {
           回应命令已写出串口：${yes(d.ack_channel_ok)}　板端回执已显示「对方已收到」：${yes(d.ack_delivered)}
           ${d.mockDevice ? '<br><span class="obs-check no">⚠ 当前为模拟模式，未走真实串口</span>' : ''}
         </div>`;
+    }
+  }
+
+  // 历史求助事件（来自服务端落盘文件，重启不丢）
+  if (els.helpHistory) {
+    const hist = Array.isArray(d.history) ? d.history : [];
+    if (els.helpHistoryCount) {
+      els.helpHistoryCount.textContent = hist.length ? `${hist.length} 条` : '—';
+    }
+    if (!hist.length) {
+      els.helpHistory.innerHTML = '<div class="obs-empty">尚无历史事件。</div>';
+    } else {
+      // 事件名 → 中文说明（与 server.js helpLog 的 ev 取值一一对应）
+      const EV_TEXT = {
+        received: '板端上报求助 · 服务端已接收',
+        cancelled: '板端取消求助',
+        ack_sent: '查看者回应已下发',
+        ack_mock: '模拟模式回应（未走真实通道）',
+        ack_failed: '回应未送达设备',
+        cancel_sent: '查看者取消已下发',
+        ack_delivered: '板端回执 · 屏幕已显示「对方已收到」',
+        ack_rejected: '板端拒绝回应（无进行中求助）',
+        cancel_delivered: '板端确认取消',
+        reset: '手动复位',
+      };
+      // 倒序：最新的在最上面，便于一眼看到最近发生了什么
+      const rows = hist.slice().reverse().map((e) => {
+        const t = e.at ? fmtClock(e.at) : '—';
+        const label = EV_TEXT[e.ev] || e.ev || '未知事件';
+        const id = e.help_id ? ` · <code>${escHtml(e.help_id)}</code>` : '';
+        const dev = e.device_id ? ` · ${escHtml(e.device_id)}` : '';
+        return `<li><span class="st-time">${t}</span>${escHtml(label)}${id}${dev}</li>`;
+      });
+      els.helpHistory.innerHTML = `<ol class="steps">${rows.join('')}</ol>`;
     }
   }
 

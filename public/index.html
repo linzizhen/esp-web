@@ -236,6 +236,19 @@
           <div id="helpNote" class="ctrl-note"></div>
         </section>
 
+        <!-- 历史求助事件（落盘留证） -->
+        <section class="card">
+          <div class="card-head">
+            <h2>历史求助事件</h2>
+            <span id="helpHistoryCount" class="mono req-id">—</span>
+          </div>
+          <div id="helpHistory" class="obs-empty">尚无历史事件。</div>
+          <p class="hint">
+            事件已写入服务端 <code>data/help.ndjson</code>（只追加不删），<b>服务重启后仍可追溯</b>。
+            这里显示最近 20 条；盘上保留全部。
+          </p>
+        </section>
+
         <!-- 证据链 -->
         <section class="card">
           <div class="card-head"><h2>证据链（本地 → 远端 → 回应）</h2></div>
@@ -516,6 +529,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=29"></script>
+<script src="/app.js?v=30"></script>
 </body>
 </html>

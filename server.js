@@ -28,6 +28,9 @@ const CONFIG_PATH = process.env.CONFIG_PATH || path.join(ROOT, 'config.json');
 const RECORD_DIR = path.join(ROOT, 'recordings');
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const RECORDS_FILE = path.join(DATA_DIR, 'records.ndjson');
+/* 求助事件单独落盘：低频事件（每次求助约 5 条），与高频采样语义不同，
+ * 混进 records.ndjson 会弄脏采样文件的语义、也让求助查询变慢。 */
+const HELP_FILE = path.join(DATA_DIR, 'help.ndjson');
 
 // 设备身份元数据键：出现在数据帧里、但不作为传感器数值展示
 const META_KEYS = new Set(['device', 'mac', 'src', 'ver', 'ver_', 'fw', 'id',
@@ -577,9 +580,51 @@ function publicHelp() {
 
 function pushHelp() { broadcast({ type: 'help', help: publicHelp() }); }
 
+/* 求助事件落盘：NDJSON，一行一事件，只追加不滚动（低频，一年也不大）。
+ * 失败只记日志、不抛出 —— 存储是旁路，绝不能因写盘失败中断求助闭环。 */
+function appendHelpEvent(entry) {
+  if (!config.storageEnabled) return;
+  try {
+    ensureDataDir();
+    fs.appendFileSync(HELP_FILE, JSON.stringify(entry) + '\n', 'utf8');
+  } catch (e) {
+    console.error('[help] 事件落盘失败：', e.message);
+  }
+}
+
+/** 启动时回读历史求助事件，恢复 help.history（服务重启不再丢失证据） */
+function loadHelpHistory() {
+  if (!config.storageEnabled || !fs.existsSync(HELP_FILE)) return;
+  try {
+    const lines = fs.readFileSync(HELP_FILE, 'utf8').split('\n');
+    const all = [];
+    for (const ln of lines) {
+      const s = ln.trim();
+      if (!s) continue;
+      try { all.push(JSON.parse(s)); } catch (_) { /* 跳过坏行 */ }
+    }
+    // 只保留最近 HELP_KEEP 条进内存；磁盘上仍是全量，不受此限制
+    help.history = all.slice(-HELP_KEEP);
+    if (help.history.length) {
+      console.log(`[help] 已从 ${path.basename(HELP_FILE)} 恢复 ${help.history.length} 条历史事件（盘上共 ${all.length} 条）`);
+    }
+  } catch (e) {
+    console.error('[help] 历史回读失败：', e.message);
+  }
+}
+
 function helpLog(ev, detail) {
-  help.history.push({ at: Date.now(), ev, detail: detail || null });
+  const entry = {
+    at: Date.now(),
+    ev,
+    detail: detail || null,
+    // 证据字段：便于事后追溯「哪台设备、哪次求助」
+    help_id: help.help_id || null,
+    device_id: help.device_id || state.deviceId || null,
+  };
+  help.history.push(entry);
   if (help.history.length > HELP_KEEP) help.history.shift();
+  appendHelpEvent(entry);
 }
 
 /** 板端上报的求助事件（request / cancel）—— 这是「远端接收」的唯一证据来源 */
@@ -2818,6 +2863,7 @@ server.listen(config.httpPort, config.host, () => {
   console.log(`  监听: ${config.host}:${config.httpPort}   串口波特率: ${config.baudRate}   自动识别: ${config.autoDetect}`);
   console.log('  说明: 未连接真实开发板时不显示任何数据（无模拟数据）');
   console.log('==========================================================');
+  loadHelpHistory();   // 回读历史求助事件（重启不丢证据）
   if (config.autoDetect || config.portPath) startScanning();
 });
 

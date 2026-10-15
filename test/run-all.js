@@ -27,10 +27,12 @@ const fs = require('node:fs');
 const ROOT = path.join(__dirname, '..');
 const TEST = (...p) => path.join(__dirname, ...p);
 
-// 端口占用现状：8093 feature / 8094 parse / 8095 verify+nl-config
+// 端口占用现状：8092 help-persist / 8093 feature / 8094 parse / 8095 verify+nl-config
 //              8096 acceptance / 8097 help+p0 / 8098 ws+nl / 8099 storage+e2e
 const SUITES = [
   { name: 'theme',        file: 'theme-contract-test.js', kind: 'unit' },
+  { name: 'isolation',    file: 'isolation-contract-test.js', kind: 'unit' },
+  { name: 'help-ui',      file: 'help-history-ui-test.js', kind: 'unit' },
   { name: 'parse',        file: 'parse-test.js',       kind: 'unit' },
   { name: 'feature',      file: 'feature-test.js',     kind: 'unit' },
   { name: 'storage',      file: 'storage-test.js',     kind: 'integration' },
@@ -38,6 +40,7 @@ const SUITES = [
   { name: 'verify',       file: 'verify-test.js',      kind: 'integration' },
   { name: 'ws',           file: 'ws-test.js',          kind: 'integration' },
   { name: 'help',         file: 'help-test.js',        kind: 'integration' },
+  { name: 'help-persist', file: 'help-persist-test.js', kind: 'integration' },
   { name: 'acceptance',   file: 'acceptance-test.js',  kind: 'integration' },
   { name: 'nl',           file: 'nl-test.js',          kind: 'integration' },
   { name: 'nl-config',    file: 'nl-config-test.js',   kind: 'integration' },
