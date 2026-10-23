@@ -157,11 +157,28 @@ HOST=0.0.0.0 PORT=8080 npm start
 
 ## 5. 部署入口
 
+> ### ⚠ 部署状态：**VPS 待补**
+>
+> 本组暂无分配的 VPS 空间，**当前按课程「备用路径」以本机作为服务器部署**
+> （板子经局域网 WiFi 上报，`transport=wifi` 已验证）。
+>
+> 按课程要求「VPS 故障可在本地服务定位，**明确部署待补**」，此处如实声明：
+> **VPS 部署尚未完成，属待补项。**
+>
+> 部署方案已**完整就绪**，拿到 VPS 后照 `docs/vps-deploy.md` 执行即可上线：
+> - `config.vps.json` —— VPS 专用配置（关闭串口自动探测）
+> - `scripts/deploy-vps.ps1` —— 一键部署（安装依赖 + 注册开机自启 + 防火墙放行 + 探活）
+> - `docs/vps-deploy.md` —— 完整手册（含 Windows Server 的编译环境坑与排查表）
+>
+> 上述脚本已在 Windows 上验证：`-Status` 分支可正常执行；
+> `config.vps.json` 实测启动后 `portOpen=false`、WiFi 上行 `transport=wifi` 可用。
+
 | 场景 | 做法 |
 |---|---|
 | 本机演示 | `npm start`，浏览器开 `http://localhost:8080` |
-| 局域网/ VPS | `HOST=0.0.0.0 PORT=8080 npm start`（或改 `config.json` 的 `host`/`httpPort`），防火墙放行对应端口 |
-| 板端指向 | 改 `firmware/s3eye_imu_idf/main/app_config.h` 里的 `APP_SERVER_HOST` / `APP_SERVER_PORT` 为服务端 IP |
+| 局域网 | `HOST=0.0.0.0 PORT=8080 npm start`（或改 `config.json` 的 `host`/`httpPort`），防火墙放行对应端口 |
+| **VPS（待补）** | `.\scripts\deploy-vps.ps1` —— 见 `docs/vps-deploy.md`；用 `config.vps.json` 作配置 |
+| 板端指向 | 改 `firmware/s3eye_imu_idf/main/app_config.local.h` 里的 `APP_SERVER_HOST` / `APP_SERVER_PORT` 为服务端 IP |
 | 各组独立空间 | 改 `DEVICE_ID`（如 `S3EYE-GROUP01`），落盘记录按 `device_id` 区分，互不混淆 |
 | 本组身份校验 | 服务端 `config.json` 的 `expectedDeviceId` 设为同一 `DEVICE_ID`；前端状态条实时显示「✓ 本组设备 / ⚠ 非本组设备」，可当场证明数据来自本组设备、页面未写死数值 |
 

@@ -23,6 +23,8 @@ recordings/*.csv
 _*.log
 _idf*.log
 server.log
+# VPS 部署脚本创建的运行时日志目录（deploy-vps.ps1 会把 stdout/stderr 追加进去）
+logs/
 # 注意：test/.test-config.json 与 test/.test-nl-config.json 是测试夹具（无敏感
 # 信息，被 acceptance/e2e/verify/help/storage/ws/nl/nl-config 等测试引用），必须纳入
 # 版本控制 —— 否则 clone 后各测试会退回到默认配置（autoDetect=true），连上真实板子
