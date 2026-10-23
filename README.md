@@ -15,6 +15,19 @@ npm start          # 等价于 node server.js
 
 启动后浏览器访问 <http://localhost:8080>
 
+> **部署到 VPS（可选）**：本项目是单进程 Node.js 服务，无数据库、无构建步骤。
+> Windows Server 上可一键部署为开机自启服务：
+>
+> ```powershell
+> .\scripts\deploy-vps.ps1          # 装依赖 + 注册计划任务 + 防火墙 + 探活
+> .\scripts\deploy-vps.ps1 -Status  # 查状态
+> .\scripts\deploy-vps.ps1 -Uninstall
+> ```
+>
+> 使用 `config.vps.json`（已关闭串口自动探测 —— VPS 上没有开发板）。
+> 完整手册见 [`docs/vps-deploy.md`](docs/vps-deploy.md)。
+> **当前状态：VPS 待补**（本组暂无分配的 VPS，按课程备用路径以本机作服务器）。
+
 ### 2. 烧录固件到 ESP32-S3-EYE
 
 本项目当前使用 **ESP-IDF 工程** `firmware/s3eye_imu_idf/`（Arduino 草稿为早期版本，已不用）。
@@ -91,10 +104,12 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 ├── scripts/
 │   ├── idfwrap.py            # ESP-IDF 构建/烧录封装（自动注入工具链环境）
 │   ├── set_wifi.py           # 一键切换板端 WiFi 配置（自动检测本机 IP，写入 gitignore 的本地文件）
+│   ├── deploy-vps.ps1        # Windows Server VPS 一键部署（开机自启任务 + 防火墙 + 探活）
 │   ├── audit-unused.js       # 代码审计：未使用的函数/常量、空 catch、注释掉的死代码（只读）
 │   ├── audit-api.js          # 代码审计：前后端接口交叉核对，找潜在 404（只读）
 │   └── audit-dup.js          # 代码审计：重复函数体 / ≥85% 相似函数（只读）
 ├── docs/
+│   ├── vps-deploy.md         # VPS 部署手册（Windows Server，含编译环境坑与排查表）
 │   ├── week2-remote-collect.md  # 第 2 周：远程采集协议、状态图、时序图、实测记录
 │   ├── week3-button-feedback.md # 第 3 周：按键触发与物理反馈闭环（协议/状态图/时序图/实测）
 │   ├── week4-nl-assistant.md    # 第 4 周：自然语言查询与请求采集（受限工具 + 诚实性回复）
