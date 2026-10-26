@@ -50,7 +50,7 @@ NL 功能的测试断言若与 NL 代码分开提交，中间态会红。
 ### 3. 功能完成，合回 develop
 
 ```bash
-npm test                                  # 全量 16 个文件 248 项断言，必须全绿
+npm test                                  # 全量 19 个文件 380 项断言，必须全绿
 git checkout develop
 git merge --no-ff feature/llm-多轮对话     # --no-ff 保留分支拓扑，便于回溯
 git push origin develop
@@ -144,9 +144,18 @@ git commit -F .git-msg.tmp
 ### 测试夹具的行尾会漂移
 
 `test/.test-config.json` 与 `test/.test-nl-config.json` 被测试写入后会显示
-为「已修改」，但 `git diff` 内容为空（仅行尾变化）。直接
-`git checkout -- test/.test-config.json test/.test-nl-config.json` 还原即可，
-**不要**把它们加进提交。
+为「已修改」，但 `git diff` 内容为空（仅行尾变化），`git diff --raw` /
+`--numstat` 也都是空——这不是内容改动，是索引里的 stat 信息过期。
+
+实测有效的处理：
+
+```bash
+git add test/.test-config.json test/.test-nl-config.json
+git status --short          # 两行 M 消失
+```
+
+因为内容哈希没变，`git add` 只刷新 stat 信息，**不会**产生任何暂存差异，
+可以放心执行。`git update-index --refresh` 对这种情况无效，别白试。
 
 ### 绝不可提交的内容
 
@@ -199,9 +208,14 @@ git blame <file>
 ## 六、当前仓库状态
 
 - 长期分支：`master`（稳定版）、`develop`（集成）
-- `develop` 领先 `master` 20 个提交，尚未合并发布
-- 测试：`npm test` → 16 个测试文件、248 项断言
+- `develop` 领先 `master` 32 个提交，尚未合并发布
+- 测试：`npm test` → 19 个测试文件、380 项断言
 - 只读审计：`npm run audit`
+
+**分支现状说明**：截至 2026-10-26，`develop` 上的 32 个提交都是**直接提交**，
+没有走 `feature/*`。原因是这批改动是在分支模型确立之前就已在工作区堆好的
+存量，只能先按主题拆成原子提交补记历史。**从此往后的新功能一律走
+`feature/*`**，见第二节第 1 步。
 
 **下一步建议**：验证一段时间后，按第二节第 4 步把 `develop` 合并到
 `master` 并打 `v1.0.0` 标签。
