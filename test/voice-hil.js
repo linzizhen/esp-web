@@ -54,6 +54,50 @@ function req(method, path, body) {
   });
 }
 
+/* 读 /api/state 的 raw 环形缓冲，找某个 request_id 的板端回执状态。
+ *
+ * 为什么必须看回执：POST /api/voice/record 的 ok=true 只表示「命令已写进串口」，
+ * 不代表板端接受。固件 voice_record_toggle() 在 s_uploading 为真时直接 return false
+ * （"正在上传上次录音，本次按键忽略"），此时服务端照样回 ok=true。
+ * 实测（2026-10-26）：stop 后 200ms 内再 start，板端回 status:"busy"，
+ * 服务端仍报 accepted=true —— 若不核对回执，测试会以为在录音，
+ * 实际板端什么都没做，最后表现为「没等到新录音」的假失败。
+ *
+ * raw 里的元素是 {ts, text, ok} 对象，text 才是串口原文，且 ack 行在 text 里
+ * 是转义过的 JSON，所以这里对序列化后的整行做宽松匹配。 */
+async function waitAck(rid, timeoutMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const st = await req('GET', '/api/state');
+    const raw = ((st.json && st.json.raw) || [])
+      .map((x) => (typeof x === 'string' ? x : JSON.stringify(x)));
+    for (const line of raw) {
+      if (!line.includes(String(rid))) continue;
+      const m = /status\\?":\\?"([a-z_]+)\\?"/.exec(line);
+      if (m) return m[1];
+    }
+    await sleep(150);
+  }
+  return null;   // 没回执：板端可能没收到（通道问题），也可能 raw 缓冲已被冲掉
+}
+
+/* 发一次录音命令并核对板端回执；板端 busy（上一轮还在上传）时退避重试。
+ * 返回 { ok, ack, attempts }。ack 为 null 表示没抓到回执（不当作失败，
+ * 因为 raw 是 60 行环形缓冲，上传期间会被采样帧迅速冲掉）。 */
+async function sendRecordCommand(action, { tries = 6, gapMs = 1200 } = {}) {
+  let ack = null;
+  for (let i = 1; i <= tries; i++) {
+    const r = await req('POST', '/api/voice/record', { action });
+    const rid = r.json && r.json.request_id;
+    if (!r.json || !r.json.ok) return { ok: false, ack: null, attempts: i, resp: r.json };
+    ack = await waitAck(rid, 2500);
+    if (ack !== 'busy') return { ok: true, ack, attempts: i, resp: r.json };
+    console.log(`    · 板端还在上传上一段录音（ack=busy），${gapMs}ms 后重试 ${i}/${tries}`);
+    await sleep(gapMs);
+  }
+  return { ok: false, ack: 'busy', attempts: tries };
+}
+
 /* 把 WAV 的 data 段解码成 16bit 采样，算峰值 / RMS，与服务端算法独立实现，
  * 避免「服务端自己算自己报」的自证循环。 */
 function analyzeWav(buf) {
@@ -130,15 +174,13 @@ function analyzeWav(buf) {
 
   /* ---------- ① 真实录音：开始 → 发声 → 结束 ---------- */
   console.log('\n— ① 真机录音（板端 MEMS 麦克风 → WAV → 上传）—');
-  const before = await req('GET', '/api/voice');
-  const beforeTotal = (before.json && before.json.audio_total) || 0;
   const beforeId = (vs0.json && vs0.json.audio_id) || null;
 
-  const startR = await req('POST', '/api/voice/record', { action: 'start' });
-  ok(startR.json && startR.json.ok, '开始录音命令已下发',
-    startR.json ? `channel=${startR.json.channel}` : `HTTP ${startR.status}`);
-  if (!startR.json || !startR.json.ok) {
-    skipped('录音断言', '命令通道不可用：' + (startR.json && startR.json.note));
+  const startR = await sendRecordCommand('start');
+  ok(startR.ok, '开始录音命令已下发并被板端接受',
+    startR.ok ? `ack=${startR.ack || '(未捕获)'} 第 ${startR.attempts} 次` : '板端一直回 busy');
+  if (!startR.ok) {
+    skipped('录音断言', '板端持续忙（上一轮上传未结束），本次无法验证录音');
     summary();
     return;
   }
@@ -154,17 +196,41 @@ function analyzeWav(buf) {
   const stopR = await req('POST', '/api/voice/record', { action: 'stop' });
   ok(stopR.json && stopR.json.ok, '结束录音命令已下发');
 
-  // 板端要压缩 + 建立 HTTP 连接 + 上传，给足 12 秒
-  let after = null;
-  for (let i = 0; i < 24; i++) {
+  /* 板端要结束采集 → 去交错 → 建 HTTP 连接 → 上传（约 100–200 KB，走 WiFi）。
+   * 实测 stop→服务端可见 的延迟（2026-10-26，同一块板、同一台机器）：
+   *   3177 / 3220 / 3460 / 4776 / 10369 / 12403 / 27196 ms
+   * 跨度接近 9 倍 —— 这是 WiFi 上传本身不稳定（已知 P1：约 34% 上传失败率），
+   * 不是录音丢失。原实现的 12 秒预算必然偶发假失败，故放宽到 45 秒；
+   * 超时后不再笼统报「没收到」，而是把「从未收到」与「收到但 id 未变」分开诊断。 */
+  const WAIT_MS = 45000;
+  const t0 = Date.now();
+  let latest = null;
+  while (Date.now() - t0 < WAIT_MS) {
     await sleep(500);
-    after = await req('GET', '/api/voice');
-    const aid = after.json && after.json.latest && after.json.latest.audio_id;
-    if (aid && aid !== beforeId) break;
+    const r = await req('GET', '/api/voice');
+    const L = r.json && r.json.latest;
+    if (L && L.audio_id && L.audio_id !== beforeId) { latest = L; break; }
   }
-  const latest = after && after.json && after.json.latest;
-  ok(!!latest, '服务端收到新录音');
-  if (!latest) { summary(); return; }
+  const waited = Date.now() - t0;
+
+  if (!latest) {
+    // 区分「服务端一直没收到新 WAV」与「收到了但被当成旧值」
+    const r = await req('GET', '/api/voice');
+    const cur = r.json && r.json.latest;
+    fail++;
+    console.error(`  ✗ ${WAIT_MS / 1000} 秒内没等到新录音` +
+      `（当前 latest=${cur ? cur.audio_id : '(无)'}，测试前=${beforeId || '(无)'}）`);
+    console.error('    可能原因：① 板端录音失败（看串口 VOICE 日志）' +
+      ' ② WiFi 上传超时/失败（已知约 34% 失败率）' +
+      ' ③ start 被 busy 拒绝后仍走了这条路径');
+    summary();
+    return;
+  }
+  if (waited > 15000) {
+    console.log(`  · 本次上传耗时 ${waited}ms，明显慢于常态（3–5 秒）——` +
+      'WiFi 链路抖动，不影响结论但值得关注');
+  }
+  ok(true, '服务端收到新录音', `${latest.audio_id}（stop 后 ${waited}ms）`);
 
   ok(latest.audio_id !== beforeId, 'audio_id 是本次新录音（不是上一段旧值）',
     `${beforeId || '(无)'} → ${latest.audio_id}`);
@@ -242,7 +308,7 @@ function analyzeWav(buf) {
   const notFound = await req('GET', '/api/voice/audio/voice-19700101-000000-000-dead');
   ok(notFound.status === 404, '不存在的 audio_id → 404', `HTTP ${notFound.status}`);
 
-  /* ---------- ⑤ 录音期间的失败可见性：通道关闭时不谎报 ---------- */
+  /* ---------- ⑤ 通道不可用时不得谎报已下发 ---------- */
   console.log('\n— ⑤ 通道不可用时不得谎报已下发 —');
   const recAgain = await req('POST', '/api/voice/record', { action: 'toggle' });
   ok(recAgain.json && typeof recAgain.json.ok === 'boolean',
@@ -256,6 +322,17 @@ function analyzeWav(buf) {
     await sleep(500);
     await req('POST', '/api/voice/record', { action: 'stop' });
   }
+
+  /* ---------- ⑥ 已知观测缺口：ok=true 不等于板端已接受 ----------
+   * 实测（2026-10-26，见 sendRecordCommand 注释）：stop 后 200ms 内再 start，
+   * 固件 voice_record_toggle() 因 s_uploading 直接拒绝并回 status:"busy"，
+   * 但服务端 POST /api/voice/record 仍返回 ok=true / accepted=true。
+   * 这是产品侧的可观测性缺口（服务端无法区分「已写进串口」与「板端已接受」），
+   * 本次任务范围限定在 test/，只登记不修，也不判失败。 */
+  console.log('\n— ⑥ 已知缺口登记（不判失败）—');
+  skipped('ok=true 能否代表板端已接受',
+    '否：固件 s_uploading 时回 ack=busy，服务端仍报 accepted=true；' +
+    '建议服务端在 sendCommand 后等待 ack 再定论（超出本次 test/ 改动范围）');
 
   summary();
 
