@@ -51,6 +51,7 @@
 #include "app_config.h"
 #include "lcd_font.h"
 #include "cam_stream.h"
+#include "voice_record.h"
 #include "mbedtls/base64.h"
 
 static const char *TAG = "S3EYE";
@@ -859,9 +860,26 @@ static void ui_task(void *arg)
             }
         }
 
-        /* LED：快闪=求助中；慢闪=对方已收到；灭=空闲/已取消 */
-        int half = led == LED_FAST ? 100 : led == LED_SLOW ? 450 : 0;
-        if (half == 0) {
+        /* LED 优先级：第 5 周语音录音状态（按键说话）优先于第 3 周求助状态。
+         * 理由：录音是「用户刚按下键」的即时动作，必须一眼看到；求助状态本来
+         * 还有 LCD 大字兜底，且语音空闲时立即把 LED 交还求助状态机。 */
+        int half = 0;
+        bool steady_on = false;
+        voice_led_t vled = voice_record_led();
+        switch (vled) {
+        case VOICE_LED_RECORDING:  steady_on = true; break;      /* 常亮 */
+        case VOICE_LED_UPLOADING:  half = 120; break;            /* 快闪 */
+        case VOICE_LED_OK:         half = 400; break;            /* 慢闪 */
+        case VOICE_LED_ERROR:      half = 60;  break;            /* 急促闪 */
+        default:                                                 /* 交回求助状态机 */
+            half = led == LED_FAST ? 100 : led == LED_SLOW ? 450 : 0;
+            break;
+        }
+
+        if (steady_on) {
+            led_write(true);
+            led_on = true;
+        } else if (half == 0) {
             led_write(false);
             led_on = false;
         } else if (now - last_toggle >= half) {
@@ -1027,6 +1045,8 @@ static void send_frame(const char *request_id)
  *   {"cmd":"pause"}                                暂停周期上报（命令通道保持）
  *   {"cmd":"resume"}                               恢复周期上报
  *   {"cmd":"ping","request_id":"..."}              连通性探测
+ *   {"cmd":"voice_record","request_id":"..."}      第 5 周：开始/结束一次录音（同 BOOT 键）
+ *   {"cmd":"voice_status","request_id":"..."}      第 5 周：查询是否录音中与 LED 档位
  * 板端回执：
  *   {"type":"ack","request_id":"...","seq":N,"status":"received"}
  * 采集观测 = 普通数据帧 + request_id 字段（复用同一条解析链路）。
@@ -1354,6 +1374,24 @@ static void handle_command(const char *line)
             ESP_LOGW(TAG, "WiFi 状态：未关联；IP=%s；上传 成功=%lu 失败=%lu",
                      has_ip ? s_ip : "（无）", (unsigned long)s_ok, (unsigned long)s_fail);
         }
+    } else if (strcmp(cmd, "voice_record") == 0) {
+        /* 第 5 周：远程触发一次「开始/结束录音」，语义与按 BOOT 键完全一致。
+         * 存在意义有两个：① 无人值守取证（自动化脚本能触发录音）；
+         * ② BOOT 键 GPIO 配置失败时的兜底（见 voice_record.c 的错误日志）。
+         * 注意先取旧状态：结束录音时 s_recording 要等采集循环退出才变 false，
+         * 若在 toggle 之后再判断，会把「结束」误报成「录音中」。 */
+        bool was_recording = voice_record_is_recording();
+        bool accepted = voice_record_toggle();
+        const char *st = !accepted ? "busy" : (was_recording ? "uploading" : "recording");
+        cmd_ack(rid, st);
+        ESP_LOGI(TAG, "远程录音命令：%s（%s）", accepted ? "已接受" : "被拒绝",
+                 was_recording ? "结束录音并上传" : "开始录音");
+    } else if (strcmp(cmd, "voice_status") == 0) {
+        char st[96];
+        snprintf(st, sizeof(st), "recording=%d led=%d",
+                 voice_record_is_recording() ? 1 : 0,
+                 (int)voice_record_led());
+        cmd_ack(rid, st);
     } else if (strcmp(cmd, "wifi_scan") == 0) {
         /* 现场诊断：重扫一遍 2.4GHz 并打印（会短暂断开再自动重连） */
         cmd_ack(rid, "scanning");
@@ -1522,6 +1560,10 @@ void app_main(void)
     xTaskCreate(poll_task, "poll", 4096, NULL, 4, NULL);
     /* 启动摄像头推流任务（默认不推流，收到 cam_on 才开始） */
     xTaskCreate(cam_task, "cam", 5120, NULL, 4, NULL);
+
+    /* 第 5 周：按键说话（BOOT 键 → 板载 MEMS 麦克风 I2S 录音 → WAV → 上传）。
+     * 独立成 voice_record.c，这里只做启动；失败只会关闭语音功能，不影响上报/求助/摄像头。 */
+    voice_record_init();
 
     int64_t last = 0;
     while (1) {
