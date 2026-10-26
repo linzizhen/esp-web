@@ -729,6 +729,453 @@ function resetHelp() {
   pushHelp();
 }
 
+/* ------------------------------------------------------------------ */
+/* 语音链路（第 5 周）：板端录音 → 服务端落盘 → 浏览器识别 / 播报        */
+/*                                                                     */
+/* 音频来源与运行位置（作业要求，必须如实记录，前端会原样展示）：         */
+/*   · 录音：ESP32-S3-EYE 板载 MEMS 麦克风（板端 I2S 采集，输出标准 WAV）  */
+/*   · 识别：电脑浏览器 Web Speech API（zh-CN）                          */
+/*   · 播报：电脑浏览器 speechSynthesis（板端没有扬声器）                 */
+/* 服务端只做三件事：收 WAV 落盘、提供回放 / 取证下载、维护四段状态链。    */
+/* 不调用外部 ASR/TTS（本机密钥已失效），NL 判定一律复用第 4 周 /api/nl。  */
+/*                                                                     */
+/* 阶段枚举（stage 与 status 同值，固件 / 前端共用同一套字符串）：         */
+/*   recorded      板端 WAV 已保存为 data/voice/<audio_id>.wav          */
+/*   transcribed   浏览器识别成功，带 transcript                        */
+/*   asr_failed    识别失败 / 浏览器不支持，带 reason                    */
+/*   task_running  文本已交给第 4 周 /api/nl（仅状态标记）                */
+/*   task_done     NL 已返回，带 intent + reply                        */
+/*   spoken        浏览器播报结束                                       */
+/*   silent        录音无声 / 过短，未进入识别                          */
+/*   timeout       链路某一步超时（识别 / NL / 采集）                    */
+/*                                                                     */
+/* 接口契约（前端 / 固件对接按这里，字段名不要改）：                      */
+/*                                                                     */
+/* 1) POST /api/voice/audio —— 板端上传 WAV 二进制                       */
+/*    请求头：device: <设备号>（或 x-device-id / ?device=）              */
+/*            duration_ms: <整数，可选；缺省时由 WAV 头算出>            */
+/*    body：完整 WAV（RIFF+WAVE+fmt+data，16kHz/16bit/单声道为约定格式） */
+/*    200 → { ok, audio_id, file, path, bytes, duration_ms, riff:"RIFF", */
+/*            wave:"WAVE", sample_rate, channels, bits,                  */
+/*            peak_dbfs, rms_dbfs, silent_hint, device_id,              */
+/*            audio_url, download_url, event_persisted, state }         */
+/*    400 → { ok:false, error:"not_wav"|"payload_too_large"|"empty_body" */
+/*            |"read_failed"|"aborted", message:<中文原因>, ... }        */
+/*    500 → { ok:false, error:"write_failed"|"storage_unavailable" }    */
+/*                                                                     */
+/* 2) GET /api/voice/audio/:id —— 回放（inline, audio/wav, 支持 Range） */
+/* 3) GET /api/voice/audio/:id/download —— 取证下载（attachment）      */
+/*    两者：不存在 → 404 {error:"not_found"}；id 非法 → 400              */
+/*                                                                     */
+/* 4) GET /api/voice —— 最近一条录音元信息 + 全链状态（固件实测取证用）  */
+/*    → { ok, latest:{audio_id,bytes,riff,wave,sample_rate,channels,     */
+/*         bits,duration_ms,peak_dbfs,rms_dbfs,silent_hint,device_id,    */
+/*         received_at,stage,audio_url,download_url}|null,              */
+/*        recent:[...], audio_total, events_total, state }              */
+/*                                                                     */
+/* 5) GET /api/voice/state —— 四段状态 + 事件历史（前端轮询）            */
+/*    → { ok, audio_id, device_id, stage, stage_text, transcript,        */
+/*        intent, reply, error, reason, bytes, duration_ms,             */
+/*        received_at, updated_at, has_audio, audio_url, download_url,  */
+/*        stages:[8 个枚举], audio_source, asr_runs_on, tts_runs_on,     */
+/*        limits:{max_bytes}, history:[最近 50 条事件], events_file }    */
+/*                                                                     */
+/* 6) POST /api/voice/state —— 前端推进阶段                              */
+/*    body：{ stage(必填), audio_id?, transcript?, intent?, reply?,      */
+/*           reason?, error?, duration_ms? }                            */
+/*    200 → { ok, persisted, voice:<GET state 同构快照> }                */
+/*    400 → { ok:false, error:"missing_stage"|"invalid_stage"           */
+/*           |"invalid_audio_id", stages:[枚举] }                        */
+/*    说明：asr_failed / silent / timeout 未给 reason 时服务端补中文原因；*/
+/*          reason/error 不跨阶段继承（只描述失败那一刻）。               */
+/*                                                                     */
+/* 7) POST /api/voice/record —— 远程触发一次录音（等价按板端 BOOT 键）    */
+/*    body：{ action?:"start"|"stop"|"toggle" }（缺省 toggle）           */
+/*    200 → { ok, accepted, action, request_id, channel, note }          */
+/*    说明：板端是纯 HTTP 客户端，命令走串口直写或 WiFi 轮询队列；       */
+/*          通道不可用时 ok=false + note 说明原因，绝不谎报已下发。       */
+/*                                                                     */
+/* WS：阶段推进广播 { type:"voice", voice:<同上快照> }；                  */
+/*     新连接 hello 消息里带 voice 快照，刷新页面不丢链路。               */
+/* ------------------------------------------------------------------ */
+const VOICE_DIR = path.join(DATA_DIR, 'voice');
+const VOICE_EVENTS_FILE = path.join(VOICE_DIR, 'events.ndjson');
+const VOICE_KEEP = 50;                    // 内存只留最近 N 条事件，盘上仍是全量
+const VOICE_MAX_BYTES = 1024 * 1024;       // 单个 WAV 上限 1 MB
+const VOICE_STAGES = ['recorded', 'transcribed', 'asr_failed', 'task_running', 'task_done', 'spoken', 'silent', 'timeout'];
+const VOICE_STAGE_SET = new Set(VOICE_STAGES);
+const VOICE_STAGE_TEXT = {
+  idle: '尚无语音链路',
+  recorded: '已收到板端 WAV',
+  transcribed: '浏览器已识别为文字',
+  asr_failed: '识别失败（可改用文字入口）',
+  task_running: '正在执行第 4 周 NL 任务',
+  task_done: '任务已完成',
+  spoken: '已在浏览器播报',
+  silent: '没有检测到语音（无声或过短）',
+  timeout: '链路超时（可改用文字入口）',
+};
+/* audio_id 同时用作文件名，必须严格校验，杜绝路径穿越 */
+const VOICE_ID_RE = /^voice-\d{8}-\d{6}-\d{3}(-[0-9a-f]{4})?$/;
+
+const voice = {
+  audio_id: null,
+  device_id: null,
+  stage: 'idle',
+  transcript: null,
+  intent: null,
+  reply: null,
+  error: null,
+  reason: null,
+  bytes: null,
+  duration_ms: null,
+  received_at: null,      // 服务端收到 WAV 的时刻
+  updated_at: null,       // 最近一次阶段推进的时刻
+  history: [],            // 最近 VOICE_KEEP 条事件（只是事件流水，不是全量）
+};
+
+function ensureVoiceDir() {
+  if (!fs.existsSync(VOICE_DIR)) fs.mkdirSync(VOICE_DIR, { recursive: true });
+}
+
+/** 给前端的状态快照：字段名即契约，历史事件原样带出 */
+function publicVoice() {
+  const rel = (p2) => path.relative(ROOT, p2).split(path.sep).join('/');
+  return {
+    ok: true,
+    audio_id: voice.audio_id,
+    device_id: voice.device_id,
+    stage: voice.stage,
+    stage_text: VOICE_STAGE_TEXT[voice.stage] || voice.stage,
+    transcript: voice.transcript,
+    intent: voice.intent,
+    reply: voice.reply,
+    error: voice.error,
+    reason: voice.reason,
+    bytes: voice.bytes,
+    duration_ms: voice.duration_ms,
+    received_at: voice.received_at,
+    updated_at: voice.updated_at,
+    has_audio: !!(voice.audio_id && fs.existsSync(path.join(VOICE_DIR, voice.audio_id + '.wav'))),
+    audio_url: voice.audio_id ? `/api/voice/audio/${voice.audio_id}` : null,
+    download_url: voice.audio_id ? `/api/voice/audio/${voice.audio_id}/download` : null,
+    stages: VOICE_STAGES,
+    // 音频来源与运行位置：写死在这里，避免前端各自编造
+    audio_source: 'board_mic_i2s',
+    audio_source_text: 'ESP32-S3-EYE 板载 MEMS 麦克风（I2S 录音，录音在板端）',
+    asr_runs_on: 'browser_web_speech',
+    asr_runs_on_text: '电脑浏览器 Web Speech API（zh-CN，识别在浏览器）',
+    tts_runs_on: 'browser_speech_synthesis',
+    tts_runs_on_text: '电脑浏览器 speechSynthesis（播放在浏览器；板端无扬声器）',
+    limits: { max_bytes: VOICE_MAX_BYTES },
+    history: voice.history.slice(-VOICE_KEEP),
+    events_file: rel(VOICE_EVENTS_FILE),
+    audio_dir: rel(VOICE_DIR),
+  };
+}
+
+function pushVoice() { broadcast({ type: 'voice', voice: publicVoice() }); }
+
+/* 语音事件落盘：NDJSON，一行一事件，只追加不滚动（低频，一年也不大）。
+ * 失败只记日志、不抛出 —— 存储是旁路，绝不能因写盘失败中断语音链路。
+ * 注意：语音事件是「链路证据」，不跟随 storageEnabled 开关关闭。 */
+function appendVoiceEvent(entry) {
+  try {
+    ensureVoiceDir();
+    fs.appendFileSync(VOICE_EVENTS_FILE, JSON.stringify(entry) + '\n', 'utf8');
+    return true;
+  } catch (e) {
+    console.error('[voice] 事件落盘失败（链路继续，不中断）：', e.message);
+    return false;
+  }
+}
+
+/** 新链路开始：清空上一段的识别 / 任务 / 播报字段，互不串味 */
+function voiceResetChain() {
+  voice.transcript = null;
+  voice.intent = null;
+  voice.reply = null;
+  voice.error = null;
+  voice.reason = null;
+  voice.bytes = null;
+  voice.duration_ms = null;
+  voice.received_at = null;
+}
+
+const VOICE_EVENT_FIELDS = ['audio_id', 'device_id', 'transcript', 'intent', 'reply',
+  'error', 'reason', 'bytes', 'duration_ms', 'received_at'];
+
+/** 把一条事件应用进内存状态（追加新事件与启动回读共用同一条路径，避免两套逻辑漂移） */
+function applyVoiceEventToState(ev) {
+  if (!ev || !VOICE_STAGE_SET.has(ev.stage)) return;
+  const aid = ev.audio_id || null;
+  // 新的 audio_id 出现即视为新链路：上一段的识别 / 任务 / 播报字段必须清掉，不能串味
+  const newChain = ev.stage === 'recorded' || (!!aid && aid !== voice.audio_id);
+  if (newChain) {
+    voiceResetChain();
+    voice.audio_id = aid;      // 新链路：没有 audio_id 就是 null，绝不沿用上一段
+  }
+  voice.stage = ev.stage;
+  if (aid) voice.audio_id = aid;
+  for (const k of VOICE_EVENT_FIELDS) {
+    if (k === 'audio_id') continue;
+    if (Object.prototype.hasOwnProperty.call(ev, k)) voice[k] = ev[k];
+  }
+  voice.updated_at = ev.updated_at || ev.at || Date.now();
+}
+
+/** 推进阶段：写内存 → append 落盘 → WS 广播 → 返回最新快照 */
+function voiceApply(stage, patch) {
+  const p = patch || {};
+  const now = Date.now();
+  const patchAid = p.audio_id != null ? p.audio_id : null;
+  // 新链路判定：新录音事件，或上报了一个与当前不同的 audio_id
+  const newChain = stage === 'recorded' || (!!patchAid && patchAid !== voice.audio_id);
+  /* reason / error 不跨阶段继承：它们只描述「失败那一刻」。
+   * 否则会出现 stage=spoken 却仍挂着 asr_failed 的 reason 这种自相矛盾快照，
+   * 前端据此渲染会误导（"已播报"与"识别失败"同时显示）。
+   * 来源只有 patch（失败阶段由路由补默认中文原因）。 */
+  const base = newChain ? {
+    audio_id: patchAid,          // 未指定则留空：绝不沿用上一段的 audio_id 冒充本次
+    device_id: p.device_id !== undefined ? p.device_id : null,
+    transcript: null, intent: null, reply: null, error: null, reason: null,
+    bytes: p.bytes !== undefined ? p.bytes : null,
+    duration_ms: p.duration_ms !== undefined ? p.duration_ms : null,
+    received_at: now,
+  } : {
+    audio_id: voice.audio_id,
+    device_id: p.device_id !== undefined ? p.device_id : voice.device_id,
+    transcript: voice.transcript, intent: voice.intent, reply: voice.reply,
+    error: null, reason: null,
+    bytes: voice.bytes, duration_ms: voice.duration_ms, received_at: voice.received_at,
+  };
+  const entry = { at: now, ts: now, stage, status: stage };
+  for (const k of VOICE_EVENT_FIELDS) {
+    entry[k] = Object.prototype.hasOwnProperty.call(p, k) ? p[k] : base[k];
+  }
+  entry.updated_at = now;
+  applyVoiceEventToState(entry);
+  voice.history.push(entry);
+  if (voice.history.length > VOICE_KEEP) voice.history.shift();
+  const persisted = appendVoiceEvent(entry);
+  pushVoice();
+  return { persisted, state: publicVoice() };
+}
+
+/** 启动时回读历史语音事件：重启后 GET /api/voice/state 仍能看到上次链路 */
+function loadVoiceHistory() {
+  try { ensureVoiceDir(); } catch (e) { console.error('[voice] 创建语音目录失败：', e.message); return; }
+  if (!fs.existsSync(VOICE_EVENTS_FILE)) {
+    console.log('[voice] 暂无语音事件历史（首次录音后自动创建 events.ndjson）');
+    return;
+  }
+  try {
+    const all = [];
+    for (const ln of fs.readFileSync(VOICE_EVENTS_FILE, 'utf8').split('\n')) {
+      const s = ln.trim();
+      if (!s) continue;
+      try { all.push(JSON.parse(s)); } catch (_) { /* 跳过坏行 */ }
+    }
+    voice.history = [];
+    for (const ev of all) applyVoiceEventToState(ev);
+    voice.history = all.slice(-VOICE_KEEP);   // 盘上仍是全量，内存只留最近 N 条
+    if (all.length) {
+      console.log(`[voice] 已从 ${path.basename(VOICE_EVENTS_FILE)} 恢复 ${voice.history.length} 条事件（盘上共 ${all.length} 条），当前阶段 ${voice.stage}`);
+    }
+  } catch (e) {
+    console.error('[voice] 历史回读失败：', e.message);
+  }
+}
+
+/* ---- WAV 头解析：只读头部，不解码 PCM（服务端不需要听声音） ---- */
+/* totalBytes：文件真实总大小。只读头部时 buf 可能只是前 4 KB，
+ * data 块声明的长度才是真实值，用 totalBytes 兜住，否则时长会被截短。 */
+function parseWavHeader(buf, totalBytes) {
+  const out = {
+    ok: false, riff: null, wave: null, format: null, channels: null,
+    sample_rate: null, bits: null, data_bytes: null, duration_ms: null, error: null,
+  };
+  if (!buf || buf.length < 12) { out.error = 'too_short'; return out; }
+  out.riff = buf.toString('latin1', 0, 4);
+  out.wave = buf.toString('latin1', 8, 12);
+  if (out.riff !== 'RIFF') { out.error = 'not_riff'; return out; }
+  if (out.wave !== 'WAVE') { out.error = 'not_wave'; return out; }
+  const total = Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : buf.length;
+  let off = 12;
+  let dataOff = null;
+  while (off + 8 <= buf.length) {
+    const id = buf.toString('latin1', off, off + 4);
+    const size = buf.readUInt32LE(off + 4);
+    const body = off + 8;
+    if (id === 'fmt ' && body + 16 <= buf.length) {
+      out.format = buf.readUInt16LE(body);
+      out.channels = buf.readUInt16LE(body + 2);
+      out.sample_rate = buf.readUInt32LE(body + 4);
+      out.bits = buf.readUInt16LE(body + 14);
+    } else if (id === 'data') {
+      dataOff = body;
+      // 声明长度可能大于实际文件（截断录音）：取二者较小者
+      out.data_bytes = Math.min(size, Math.max(0, total - body));
+      break;
+    }
+    if (!size) break;                        // 空块：防死循环
+    off = body + size + (size % 2);          // 块按偶数字节对齐
+  }
+  if (out.data_bytes == null) {
+    out.data_bytes = Math.max(0, total - 44);
+    dataOff = 44;
+  }
+  const bps = (out.sample_rate || 0) * (out.channels || 0) * ((out.bits || 0) / 8);
+  out.duration_ms = bps > 0 ? Math.round((out.data_bytes / bps) * 1000) : null;
+  out.data_offset = dataOff;
+  out.ok = true;
+  return out;
+}
+
+/* 电平统计：给「无声 / 过短」一个服务端可复核的依据，而不是只靠浏览器自述。
+ * 只抽样计算（每 16 个样本取 1），1 MB 以内开销可忽略。 */
+function wavLevelStats(buf, wav) {
+  const out = { peak: 0, rms: 0, silent_hint: null, zero_ratio: null };
+  try {
+    if (!wav || !wav.ok || wav.format !== 1 || wav.bits !== 16) return out;
+    const start = wav.data_offset || 44;
+    const end = Math.min(buf.length, start + wav.data_bytes);
+    if (end - start < 4) { out.silent_hint = true; out.rms = 0; out.peak = 0; return out; }
+    let peak = 0, sum = 0, n = 0, zeros = 0;
+    for (let i = start; i + 1 < end; i += 32) {          // 32 字节 = 16 个 16-bit 样本
+      const v = buf.readInt16LE(i);
+      const a = Math.abs(v);
+      if (a > peak) peak = a;
+      if (a <= 1) zeros++;
+      sum += v * v;
+      n++;
+    }
+    if (!n) return out;
+    out.peak = peak;
+    out.peak_dbfs = peak > 0 ? Math.round(20 * Math.log10(peak / 32768) * 10) / 10 : null;
+    out.rms = Math.round(Math.sqrt(sum / n));
+    out.rms_dbfs = out.rms > 0 ? Math.round(20 * Math.log10(out.rms / 32768) * 10) / 10 : null;
+    out.zero_ratio = Math.round((zeros / n) * 1000) / 1000;
+    // 峰值 <= -40 dBFS（约 328）视为基本无声；仅作提示，最终 stage 由前端判定
+    out.silent_hint = peak < 328;
+    return out;
+  } catch (_) { return out; }
+}
+
+/* audio_id → 绝对路径（严格校验，非法一律当不存在） */
+function voiceAudioFile(audioId) {
+  if (!audioId || !VOICE_ID_RE.test(audioId)) return null;
+  return path.join(VOICE_DIR, audioId + '.wav');
+}
+
+function newVoiceId() {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+  const ms = String(d.getMilliseconds()).padStart(3, '0');
+  for (let i = 0; i < 20; i++) {
+    const rand = Math.floor(Math.random() * 0xffff).toString(16).padStart(4, '0');
+    const id = `voice-${stamp}-${ms}-${rand}`;
+    if (!fs.existsSync(path.join(VOICE_DIR, id + '.wav'))) return id;
+  }
+  return `voice-${stamp}-${ms}-${Math.floor(Math.random() * 0xffff).toString(16).padStart(4, '0')}`;
+}
+
+/* 板端串口上传摘要（type:'voice'）：只作链路证据，绝不产生传感字段。
+ * 固件在录音上传成功后 printf 一行 JSON，这里把它记进链路状态与事件流水，
+ * 让「串口说 http:200 / audio_id=X」与「HTTP 侧实际存的 X」能对上。 */
+function onVoiceUploadSummary(obj) {
+  const audioId = typeof obj.audio_id === 'string' ? obj.audio_id.trim() : '';
+  const entry = {
+    stage: 'recorded',
+    source: 'serial_summary',
+    device_id: obj.device ? String(obj.device) : (state.deviceId || null),
+    bytes: typeof obj.bytes === 'number' ? obj.bytes : null,
+    duration_ms: typeof obj.duration_ms === 'number' ? obj.duration_ms : null,
+    http_status: typeof obj.http === 'number' ? obj.http : null,
+    riff: typeof obj.riff === 'string' ? obj.riff : null,
+    note: obj.error ? String(obj.error) : null,
+  };
+  if (audioId && VOICE_ID_RE.test(audioId)) entry.audio_id = audioId;
+  // 只在串口摘要确实指向一次成功上传时，才把 audio_id 回填进链路状态；
+  // 失败摘要（http!=200 / error 非空）只留证据，不改状态，避免污染链路。
+  const okUpload = entry.http_status == null || entry.http_status === 200 || entry.http_status === 201;
+  if (okUpload && entry.audio_id && !voice.audio_id) {
+    voice.audio_id = entry.audio_id;
+    voice.device_id = voice.device_id || entry.device_id;
+    voice.bytes = voice.bytes == null ? entry.bytes : voice.bytes;
+    voice.duration_ms = voice.duration_ms == null ? entry.duration_ms : voice.duration_ms;
+    voice.received_at = voice.received_at || Date.now();
+    voice.updated_at = Date.now();
+    pushVoice();
+  }
+  console.log(`[voice] 板端上传摘要 ← ${entry.device_id || '?'} http=${entry.http_status == null ? '?' : entry.http_status} audio_id=${entry.audio_id || '(无)'} ${entry.bytes == null ? '?' : entry.bytes} 字节`);
+  return entry;
+}
+
+/** 读文件头生成元信息（不复用内存缓存，重启后也能如实反映盘上内容） */
+function readVoiceAudioMeta(audioId) {
+  const file = voiceAudioFile(audioId);
+  if (!file) return null;
+  try {
+    const st = fs.statSync(file);
+    // 读前 64 KB 足够覆盖 WAV 头 + 若干采样，用于头部解析与电平抽样
+    const headLen = Math.min(65536, st.size);
+    const head = Buffer.alloc(headLen);
+    const fd = fs.openSync(file, 'r');
+    try { fs.readSync(fd, head, 0, headLen, 0); } finally { fs.closeSync(fd); }
+    const wav = parseWavHeader(head, st.size);
+    const lv = wavLevelStats(head, wav);
+    return {
+      audio_id: audioId,
+      file: path.basename(file),
+      bytes: st.size,
+      is_wav: wav.ok,
+      riff: wav.riff,
+      wave: wav.wave,
+      bytes_head: wav.riff,
+      sample_rate: wav.sample_rate,
+      channels: wav.channels,
+      bits: wav.bits,
+      data_bytes: wav.data_bytes,
+      duration_ms: wav.duration_ms,
+      peak_dbfs: lv.peak_dbfs != null ? lv.peak_dbfs : null,
+      rms_dbfs: lv.rms_dbfs != null ? lv.rms_dbfs : null,
+      silent_hint: lv.silent_hint,
+      mtime: st.mtimeMs,
+      audio_url: `/api/voice/audio/${audioId}`,
+      download_url: `/api/voice/audio/${audioId}/download`,
+    };
+  } catch (e) {
+    console.error('[voice] 读取音频元信息失败：', audioId, e.message);
+    return null;
+  }
+}
+
+/** 列出最近的语音文件（按 audio_id 倒序，id 内含时间戳） */
+function listVoiceAudios(limit) {
+  try {
+    ensureVoiceDir();
+    const names = fs.readdirSync(VOICE_DIR).filter((n) => n.endsWith('.wav')).sort().reverse();
+    const rows = [];
+    for (const n of names.slice(0, Math.min(limit || 20, 50))) {
+      const m = readVoiceAudioMeta(n.replace(/\.wav$/, ''));
+      if (m) rows.push(m);
+    }
+    return { total: names.length, rows };
+  } catch (e) {
+    console.error('[voice] 列出音频失败：', e.message);
+    return { total: 0, rows: [] };
+  }
+}
+
+function voiceEventsTotal() {
+  try {
+    if (!fs.existsSync(VOICE_EVENTS_FILE)) return 0;
+    return fs.readFileSync(VOICE_EVENTS_FILE, 'utf8').split('\n').filter((l) => l.trim()).length;
+  } catch (_) { return 0; }
+}
+
 function pushStatus(reason) {
   broadcast({
     type: 'status',
@@ -1722,6 +2169,18 @@ function handleLine(line, source) {
           onHelpEvent(obj);
           return;
         }
+        /* 语音上传摘要（第 5 周）：固件录音完成后 printf 的一行 JSON。
+         * 必须在此早退 —— 否则 bytes / duration_ms / sample_rate / peak 会被
+         * 通用分支当成传感器字段写进 state.fields 并落盘，网页仪表盘会凭空
+         * 多出几个假字段（这条流的语义是「上传回执」，不是一次采样观测）。
+         * 只记原始日志、不产生任何传感数据。audio_id 若存在则回填到链路状态，
+         * 便于串口与 HTTP 两条证据链对上同一段录音。 */
+        if (obj.type === 'voice') {
+          stats.linesValid++;
+          pushRaw(trimmed, true);
+          onVoiceUploadSummary(obj);
+          return;
+        }
         // 摄像头帧：JPEG 以 base64 内联，单独处理。
         // 不 pushRaw 整帧（8KB 会把原始日志刷爆），只记一条摘要。
         if (obj.type === 'frame') {
@@ -2091,6 +2550,28 @@ async function readJsonBody(req) {
   try { return JSON.parse((await readBody(req)) || '{}'); } catch (_) { return {}; }
 }
 
+/* 二进制 body 读取（第 5 周语音）：readBody 用字符串拼接，会把 WAV 字节毁掉，
+ * 这里单独按 Buffer 累积。超过 maxBytes 立刻停止累积并标记 tooLarge，
+ * 但【不】destroy 请求 —— 让调用方还能正常回 400 说明原因（固件要看到原因）。 */
+function readBinaryBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let tooLarge = false;
+    let settled = false;
+    const finish = (r) => { if (!settled) { settled = true; resolve(r); } };
+    req.on('data', (c) => {
+      if (tooLarge) return;                 // 已超限：丢弃余下数据，继续等 end
+      size += c.length;
+      if (size > maxBytes) { tooLarge = true; chunks.length = 0; return; }
+      chunks.push(c);
+    });
+    req.on('end', () => finish({ buf: Buffer.concat(chunks), size: tooLarge ? size : chunks.reduce((a, c) => a + c.length, 0), tooLarge }));
+    req.on('error', (e) => { if (!settled) { settled = true; reject(e); } });
+    req.on('aborted', () => finish({ buf: Buffer.alloc(0), size, tooLarge: false, aborted: true }));
+  });
+}
+
 function json(res, code, obj) {
   const s = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -2418,6 +2899,231 @@ async function handleRequest(req, res) {
     });
     cam.clients.add(res);
     req.on('close', () => cam.clients.delete(res));
+    return;
+  }
+
+  // ---- 语音链路（第 5 周）：① 板端上传 WAV ----
+  //   POST /api/voice/audio
+  //   headers: device: <DEVICE_ID>（或 x-device-id / ?device=）、duration_ms: <整数>
+  //   body:    完整 WAV 二进制（RIFF 头 + PCM）
+  //   注意：本入口与 /api/data 的「串口优先」无关，语音只走 HTTP，不受串口在线影响。
+  if (p === '/api/voice/audio' && req.method === 'POST') {
+    let got;
+    try {
+      got = await readBinaryBody(req, VOICE_MAX_BYTES);
+    } catch (e) {
+      return json(res, 400, { ok: false, error: 'read_failed', message: '读取请求体失败：' + e.message });
+    }
+    if (got.aborted) {
+      return json(res, 400, { ok: false, error: 'aborted', message: '上传中断（连接提前关闭），未保存任何文件。' });
+    }
+    if (got.tooLarge) {
+      // 契约要求「非法格式或超限一律 400」，因此不用 413（前端/固件只判 200 与 400）
+      return json(res, 400, {
+        ok: false, error: 'payload_too_large', max_bytes: VOICE_MAX_BYTES,
+        message: `WAV 超过上限 ${VOICE_MAX_BYTES} 字节（1 MB），未保存。请缩短录音时长或降低采样率。`,
+      });
+    }
+    const buf = got.buf;
+    if (!buf.length) return json(res, 400, { ok: false, error: 'empty_body', message: '请求体为空，没有可保存的 WAV。' });
+    const wav = parseWavHeader(buf);
+    if (!wav.ok) {
+      const msg = wav.error === 'not_riff'
+        ? `不是合法 WAV：前 4 字节应为 "RIFF"，实际是 "${String(wav.riff)}"。`
+        : (wav.error === 'not_wave'
+          ? `不是合法 WAV：第 8-11 字节应为 "WAVE"，实际是 "${String(wav.wave)}"。`
+          : '请求体不足 12 字节，连 WAV 头都不完整。');
+      return json(res, 400, { ok: false, error: 'not_wav', detail: wav.error, riff: wav.riff, wave: wav.wave, message: msg });
+    }
+
+    const devHeader = (req.headers['device'] || req.headers['x-device-id'] || url.searchParams.get('device') || '').toString().trim();
+    const deviceId = devHeader || state.deviceId || null;
+    /* duration_ms 优先取固件自报（板端实测更准），缺失/非法时退回由 WAV 头计算的值。
+     * 注意：Number(undefined) 是 NaN，但 Number(null) 是 0 —— 必须显式判空，
+     * 否则缺头时会写进 duration_ms=0，前端会误报「录音过短」。 */
+    const durRaw = req.headers['duration_ms'] != null ? req.headers['duration_ms'] : url.searchParams.get('duration_ms');
+    const durNum = durRaw == null || String(durRaw).trim() === '' ? NaN : Number(durRaw);
+    const durationMs = Number.isFinite(durNum) && durNum > 0 ? Math.round(durNum) : wav.duration_ms;
+
+    try {
+      ensureVoiceDir();
+    } catch (e) {
+      return json(res, 500, { ok: false, error: 'storage_unavailable', message: '无法创建 data/voice 目录：' + e.message });
+    }
+    const audioId = newVoiceId();
+    const file = voiceAudioFile(audioId);
+    try {
+      // 先写临时文件再原子改名：中途失败不会留下半截 WAV 冒充合法录音
+      const tmp = file + '.part';
+      fs.writeFileSync(tmp, buf);
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      console.error('[voice] WAV 落盘失败：', e.message);
+      return json(res, 500, { ok: false, error: 'write_failed', message: 'WAV 落盘失败：' + e.message });
+    }
+
+    const lv = wavLevelStats(buf, wav);
+    const r = voiceApply('recorded', {
+      audio_id: audioId,
+      device_id: deviceId,
+      bytes: buf.length,
+      duration_ms: durationMs,
+      received_at: Date.now(),
+    });
+    console.log(`[voice] 收到 WAV ${audioId} ← ${deviceId || '(未标注设备)'} ${buf.length} 字节 / ${durationMs == null ? '?' : durationMs}ms（${wav.sample_rate || '?'}Hz ${wav.channels || '?'}ch ${wav.bits || '?'}bit，峰值 ${lv.peak_dbfs == null ? '?' : lv.peak_dbfs} dBFS）`);
+    return json(res, 200, {
+      ok: true,
+      audio_id: audioId,
+      file: path.basename(file),
+      path: path.relative(ROOT, file).split(path.sep).join('/'),
+      bytes: buf.length,
+      duration_ms: durationMs,
+      riff: 'RIFF',
+      wave: 'WAVE',
+      sample_rate: wav.sample_rate,
+      channels: wav.channels,
+      bits: wav.bits,
+      peak_dbfs: lv.peak_dbfs != null ? lv.peak_dbfs : null,
+      rms_dbfs: lv.rms_dbfs != null ? lv.rms_dbfs : null,
+      silent_hint: lv.silent_hint,
+      device_id: deviceId,
+      audio_url: `/api/voice/audio/${audioId}`,
+      download_url: `/api/voice/audio/${audioId}/download`,
+      event_persisted: r.persisted,
+      state: r.state,
+    });
+  }
+
+  // ---- 语音链路：② 最近一条录音的元信息 + 全链路状态（固件实测取证入口）----
+  if (p === '/api/voice' && req.method === 'GET') {
+    const latestId = voice.audio_id;
+    const latest = latestId ? readVoiceAudioMeta(latestId) : null;
+    const recent = listVoiceAudios(Number(url.searchParams.get('limit')) || 10);
+    return json(res, 200, {
+      ok: true,
+      latest: latest ? Object.assign({}, latest, {
+        device_id: voice.device_id,
+        duration_ms: voice.duration_ms != null ? voice.duration_ms : latest.duration_ms,
+        received_at: voice.received_at,
+        stage: voice.stage,
+      }) : null,
+      recent: recent.rows,
+      audio_total: recent.total,
+      events_total: voiceEventsTotal(),
+      state: publicVoice(),
+    });
+  }
+
+  // ---- 语音链路：③ 四段状态 + 事件历史（前端轮询入口）----
+  if (p === '/api/voice/state' && req.method === 'GET') {
+    return json(res, 200, publicVoice());
+  }
+
+  // ---- 语音链路：④ 前端上报阶段推进 ----
+  //   body: { audio_id?, stage, transcript?, intent?, reply?, reason?, error?, duration_ms? }
+  //   stage 枚举见 VOICE_STAGES；不在枚举内 → 400（绝不悄悄接受未知阶段）
+  if (p === '/api/voice/state' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const stage = String(body.stage || '').trim();
+    if (!stage) return json(res, 400, { ok: false, error: 'missing_stage', message: '缺少 stage 字段。', stages: VOICE_STAGES });
+    if (!VOICE_STAGE_SET.has(stage)) {
+      return json(res, 400, { ok: false, error: 'invalid_stage', message: `未知阶段 "${stage}"。`, stages: VOICE_STAGES });
+    }
+    const patch = {};
+    if (body.audio_id != null) {
+      const aid = String(body.audio_id).trim();
+      if (!VOICE_ID_RE.test(aid)) return json(res, 400, { ok: false, error: 'invalid_audio_id', message: `audio_id 格式非法：${aid}` });
+      patch.audio_id = aid;
+    }
+    for (const k of ['transcript', 'intent', 'reply', 'reason', 'error']) {
+      if (body[k] !== undefined) patch[k] = body[k] == null ? null : String(body[k]);
+    }
+    // duration_ms 只在真给了有效正数时才覆盖（Number(null) === 0，必须显式判空）
+    if (body.duration_ms != null && String(body.duration_ms).trim() !== '') {
+      const d = Number(body.duration_ms);
+      if (Number.isFinite(d) && d > 0) patch.duration_ms = Math.round(d);
+    }
+    // 失败分支必须能看懂原因：前端只给 stage 时由服务端补一句默认中文原因
+    if (!patch.reason && (stage === 'asr_failed' || stage === 'silent' || stage === 'timeout')) {
+      patch.reason = stage === 'asr_failed' ? '浏览器未能识别出语音内容'
+        : (stage === 'silent' ? '没有检测到语音（无声或录音过短）' : '链路等待超时');
+    }
+    const r = voiceApply(stage, patch);
+    console.log(`[voice] 阶段推进 → ${stage}${patch.transcript ? '：' + patch.transcript : ''}${patch.reason ? '（' + patch.reason + '）' : ''}`);
+    return json(res, 200, { ok: true, persisted: r.persisted, voice: r.state });
+  }
+
+  // ---- 语音链路：⑦ 远程触发一次录音（等价于按板端 BOOT 键）----
+  //   板端是纯 HTTP 客户端，服务端无法主动连它；命令走串口直写或 WiFi 轮询队列。
+  //   用途：① 自动化取证脚本触发录音；② BOOT 键 GPIO 异常时的兜底入口。
+  //   200 → { ok, accepted, action:"start"|"stop", channel, note }
+  //   说明：accepted=false 时 ok 也可能为 false —— 绝不谎报"已下发"。
+  if (p === '/api/voice/record' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const action = body.action === 'stop' ? 'stop' : (body.action === 'start' ? 'start' : 'toggle');
+    const rid = `voice-rec-${Date.now()}`;
+    const ok = sendCommand({ cmd: 'voice_record', request_id: rid }, state.deviceId || null);
+    const channel = ok ? ((port && port.isOpen) ? 'serial' : 'wifi') : null;
+    console.log(`[voice] 远程录音命令已下发（${action}）→ channel=${channel || 'none'}`);
+    return json(res, 200, {
+      ok,
+      accepted: ok,
+      action,
+      request_id: rid,
+      channel,
+      note: ok ? null : (config.mockDevice
+        ? '模拟模式：未走真实串口'
+        : '命令通道不可用（串口未打开，且板端未通过 WiFi 轮询取命令）'),
+    });
+  }
+
+  // ---- 语音链路：⑤ WAV 回放 / 取证下载（:id 必须通过格式校验，杜绝路径穿越）----
+  if (p.startsWith('/api/voice/audio/') && req.method === 'GET') {
+    const rest = p.slice('/api/voice/audio/'.length);
+    const asDownload = rest.endsWith('/download');
+    const audioId = asDownload ? rest.slice(0, -'/download'.length) : rest;
+    const file = voiceAudioFile(audioId);
+    if (!file) return json(res, 400, { ok: false, error: 'invalid_audio_id', message: 'audio_id 格式非法。' });
+    fs.stat(file, (err, st) => {
+      if (err || !st.isFile()) {
+        return json(res, 404, { ok: false, error: 'not_found', message: `没有 audio_id=${audioId} 的录音。` });
+      }
+      const name = path.basename(file);
+      const disposition = asDownload ? `attachment; filename="${name}"` : `inline; filename="${name}"`;
+      /* <audio> 在 Chrome/Safari 上会先发 Range 请求探测可播性；
+       * 处理 206 能让进度条可拖动，也让某些浏览器不再因 200+全量 而反复重取。 */
+      const range = req.headers.range;
+      let start = 0;
+      let end = st.size - 1;
+      let partial = false;
+      if (range && /^bytes=\d*-\d*$/.test(String(range).trim())) {
+        const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
+        if (m[1]) { start = Number(m[1]); if (m[2]) end = Number(m[2]); }
+        else if (m[2]) { start = Math.max(0, st.size - Number(m[2])); }
+        if (!Number.isFinite(start) || start < 0 || start >= st.size) {
+          res.writeHead(416, { 'Content-Range': `bytes */${st.size}`, 'Content-Type': 'audio/wav' });
+          return res.end();
+        }
+        if (!Number.isFinite(end) || end >= st.size) end = st.size - 1;
+        if (end < start) end = st.size - 1;
+        partial = true;
+      }
+      const headers = {
+        'Content-Type': 'audio/wav',
+        'Content-Length': partial ? (end - start + 1) : st.size,
+        'Cache-Control': 'no-store',
+        'Accept-Ranges': 'bytes',
+        'Content-Disposition': disposition,
+      };
+      if (partial) headers['Content-Range'] = `bytes ${start}-${end}/${st.size}`;
+      res.writeHead(partial ? 206 : 200, headers);
+      const rs = fs.createReadStream(file, partial ? { start, end } : undefined);
+      rs.on('error', (e) => {
+        console.error('[voice] 发送 WAV 失败：', e.message);
+        try { res.destroy(); } catch (_) {}
+      });
+      rs.pipe(res);
+    });
     return;
   }
 
@@ -2769,6 +3475,8 @@ wss.on('connection', (ws) => {
     collectTimeoutMs: collectTimeoutMs(),
     // 教学求助：刷新页面后恢复当前求助状态
     help: publicHelp(),
+    // 语音链路：刷新页面后恢复四段状态与事件历史
+    voice: publicVoice(),
   }));
   pushStatus('client');
 });
@@ -2882,6 +3590,7 @@ server.listen(config.httpPort, config.host, () => {
   console.log('  说明: 未连接真实开发板时不显示任何数据（无模拟数据）');
   console.log('==========================================================');
   loadHelpHistory();   // 回读历史求助事件（重启不丢证据）
+  loadVoiceHistory();  // 回读历史语音事件（重启不丢语音链路证据）
   if (config.autoDetect || config.portPath) startScanning();
 });
 

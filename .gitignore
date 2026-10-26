@@ -17,6 +17,9 @@ config.local.json
 data/*.ndjson
 data/records.*.ndjson
 recordings/*.csv
+# 第 5 周语音链路：录音 WAV + 事件流都是真实素材（可能含人声），
+# 属用户资产，绝不入库。data/*.ndjson 只覆盖 data 根目录，管不到子目录。
+data/voice/
 
 # ---- 临时/调试文件 ----
 *.log
