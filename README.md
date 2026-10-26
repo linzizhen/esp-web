@@ -114,6 +114,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   ├── week3-button-feedback.md # 第 3 周：按键触发与物理反馈闭环（协议/状态图/时序图/实测）
 │   ├── week4-nl-assistant.md    # 第 4 周：自然语言查询与请求采集（受限工具 + 诚实性回复）
 │   ├── week4-test-guide.md      # 第 4 周：LLM 配置与验收步骤
+│   ├── week5-voice.md           # 第 5 周：按键录音 → 上传 → 浏览器识别与播报（含 I2S 交错缺陷复盘）
 │   ├── week3-flash-evidence.txt # 第 3 周烧录留存证据
 │   ├── code-issues-review.md    # 代码问题评审记录
 │   ├── course-weeks-review.md   # 课程周次对照检查
@@ -484,6 +485,59 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 | `linked=0 ip=- ...` | 没关联上 → SSID/密码错，或该热点只在 5GHz 广播 |
 
 > 这两条命令是排查"连上了却传不出去"时最有效的第一步——先分清是**关联失败**还是 **DHCP 失败**，两者排查方向完全不同。
+
+## 六之六、语音（第 5 周）
+
+Web 页「**语音**」标签页让佩戴者**按 BOOT 键说一句话**，查看者能读到这句话的内容。
+
+```
+板端 MEMS 麦克风（I2S）→ WAV 16kHz/16bit/单声道 → WiFi 上传 → 服务端落盘
+   → 浏览器 Web Speech API 识别成文字 → 复用第 4 周 /api/nl → speechSynthesis 播报
+```
+
+### 分工是硬约束，不是选择
+
+| 环节 | 位置 | 原因 |
+|------|------|------|
+| 录音 | **板端** | 板子才有麦克风 |
+| 识别 | **浏览器** | 板端没有算力跑 ASR，也没有联网 ASR 的额度 |
+| 落盘 | **服务端** | 唯一长期存储 |
+| 播报 | **浏览器** | ★ 本板 `BSP_CAPS_AUDIO_SPEAKER = 0`，**物理上没有扬声器** |
+
+★ **任何「板端播报」的实现都是假的**。验收时必须写清这一点，否则等于伪造能力。
+
+### 链路阶段
+
+`idle → recorded → transcribed → task_running → task_done → spoken`，失败分支为
+`silent`（没检测到语音）/ `asr_failed`（浏览器没识别出内容）/ `timeout`（链路超时）。
+
+- 每个阶段都能从 `GET /api/voice/state` 读到，`stage_text` 是给人看的中文说明
+- **没有设备完成证据时绝不显示「已录到」**：`recorded` 之前不许出现采集成功字样
+- 三类失败若前端没给 `reason`，服务端补一条中文原因；进入新阶段时清掉上一轮的失败原因
+
+### 接口
+
+| 方法 | 路径 | 用途 |
+|------|------|------|
+| POST | `/api/voice/audio` | 板端上传 WAV（校验 RIFF/WAVE，上限 1 MB） |
+| GET | `/api/voice` | 全链状态快照 + 最近事件 |
+| GET / POST | `/api/voice/state` | 读当前阶段 / 浏览器推进阶段 |
+| GET | `/api/voice/audio/:id` | 回放 WAV |
+| GET | `/api/voice/audio/:id/download` | 下载取证 |
+| POST | `/api/voice/record` | 远程触发一次录音（等价按 BOOT 键） |
+
+### 当堂验证
+
+```bash
+node test/voice-hil.js --speak    # 真机：录音 → 上传 → 独立复核 WAV 电平（需硬件）
+node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
+node test/voice-test.js           # 84 项接口契约（隔离实例 + 合成 WAV，无需硬件）
+```
+
+`voice-hil.js` 会**自己重新下载 WAV 并解码算 RMS**，不信服务端自报——服务端说「录到声音」不算证据。
+
+> 完整说明（含真机暴露的 I2S 交错缺陷取证与修复、失败分支表、迁移判据）见
+> [`docs/week5-voice.md`](docs/week5-voice.md)。
 
 ## 七、排查：板子插上了但没数据
 

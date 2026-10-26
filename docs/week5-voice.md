@@ -134,6 +134,61 @@ node test/voice-layout-contract-test.js   # 25 项：数据布局静态契约
 
 ---
 
+## 四之二、真机验证踩到的两个测试侧坑与一个产品侧缺口
+
+这一节记录 `test/voice-hil.js` 第一版会**在链路完全正常时报失败**的两个原因，以及一个
+**服务端能力缺口**。前两个已修，第三个只登记不修（超出本周范围）。
+
+### 坑 1：等待预算 12 秒太短
+
+写探针实测「`stop` 命令 → 服务端能看到新 WAV」的延迟，5 轮结果：
+
+```
+3177 / 3220 / 3460 / 4776 / 10369 ms
+```
+
+后续两轮更极端：`12403 ms`、`27196 ms`。**跨度接近 9 倍**，而 WiFi 上传本身有约 34% 的失败重传率。
+第一版只等 12 秒，于是经常在录音其实成功时判失败。
+
+修复：预算放宽到 **45 秒**（`WAIT_MS = 45000`），超过 15 秒单独提示「链路抖动」，
+超时后区分「从未收到新录音」与「收到了但 `audio_id` 未变」——两者原因完全不同。
+
+### 坑 2：只看服务端返回，不看板端回执
+
+`POST /api/voice/record` 返回 `ok=true` **只表示命令写进了串口**，不代表板端接受：
+
+- 服务端 `sendCommand()` 的 `port.write()` 回调只记错误，**不等待 ack**
+- 固件 `voice_record_toggle()` 开头就是 `if (s_uploading) { ...; return false; }`，
+  此时回 `cmd_ack(rid, "busy")`
+
+实测证据（一次性探针，见下）：第 1 次 `start` → ack=`recording`；`stop` → ack=`uploading`；
+**200 ms 后再 `start` → 板端 ack=`busy`，而服务端仍回 `ok=true / accepted=true`**。
+
+修复：测试侧新增 `waitAck(rid, timeoutMs)` 读 `/api/state` 的 `raw` 环形缓冲核对 `request_id` 回执，
+`sendRecordCommand()` 遇 `busy` 退避重试（6 次 × 1200 ms）。
+
+> 这两个取证探针（`probe-upload-latency.js` / `probe-voice-busy.js`）是排查时的一次性脚本，
+> **不入库**——它们的结论已经固化成本节的表格与 `voice-hil.js` 的断言，留着只会变成无人维护的死代码。
+> 需要复现时按本节描述重写即可，核心逻辑就是「发命令 → 轮询 `/api/state` 的 `raw` 找 ack」。
+>
+> 写探针时踩了个坑：`/api/state` 的 `raw` 数组元素是 **`{ts, text, ok}` 对象**，不是字符串。
+> 第一版直接对元素做 `String()` 比较，全部打印成 `[object Object]`，误判成「板端没回 ack」。
+> 教训：**先打印一条样例行再写匹配逻辑**。
+
+### 缺口：服务端无法区分「已写进串口」与「板端已接受」
+
+上面坑 2 暴露的是产品侧能力缺口，测试侧只是绕过。当前行为：
+
+| 场景 | 板端实际 | 服务端返回 |
+|------|---------|-----------|
+| 正常 | `recording` | `ok=true, accepted=true` |
+| 正在上传上一段 | `busy`（命令被丢弃） | `ok=true, accepted=true` ← **谎报** |
+
+建议后续在 `sendCommand()` 后等待 ack 再定论，把 `accepted` 改成「板端确认」而非「写出口成功」。
+**本周不修**，已在 `test/voice-hil.js` 第 ⑥ 段登记为已知缺口，不判失败——登记不等于认可。
+
+---
+
 ## 五、★ 真机暴露的缺陷与修复（2026-10-26）
 
 ### 现象
@@ -231,9 +286,10 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 | `public/app.js` | 语音页：录音回放、Web Speech 识别、`speechSynthesis` 播报 |
 | `public/index.html` | 语音页 DOM（样式全部复用既有类，未新增 CSS） |
 | `test/voice-test.js` | 新增，84 项接口契约 |
-| `test/voice-hil.js` | 新增，真机端到端（需硬件） |
+| `test/voice-hil.js` | 新增，真机端到端（需硬件），含板端回执核对与 45 秒等待预算 |
 | `test/voice-layout-contract-test.js` | 新增，25 项数据布局静态契约 |
 | `test/probe-voice-stop.js` | 新增，真机稳定性探针（需硬件） |
+| `test/run-all.js` | 登记 `voice` / `voice-layout` 两个套件，并修正「N 项通过」格式的结果计数 |
 
 ---
 

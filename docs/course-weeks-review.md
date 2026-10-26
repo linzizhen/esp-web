@@ -1,4 +1,4 @@
-# 四周课程目标核对报告
+# 五周课程目标核对报告
 
 > 核对日期：2026-10-26　项目：ESP32-S3-EYE 三轴 IMU 监控平台（`imu-monitor`）
 > 核对方式：代码审查（server.js / 固件 main.c / 前端）+ 测试套件实跑（380 项断言全过）+ 实物验证记录
@@ -18,11 +18,13 @@ imu-monitor/
 │   ├─ 采集  POST/GET /api/collect     （第2周状态机）
 │   ├─ 求助  GET/POST /api/help        （第3周）
 │   ├─ 自然语言 GET/POST /api/nl       （第4周）
+│   ├─ 语音  POST /api/voice/audio     GET/POST /api/voice/state（第5周）
 │   └─ 其他  /api/cam(.mjpg/.jpg/snapshot)  /api/connect /api/disconnect /api/config /api/diag /api/ports /api/probe /api/record
-├─ public/                     前端 SPA（hash 路由 6 页）
-│   └─ live 实时监控 / collect 远程采集 / help 教学求助 / cam 摄像头 / records 记录与设备 / ask 自然语言
+├─ public/                     前端 SPA（hash 路由 7 页）
+│   └─ live 实时监控 / collect 远程采集 / help 教学求助 / cam 摄像头 / records 记录与设备 / ask 自然语言 / voice 语音
 ├─ data/records.ndjson         落盘记录（appendFileSync，轮转）
-├─ test/                       9 个测试套件 + 隔离实例夹具
+├─ data/voice/                 第 5 周：录音 WAV + events.ndjson（已 gitignore，属用户资产）
+├─ test/                       19 个测试套件 + 隔离实例夹具
 └─ docs/                       各周设计文档
 ```
 
@@ -92,6 +94,27 @@ imu-monitor/
 
 **差距**：LLM 真实模型调用**待凭据**（当前 `engine: rule` 兜底已覆盖全部当堂验证；填 `config.local.json` 即启用，无需改代码）。
 
+### 第 5 周：按键说话与语音播报 —— ✅ 已完成（真机验证）
+
+| 要求 | 状态 | 证据 |
+|---|---|---|
+| 佩戴者按一句话，查看者读到内容 | ✅ | BOOT 键 → 板端 I2S 录音 → WAV 上传 → 浏览器 Web Speech 识别 → 落盘 `data/voice/events.ndjson`，见 `docs/week5-voice.md` |
+| 录音在板端 | ✅ | `voice_record.c` 用板载 MEMS 麦克风（BCLK=41 / WS=42 / DIN=2），16 kHz / 16 bit / 单声道 |
+| 识别与播报在浏览器 | ✅ | `public/app.js:1860` `SpeechRecognition`、`:1937-1962` `speechSynthesis`；服务端 `/api/voice/state` 如实返回 `asr_runs_on=browser_web_speech` |
+| 全链状态可观测 | ✅ | 8 阶段 `VOICE_STAGES` + `idle`，`recorded → transcribed → task_running → task_done → spoken` 逐段推进，重启后回读 |
+| 无声与失败有可理解反馈 | ✅ | `silent` / `asr_failed` / `timeout` 三类失败未给 `reason` 时服务端补中文原因 |
+| 文字入口保持可用 | ✅ | 语音页保留文字入口卡，第 4 周 `/api/nl` 未改动（nl 37 + nl-config 44 全过） |
+| 音频来源与运行位置被记录 | ✅ | `audio_source=board_mic_i2s`、`asr_runs_on=browser_web_speech`，`voice-hil.js` 各有一条断言 |
+
+**★ 硬约束**：本板 `BSP_CAPS_AUDIO_SPEAKER = 0`，**物理上没有扬声器**，任何「板端播报」都是假的。
+
+**真机暴露并已修复的缺陷**：I2S 配 `I2S_SLOT_MODE_MONO` 时 RX 侧仍按 2 slot 送数据，
+固件把交错数据当单声道写进 WAV → 时长翻倍（3 秒录成 6144 ms）、播放慢一半、录音上限缩水一半。
+修复为独立 `s_raw` 缓冲 + `voice_deinterleave()` 自动探测活动 slot，实测 3 秒由 6144 ms 恢复为 3008/3136/3072 ms。
+
+**已知缺口（登记未修）**：`POST /api/voice/record` 的 `ok=true` 只表示命令写进串口，
+固件 `s_uploading` 时回 `ack=busy` 而服务端仍报 `accepted=true`。建议 `sendCommand()` 后等 ack 再定论。
+
 ---
 
 ## 三、测试与文档覆盖
@@ -103,7 +126,7 @@ imu-monitor/
 
 ## 四、按优先级的补充/修复任务清单
 
-> 四周**核心功能全部完成**（无 P0 阻断项）。以下为排查中发现的工程改进项，按影响排序。
+> 五周**核心功能全部完成**（无 P0 阻断项）。以下为排查中发现的工程改进项，按影响排序。
 
 **P1 — 稳健性/演示体验**
 
@@ -141,10 +164,22 @@ imu-monitor/
    - 新增 `data/help.ndjson`（只追加不滚动）+ 启动回读 `loadHelpHistory()`；
      记录含 `at` / `ev` / `help_id` / `device_id`，服务重启不再丢失证据
 6. **屏幕空闲画面**已改亮蓝底 + 实时数值（`ee02d7e`），若需可再调样式
+7. ~~**第 5 周 I2S 交错数据被当单声道**~~ —— ✅ **已修复（2026-10-26）**
+   - 现象：请求录 3 秒得到 6144 ms，请求 6 秒撞 10000 ms 上限，连续 3 轮完全一致
+   - 根因：`I2S_SLOT_MODE_MONO` 只影响 BCLK 计算（`i2s_std.c:125` `total_slot = 2`），
+     RX 侧仍按 2 slot 一帧送数据，非活动 slot 被 `auto_clear` 填 0；固件把交错数据
+     直接当单声道写进 WAV → 时长翻倍、播放慢一半、录音上限缩水一半
+   - 修复：独立 `s_raw` 缓冲（640000 字节）+ `voice_deinterleave()` 自动探测活动 slot；
+     实测 3 秒由 6144 ms 恢复为 3008/3136/3072 ms，6 秒为 6080 ms
+   - 防回归：`test/voice-layout-contract-test.js` 25 项静态契约
 
 **已知约束（非缺陷，记录备查）**
-- 串口必须保持有人读（板子每帧 `printf`，主机断开串口会缓冲满阻塞 → 帧率暴跌）
+- 串口**先被打开后又被关闭**时，板子 `printf` 会因 UART 缓冲满而阻塞 → 帧率暴跌。
+  **板子从未连接主机时不受影响**（USB-Serial-JTAG 数据由驱动丢弃）——2026-10-15
+  纯 WiFi 独立运行实测 90 秒平均 6.02 帧/秒、丢帧 0，已推翻旧结论的适用范围
 - 串口优先策略会忽略 WiFi 上报（避免数据源混乱）
+- 第 5 周遗留缺口：`POST /api/voice/record` 的 `ok=true` 只表示命令写进串口，
+  板端 `busy` 时服务端仍报 `accepted=true`（详见 `week5-voice.md` 第四节之二）
 
 ---
 
@@ -156,5 +191,6 @@ imu-monitor/
 | 第 2 周 | ✅ 已完成 |
 | 第 3 周 | ✅ 已完成（实物验证 2026-09-30 通过；viewer_ack 实物目验可补） |
 | 第 4 周 | ✅ 已完成（LLM 真实模型待凭据，备用路径已如实实现） |
+| 第 5 周 | ✅ 已完成（真机录音、上传、识别、播报全链跑通；I2S 交错缺陷已修复） |
 
-四周课程目标**全部达成**，核心功能均有代码证据、测试断言与实物验证记录。P1 三项为工程稳健性改进（摄像头重启、上传异步化、viewer_ack 实物验证），不影响当堂验证。
+五周课程目标**全部达成**，核心功能均有代码证据、测试断言与实物验证记录。P1 三项为工程稳健性改进（摄像头重启、上传异步化、viewer_ack 实物验证），不影响当堂验证。

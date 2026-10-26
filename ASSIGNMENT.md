@@ -383,6 +383,8 @@ npm run audit                 # 未使用函数 / 接口交叉核对 / 重复函
 - [x] **（第 3 周）实体按键与反馈**：板端 `btn_task`（ADC 自适应校准）+ `ui_task`（LED 快闪/慢闪 + ST7789 中文状态）+ `lcd_font.h`（自动生成字模）
 - [x] **（第 3 周）双向交互与取消**：`#help` 页 + `GET/POST /api/help` + 板端 `viewer_ack` / `help_cancel`
 - [x] **（第 3 周）任务说明、走查与改进记录**：§10 + [`docs/week3-button-feedback.md`](docs/week3-button-feedback.md)（状态图/时序图/实测/迁移）
+- [x] **（第 5 周）按键录音与语音链路**：板端 `voice_record.c`（I2S 去交错 + WAV）+ `#voice` 页 + `/api/voice*`（§12）
+- [x] **（第 5 周）运行位置与失败反馈说明**：§12.2（分工硬约束）+ §12.4（无声/识别失败/超时均有中文原因）
 
 > 提交前只需完成 **§0.1 的三处个人必改项**（WiFi、`SERVER_HOST`、`DEVICE_ID` ↔ `expectedDeviceId`），其余代码开箱即用。
 
@@ -725,3 +727,101 @@ cam_obj->fb_size   = cam_obj->recv_size;
 > 本次真正的问题不是"抓拍失败"，而是**失败不可见**。
 > 另外 `cam_stream_set_params()` 忽略了 `set_framesize()` 的返回值，
 > 所以日志里"参数已更新：640x480"**不代表切换真的成功**。
+
+---
+
+## 12. 第 5 周：按键说话与语音播报
+
+### 12.1 本周问题的答案
+
+> 佩戴者按下按键说一句话，查看者能读到这句说了什么吗？
+
+**能，但链路是分工的**：录音在**板端**，识别与播报在**浏览器**，落盘在**服务端**。
+
+```
+BOOT 键 → 板载 MEMS 麦克风 I2S 直采 → WAV(16kHz/16bit/单声道)
+   → WiFi 上传 → 服务端落盘 data/voice/ → 浏览器 Web Speech 识别成文字
+   → 复用第 4 周 /api/nl 查询 → speechSynthesis 播报
+```
+
+### 12.2 分工是硬约束（不是设计选择）
+
+| 环节 | 位置 | 为什么不能换 |
+|------|------|-------------|
+| 录音 | **板端** | 板子才有麦克风（BCLK=41 / WS=42 / DIN=2） |
+| 识别 | **浏览器** | 板端没有算力跑 ASR，也没有联网 ASR 的授权额度 |
+| 落盘 | **服务端** | 唯一长期存储 |
+| 播报 | **浏览器** | ★ 本板 `BSP_CAPS_AUDIO_SPEAKER = 0`，**物理上没有扬声器** |
+
+★ **任何「板端播报」的实现都是假的**。这一条必须写进验收，否则等于伪造能力。
+服务端 `/api/voice/state` 如实返回 `audio_source=board_mic_i2s`、`asr_runs_on=browser_web_speech`，
+测试对这两项各有一条断言。
+
+### 12.3 链路状态机
+
+`idle → recorded → transcribed → task_running → task_done → spoken`，
+失败分支 `silent`（没检测到语音）/ `asr_failed`（浏览器没识别出内容）/ `timeout`（链路超时）。
+
+- **没有设备完成证据时绝不显示「已录到」**：`recorded` 之前不许出现采集成功字样
+- 三类失败若前端没给 `reason`，服务端补一条中文原因；进入新阶段时清掉上一轮失败原因
+- 全链状态可 `GET /api/voice/state` 读到，`stage_text` 是给人看的中文说明
+
+### 12.4 当堂验证
+
+```bash
+node test/voice-hil.js --speak            # 真机：录音 → 上传 → 独立复核 WAV 电平
+node test/probe-voice-stop.js 5 2         # 真机探针：5 轮 start → 2s → stop 时长稳定性
+node test/voice-test.js                   # 84 项接口契约（隔离实例 + 合成 WAV）
+node test/voice-layout-contract-test.js   # 25 项数据布局静态契约
+```
+
+`voice-hil.js` **自己重新下载 WAV 并解码算 RMS**，不信服务端自报 —— 服务端说「录到声音」不算证据。
+静音时如实报「录到静音」并提示加 `--speak` 复验，不判通过。
+
+### 12.5 ★ 真机暴露的缺陷与修复（2026-10-26）
+
+**现象**：请求录 3 秒，服务端显示 **6144 ms**；请求 6 秒，显示 **10000 ms**（撞上限）。
+连续 3 轮结果完全一致 —— 确定性缺陷，不是偶发。
+
+**取证**：
+
+```
+3 秒录音 → 196,608 字节 PCM → 98,304 采样
+98,304 ÷ 3.072 s = 32,000 采样/秒   ← 但 WAV 头写的是 16,000
+前 16 个采样值: -37, 0, -53, 0, -53, 0, -49, 0, ...
+奇数下标全部为 0（偶采样 RMS 28.2 / 奇采样 RMS 0.0）
+```
+
+**根因**：I2S 配 `I2S_SLOT_MODE_MONO` 时，**RX 侧仍按 2 slot 一帧送数据**：
+
+- ESP-IDF `i2s_std.c:125` `handle->total_slot = 2`；`active_slot = 1` 只影响 BCLK 计算
+  （`clk_info->bclk = rate * total_slot * slot_bits`），**不改变数据布局**
+- 每帧 = 2 个 `int16`，只有活动 slot 是真实采样，另一个被 `chan_cfg.auto_clear = true` 填 0
+- 固件把交错数据直接当单声道写进 WAV → 时长翻倍、播放慢一半、录音上限缩水一半
+
+**修复**：独立 `s_raw` 缓冲（`VOICE_MAX_RAW_BYTES = 640000`，PSRAM 优先）+ `voice_deinterleave()`，
+探测前 2048 帧里 `lead_even` / `lead_odd` 非零计数自动选活动 slot（左右声道接反也能自适应）；
+采集循环按整帧读（`want -= want % (2 * VOICE_I2S_SLOTS)`）防错位。
+
+**修复后实测**：
+
+| 请求时长 | 修复前 | 修复后 |
+|---------|-------|-------|
+| 2 秒 | 4096 ms | 2048 / 2048 / 2048 / 2112 / 2048 ms |
+| 3 秒 | 6144 ms | 3008 / 3136 / 3072 ms |
+| 6 秒 | 10000 ms（撞上限） | 6080 ms |
+
+**防回归**：`test/voice-layout-contract-test.js` 25 项静态契约（断言 `i2s_channel_read` 必须写
+`s_raw` 而**绝不能写 `s_pcm`**），CI 里没板子也能拦住「有人又把交错数据当单声道用」。
+
+### 12.6 遗留缺口（登记未修）
+
+`POST /api/voice/record` 的 `ok=true` **只表示命令写进了串口**，不代表板端接受：
+固件 `voice_record_toggle()` 在 `s_uploading` 时直接拒绝并回 `cmd_ack(rid, "busy")`，
+而服务端仍返回 `ok=true / accepted=true` —— **谎报**。
+
+建议后续在 `sendCommand()` 后等待 ack 再定论，把 `accepted` 改成「板端确认」而非「写出口成功」。
+本周不修（超出范围），已在 `test/voice-hil.js` 第 ⑥ 段登记为已知缺口、不判失败 —— **登记不等于认可**。
+
+> 完整说明（架构图、接口清单、失败分支表、取证过程、迁移判据）见
+> [`docs/week5-voice.md`](docs/week5-voice.md)。
