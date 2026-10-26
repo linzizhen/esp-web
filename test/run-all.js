@@ -18,6 +18,10 @@
  *   node test/run-all.js          跑全部（e2e 自动用隔离实例 8099）
  *   node test/run-all.js e2e      只跑 e2e（仍走隔离实例）
  *   node test/run-all.js --serial 只跑单元/集成，跳过 e2e（省时）
+ *
+ * 不在本编排器内的两个测试（需真实硬件，手动跑）：
+ *   node test/voice-hil.js          真机端到端：录音 → 上传 → 电平复核
+ *   node test/probe-voice-stop.js   真机探针：连续多轮 start/stop 稳定性
  */
 'use strict';
 const { spawn } = require('node:child_process');
@@ -27,8 +31,9 @@ const fs = require('node:fs');
 const ROOT = path.join(__dirname, '..');
 const TEST = (...p) => path.join(__dirname, ...p);
 
-// 端口占用现状：8092 help-persist / 8093 feature / 8094 parse / 8095 verify+nl-config
-//              8096 acceptance / 8097 help+p0 / 8098 ws+nl / 8099 storage+e2e
+// 端口占用现状：8090 voice / 8091 handleline-guard / 8092 help-persist / 8093 feature
+//              8094 parse / 8095 verify+nl-config / 8096 acceptance / 8097 help+p0
+//              8098 ws+nl / 8099 storage+e2e
 const SUITES = [
   { name: 'theme',        file: 'theme-contract-test.js', kind: 'unit' },
   { name: 'isolation',    file: 'isolation-contract-test.js', kind: 'unit' },
@@ -46,6 +51,8 @@ const SUITES = [
   { name: 'acceptance',   file: 'acceptance-test.js',  kind: 'integration' },
   { name: 'nl',           file: 'nl-test.js',          kind: 'integration' },
   { name: 'nl-config',    file: 'nl-config-test.js',   kind: 'integration' },
+  { name: 'voice',        file: 'voice-test.js',       kind: 'integration' },
+  { name: 'voice-layout', file: 'voice-layout-contract-test.js', kind: 'unit' },
   { name: 'e2e',          file: 'e2e-test.js',         kind: 'e2e', needsServer: false },
 ];
 
