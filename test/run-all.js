@@ -36,6 +36,7 @@ const SUITES = [
   { name: 'cam-config',   file: 'cam-config-contract-test.js', kind: 'unit' },
   { name: 'parse',        file: 'parse-test.js',       kind: 'unit' },
   { name: 'feature',      file: 'feature-test.js',     kind: 'unit' },
+  { name: 'guard',        file: 'handleline-guard-test.js', kind: 'integration' },
   { name: 'storage',      file: 'storage-test.js',     kind: 'integration' },
   { name: 'p0-dedup',     file: 'p0-dedup-test.js',    kind: 'integration' },
   { name: 'verify',       file: 'verify-test.js',      kind: 'integration' },

@@ -1754,6 +1754,27 @@ function handleLine(line, source) {
     return;
   }
 
+  // 展示字段：去掉元数据（ts/seq/device/mac/iso 不画成传感器卡片）
+  const disp = Object.assign({}, numbers, others);
+  for (const k of [...META_KEYS, ...META_NUMERIC_KEYS]) delete disp[k];
+
+  /* 空帧守卫（第 5 周回归修复，缺陷早于 t2 就存在）：
+   * numbers 里可能只装着「元数据数值键」（ts / seq / uptime_ms / boot_ms）。
+   *   · JSON 路径在读帧时就把这些键分流进 meta，numbers 因此为空 —— 上面的守卫已返回；
+   *   · key=value 路径（tryKeyValue）不做元数据分流，于是 "seq=12 ts=..." 这类行
+   *     能通过上面的守卫。删掉元数据后 disp 变成 {}，旧代码仍继续落盘，
+   *     于是产生一条 fields:{} 的空记录（历史 158 条脏记录即由此而来）。
+   * 空观测不是观测：只进原始日志、计入无效行，不落盘 / 不改 state.fields /
+   * 不广播 sample / 不写入录制缓冲。
+   * 关于 request_id：它只可能出现在 JSON 帧里，而 JSON 帧若没有任何传感值，
+   * 上面的 numbers 守卫已经返回（既有语义）。因此这里的守卫不会改变远程采集
+   * 判定 —— 「没有观测证据就不算采集完成」由采集侧如实超时，绝不误报成功。 */
+  if (Object.keys(disp).length === 0) {
+    stats.linesInvalid++;
+    pushRaw(trimmed, false);
+    return;
+  }
+
   stats.linesValid++;
 
   // 更新设备身份与板端时间（来自固件上报的元数据）
@@ -1777,10 +1798,7 @@ function handleLine(line, source) {
   state.live = true;
   state.transport = transport;
   state.lastDataAt = recvTs;
-  // 展示字段：去掉元数据（ts/seq/device/mac/iso 不画成传感器卡片）
-  const disp = Object.assign({}, numbers, others);
-  for (const k of [...META_KEYS, ...META_NUMERIC_KEYS]) delete disp[k];
-  state.fields = disp;
+  state.fields = disp;          // disp 已在上方算好并做过空帧守卫
   pushRaw(trimmed, true);
 
   // 远程采集：帧里带 request_id 即本次请求的「新观测」（数据本身照常落盘）
