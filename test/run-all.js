@@ -132,11 +132,12 @@ async function main() {
 
     results.push({ ...s, ok, secs, out });
 
-    // 抓结果行（各测试格式不一：有的 "结果: N 通过"，有的 "通过 N / 失败 0"）
+    // 抓结果行（各测试格式不一：有的 "结果: N 通过"，有的 "通过 N / 失败 0"，
+    // 有的 "结果：N 项通过，M 项失败" —— "项" 必须可选，否则计数会整列消失）
     const m =
-      out.match(/结果[:：]\s*(\d+)\s*通过[,\s]*(\d+)\s*失败/) ||
+      out.match(/结果[:：]\s*(\d+)\s*(?:项\s*)?通过[,\s，]*(\d+)\s*(?:项\s*)?失败/) ||
       out.match(/通过[^\d]*(\d+)\s*\/\s*失败[^\d]*(\d+)/) ||
-      out.match(/(\d+)\s*通过[^\d]*(\d+)\s*失败/);
+      out.match(/(\d+)\s*(?:项\s*)?通过[^\d]*(\d+)\s*(?:项\s*)?失败/);
     const cnt = m ? `${GREEN(m[1])} 通过 / ${m[2]} 失败` : '';
 
     console.log(`${ok ? GREEN('✓') : RED('✗')} ${s.name.padEnd(12)} ${DIM(secs + 's')}  ${cnt}`);
