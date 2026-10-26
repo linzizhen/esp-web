@@ -67,6 +67,21 @@ const els = {
   btnLlmModels: $('btnLlmModels'), llmModels: $('llmModels'),
   llmMsg: $('llmMsg'),
 
+  // 按键说话 · 语音链路（第 5 周）
+  voiceBadge: $('voiceBadge'), voiceStageTag: $('voiceStageTag'),
+  voiceFailure: $('voiceFailure'), voiceFailureIcon: $('voiceFailureIcon'),
+  voiceFailureTitle: $('voiceFailureTitle'), voiceFailureDesc: $('voiceFailureDesc'),
+  btnVoiceUseText: $('btnVoiceUseText'), voiceSegments: $('voiceSegments'),
+  voiceDurText: $('voiceDurText'), voiceBytesText: $('voiceBytesText'), voiceSrcText: $('voiceSrcText'),
+  btnVoiceRetry: $('btnVoiceRetry'), btnVoiceSpeak: $('btnVoiceSpeak'),
+  voiceDownload: $('voiceDownload'), voicePlayer: $('voicePlayer'), voiceNote: $('voiceNote'),
+  voiceTextTag: $('voiceTextTag'), voiceTextForm: $('voiceTextForm'),
+  voiceTextInput: $('voiceTextInput'), voiceTextSend: $('voiceTextSend'),
+  voiceTextResult: $('voiceTextResult'),
+  voiceSrcAudio: $('voiceSrcAudio'), voiceSrcAsr: $('voiceSrcAsr'), voiceSrcTts: $('voiceSrcTts'),
+  voiceAudioDir: $('voiceAudioDir'), voiceEventsFile: $('voiceEventsFile'),
+  voiceHistory: $('voiceHistory'), voiceHistoryCount: $('voiceHistoryCount'),
+
   // 主题切换（浅色 / 深色）
   btnTheme: $('btnTheme'),
 };
@@ -1530,9 +1545,681 @@ if (els.llmForm) {
   loadLlmConfig();
 }
 
+// ---------------------------------------------------------------- 按键说话 · 语音链路（第 5 周）
+/* 链路（作业要求，顺序不可调换）：
+ *   ① 板端按键录音（板载 MEMS 麦克风 / I2S → 标准 WAV，POST /api/voice/audio 上传）
+ *   ② 服务端存 WAV（data/voice/<audio_id>.wav；服务端只存不算）
+ *   ③ 本机浏览器播放 + Web Speech API 识别（zh-CN，硬性要求）
+ *   ④ 用识别文本 POST 第 4 周 /api/nl（复用同一套受限任务，不另造规则）
+ *   ⑤ speechSynthesis 播报 reply
+ *   每推进一步都 POST /api/voice/state，全链状态可在服务端复核（刷新页面不丢）。
+ *
+ * 三条设计约束（来自课程硬性要求）：
+ *   · 四段各自显示「等待 / 进行中 / 成功 / 失败」，不能拿一句「出错了」糊过去
+ *   · 三个失败分支（无声 / 识别失败 / 超时）必须给中文原因 + 引导改用文字输入
+ *   · 文字入口永远可用：语音全挂也能完成任务
+ *
+ * 已知的浏览器限制（如实写出来，而不是假装能直接喂音频）：
+ *   Web Speech API 只接受「麦克风实时拾音」，没有接口能把 WAV 文件直接喂给它。
+ *   所以这里是「扬声器播放这段录音 → 浏览器麦克风听到 → 识别」，播放与识别必须同时进行，
+ *   期间环境要安静、音量要能听见。这一点在页面上也写明了。 */
+const VOICE_STAGE_TEXT = {
+  idle: '尚无语音链路',
+  recorded: '已收到板端 WAV',
+  transcribed: '浏览器已识别为文字',
+  asr_failed: '识别失败（可改用文字输入）',
+  task_running: '正在执行第 4 周 NL 任务',
+  task_done: '任务已完成',
+  spoken: '已在浏览器播报',
+  silent: '没有检测到语音（无声或过短）',
+  timeout: '链路超时（可改用文字输入）',
+};
+
+/* Web Speech API 的错误码 → 能看懂的中文原因（每条都指向下一步该怎么做） */
+const VOICE_ASR_ERROR_TEXT = {
+  'not-allowed': '浏览器拒绝了麦克风权限：识别靠麦克风收听播放出来的录音，必须允许麦克风。请在地址栏重新允许麦克风后点「重新识别这段录音」。',
+  'service-not-allowed': '浏览器策略禁止了语音识别服务（可能需要 https / localhost，或企业策略限制）。请改用下方「文字入口」输入同一句话。',
+  'audio-capture': '浏览器找不到可用的麦克风，收不到声音，无法识别。请接上麦克风并允许权限，或改用文字输入。',
+  'no-speech': '没有识别到语音内容：可能声音太小、环境太吵，或这段录音太短。请调大音量后点「重新识别这段录音」，或改用文字输入。',
+  'network': '识别服务网络异常（Web Speech API 需要连接浏览器厂商的识别服务）。请检查网络后重试，或改用文字输入。',
+  'language-not-supported': '当前浏览器不支持中文（zh-CN）识别。请改用 Chrome / Edge 打开本页，或改用文字输入。',
+  'aborted': '识别被中断（可能页面切走或播放提前停止）。请点「重新识别这段录音」重试，或改用文字输入。',
+};
+
+const VOICE_SEG_LABEL = {
+  record: '① 录音 · 板端按键录音（板载 MEMS 麦克风 / I2S）',
+  asr: '② 识别 · 本机浏览器 Web Speech API（zh-CN）',
+  task: '③ 任务执行 · 复用第 4 周 /api/nl',
+  tts: '④ 播放 · 本机浏览器 speechSynthesis',
+};
+const VOICE_SEG_STATE = { wait: '等待', run: '进行中', done: '成功', fail: '失败' };
+const VOICE_SEG_ORDER = ['record', 'asr', 'task', 'tts'];
+
+/* 历史事件名 → 中文说明（与 server.js 的 VOICE_STAGES 一一对应） */
+const VOICE_EVENT_TEXT = {
+  recorded: '板端 WAV 已上传 · 服务端已落盘',
+  transcribed: '浏览器识别成功',
+  asr_failed: '浏览器识别失败',
+  task_running: '已交给第 4 周 /api/nl',
+  task_done: '任务执行完成',
+  spoken: '浏览器已播报',
+  silent: '没有检测到语音（未进入识别）',
+  timeout: '链路超时',
+};
+
+const VOICE = {
+  state: null,          // 服务端最近一次全链快照（GET /api/voice/state 原样）
+  lastAudioId: null,    // 已接管过的 audio_id：避免轮询把同一段录音反复处理
+  busy: false,          // 本机链路正在跑（播放 / 识别 / 任务 / 播报）
+  seg: {
+    record: { st: 'wait', text: '' },
+    asr: { st: 'wait', text: '' },
+    task: { st: 'wait', text: '' },
+    tts: { st: 'wait', text: '' },
+  },
+};
+
+function voiceNote(text) {
+  if (els.voiceNote) els.voiceNote.textContent = text;
+}
+
+function voiceDurLabel(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return '—';
+  return (Number(ms) / 1000).toFixed(2) + ' 秒';
+}
+
+function voiceBytesLabel(b) {
+  if (b == null || !Number.isFinite(Number(b))) return '—';
+  const n = Number(b);
+  return n >= 1024 ? `${(n / 1024).toFixed(1)} KB（${n} B）` : `${n} B`;
+}
+
+/** 带超时的 JSON 请求：超时由 AbortController 触发，抛出的错误 name === 'AbortError' */
+async function voiceFetchJson(url, opts, timeoutMs) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs || 8000);
+  try {
+    const r = await fetch(url, Object.assign({}, opts || {}, { signal: ac.signal }));
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function voiceSegReset() {
+  for (const k of VOICE_SEG_ORDER) VOICE.seg[k] = { st: 'wait', text: '' };
+}
+
+function voiceSetSeg(key, st, text) {
+  if (!VOICE.seg[key]) VOICE.seg[key] = { st: 'wait', text: '' };
+  VOICE.seg[key] = { st, text: text || '' };
+}
+
+function renderVoiceSegments() {
+  if (!els.voiceSegments) return;
+  els.voiceSegments.innerHTML = VOICE_SEG_ORDER.map((k) => {
+    const s = VOICE.seg[k] || { st: 'wait', text: '' };
+    const cls = s.st === 'done' ? 'done' : s.st === 'run' ? 'active' : s.st === 'fail' ? 'fail' : '';
+    const state = VOICE_SEG_STATE[s.st] || '';
+    return `<li class="${cls}"><span class="st-time">${escHtml(state)}</span>`
+      + escHtml(VOICE_SEG_LABEL[k]) + (s.text ? ' · ' + escHtml(s.text) : '') + '</li>';
+  }).join('');
+}
+
+/** 失败横幅：三个必达分支（无声 / 识别失败 / 超时）各有明确中文标题与下一步引导 */
+const VOICE_FAIL_KIND = {
+  silent: {
+    title: '没有检测到语音',
+    desc: (reason) => `${reason || '这段录音基本无声或太短，未进入识别。'} 处理建议：靠近板载麦克风、按住按键把一句话说完再松开，重录一次；也可以直接用下方「文字入口」输入同一句话。`,
+  },
+  asr_failed: {
+    title: '识别失败（可改用文字输入）',
+    desc: (reason) => `${reason || '浏览器没能识别出这段录音的内容。'} 处理建议：确认扬声器能听见、麦克风已授权后点「重新识别这段录音」；仍然失败就直接用下方「文字入口」输入同一句话，任务照样能完成。`,
+  },
+  timeout: {
+    title: '链路超时（可改用文字入口）',
+    desc: (reason) => `${reason || '链路某一步等待超时。'} 处理建议：等采集类请求结束后重试；如果反复超时，直接用下方「文字入口」输入同一句话，避免一直等。`,
+  },
+  task_failed: {
+    title: '任务执行失败（可改用文字输入）',
+    desc: (reason) => `${reason || '识别已经成功，但把文本交给 /api/nl 时失败了。'} 处理建议：稍后点「重新识别这段录音」重试；也可以直接把这句话打进下方「文字入口」，任务照样能完成。`,
+  },
+};
+
+function renderVoiceFailure(stage, reason) {
+  if (!els.voiceFailure) return;
+  const kind = VOICE_FAIL_KIND[stage];
+  if (!kind) { els.voiceFailure.classList.add('hidden'); return; }
+  els.voiceFailure.classList.remove('hidden');
+  els.voiceFailure.className = 'help-alert warn';
+  if (els.voiceFailureTitle) els.voiceFailureTitle.textContent = kind.title;
+  if (els.voiceFailureDesc) els.voiceFailureDesc.textContent = kind.desc(reason);
+  if (els.voiceFailureIcon) els.voiceFailureIcon.textContent = stage === 'timeout' ? '⏱' : '!';
+}
+
+function renderVoiceFacts(sv) {
+  const d = sv || {};
+  if (els.voiceDurText) els.voiceDurText.textContent = voiceDurLabel(d.duration_ms);
+  if (els.voiceBytesText) els.voiceBytesText.textContent = voiceBytesLabel(d.bytes);
+  if (els.voiceSrcText) els.voiceSrcText.textContent = '板载麦克风（I2S）';
+}
+
+function renderVoiceHistory(hist) {
+  if (!els.voiceHistory) return;
+  const list = Array.isArray(hist) ? hist : [];
+  if (els.voiceHistoryCount) els.voiceHistoryCount.textContent = list.length ? `${list.length} 条` : '—';
+  if (!list.length) {
+    els.voiceHistory.innerHTML = '<div class="obs-empty">尚无语音事件。</div>';
+    return;
+  }
+  // 倒序：最新的在最上面
+  const rows = list.slice().reverse().map((e) => {
+    const t = e.at || e.updated_at ? fmtClock(e.at || e.updated_at) : '—';
+    const label = VOICE_EVENT_TEXT[e.stage || e.status] || e.stage || '未知事件';
+    const extra = [];
+    if (e.transcript) extra.push(`「${e.transcript}」`);
+    if (e.reply) extra.push(`intent=${e.intent || '—'} · ${e.reply}`);
+    if (e.reason) extra.push(e.reason);
+    if (e.audio_id) extra.push(e.audio_id);
+    const cls = e.stage === 'asr_failed' || e.stage === 'silent' || e.stage === 'timeout' ? 'fail' : '';
+    return `<li class="${cls}"><span class="st-time">${t}</span>${escHtml(label)}`
+      + (extra.length ? ' · ' + escHtml(extra.join(' · ')) : '') + '</li>';
+  });
+  els.voiceHistory.innerHTML = `<ol class="steps">${rows.join('')}</ol>`;
+}
+
+/** 服务端快照 → 四段状态（用于刷新后恢复，以及非本机推进的阶段） */
+function voiceApplyStageToSegments(sv) {
+  const st = sv && sv.stage;
+  voiceSegReset();
+  renderVoiceFailure(null);
+  if (!st || st === 'idle') { renderVoiceSegments(); return; }
+  const durTxt = `${voiceDurLabel(sv.duration_ms)} · ${voiceBytesLabel(sv.bytes)} · 板载麦克风`;
+  const trTxt = sv.transcript ? `识别文本：「${sv.transcript}」` : '识别成功';
+  const taskTxt = sv.reply ? `intent=${sv.intent || '—'} · ${sv.reply}` : '任务完成';
+  const reason = sv.reason || '';
+
+  voiceSetSeg('record', 'done', durTxt);
+  if (st === 'recorded') {
+    voiceSetSeg('asr', 'wait', '等待浏览器识别（若未自动开始，点「重新识别这段录音」）');
+  } else if (st === 'transcribed') {
+    voiceSetSeg('asr', 'done', trTxt);
+    voiceSetSeg('task', 'wait', '等待交给 /api/nl');
+  } else if (st === 'task_running') {
+    voiceSetSeg('asr', 'done', trTxt);
+    voiceSetSeg('task', 'run', '正在执行');
+  } else if (st === 'task_done') {
+    voiceSetSeg('asr', 'done', trTxt);
+    voiceSetSeg('task', 'done', taskTxt);
+    voiceSetSeg('tts', 'wait', '等待播报（可点「再播报一次」）');
+  } else if (st === 'spoken') {
+    voiceSetSeg('asr', 'done', trTxt);
+    voiceSetSeg('task', 'done', taskTxt);
+    voiceSetSeg('tts', 'done', '已在本机浏览器播报');
+  } else if (st === 'asr_failed') {
+    voiceSetSeg('asr', 'fail', reason || '识别失败');
+    voiceSetSeg('task', 'wait', '未执行（识别没通过）');
+    voiceSetSeg('tts', 'wait', '未执行');
+    renderVoiceFailure('asr_failed', reason);
+  } else if (st === 'silent') {
+    voiceSetSeg('record', 'fail', reason || '没有检测到语音');
+    voiceSetSeg('asr', 'wait', '未进入识别（这段录音没有语音）');
+    voiceSetSeg('task', 'wait', '未执行');
+    voiceSetSeg('tts', 'wait', '未执行');
+    renderVoiceFailure('silent', reason);
+  } else if (st === 'timeout') {
+    // 超时发生在哪一段：用服务端已留下的证据倒推
+    if (!sv.transcript) {
+      voiceSetSeg('asr', 'fail', reason || '识别超时');
+      voiceSetSeg('task', 'wait', '未执行');
+      voiceSetSeg('tts', 'wait', '未执行');
+    } else if (!sv.reply) {
+      voiceSetSeg('asr', 'done', trTxt);
+      voiceSetSeg('task', 'fail', reason || '任务执行超时');
+      voiceSetSeg('tts', 'wait', '未执行');
+    } else {
+      voiceSetSeg('asr', 'done', trTxt);
+      voiceSetSeg('task', 'done', taskTxt);
+      voiceSetSeg('tts', 'fail', reason || '播报超时');
+    }
+    renderVoiceFailure('timeout', reason);
+  }
+  renderVoiceSegments();
+}
+
+/** 应用一份服务端快照。doSegs=false 时只更新总状态/事实/历史，不覆盖进行中的四段。 */
+function voiceApplySnapshot(sv, doSegs) {
+  if (!sv) return;
+  VOICE.state = sv;
+  const st = sv.stage || 'idle';
+  if (els.voiceStageTag) {
+    els.voiceStageTag.textContent = sv.stage_text || VOICE_STAGE_TEXT[st] || st;
+    els.voiceStageTag.className = 'tag'
+      + (st === 'spoken' ? ' tag-ok' : (st === 'asr_failed' || st === 'silent' || st === 'timeout') ? ' tag-warn' : '');
+  }
+  // 导航红点：有新录音待处理时提示（与求助红点同一套样式）
+  if (els.voiceBadge) els.voiceBadge.classList.toggle('hidden', st !== 'recorded');
+
+  renderVoiceFacts(sv);
+
+  // 音频来源与运行位置一律以服务端快照为准（前端不自己编造）
+  if (els.voiceSrcAudio && sv.audio_source_text) els.voiceSrcAudio.textContent = sv.audio_source_text;
+  if (els.voiceSrcAsr && sv.asr_runs_on_text) els.voiceSrcAsr.textContent = sv.asr_runs_on_text;
+  if (els.voiceSrcTts && sv.tts_runs_on_text) els.voiceSrcTts.textContent = sv.tts_runs_on_text;
+  if (els.voiceAudioDir && sv.audio_dir) els.voiceAudioDir.textContent = sv.audio_dir;
+  if (els.voiceEventsFile && sv.events_file) els.voiceEventsFile.textContent = sv.events_file;
+
+  if (els.voiceDownload) {
+    if (sv.has_audio && sv.audio_url) {
+      els.voiceDownload.href = sv.download_url || sv.audio_url;
+      els.voiceDownload.download = (sv.audio_id || 'voice') + '.wav';
+      els.voiceDownload.classList.remove('hidden');
+    } else {
+      els.voiceDownload.classList.add('hidden');
+    }
+  }
+
+  renderVoiceHistory(sv.history);
+
+  if (doSegs && !VOICE.busy) voiceApplyStageToSegments(sv);
+
+  // 发现新录音 → 接管本条链路（轮询/WS 都可能触发，用 lastAudioId 去重）
+  // 只在「语音」页自动接管：否则用户在别的页面时突然外放录音会很困惑；
+  // 不在语音页时只点亮导航红点，回到语音页再用「开始处理 / 重新识别」按钮接管。
+  if (!VOICE.busy && st === 'recorded' && sv.audio_id && sv.audio_id !== VOICE.lastAudioId
+      && S.page === 'voice') {
+    voiceStartChain(sv.audio_id);
+  }
+}
+
+/** 轮询：服务端始终是四段状态的唯一真源，前端只做推进与展示 */
+async function voicePoll() {
+  if (VOICE.busy) return;
+  try {
+    const sv = await voiceFetchJson('/api/voice/state', null, 6000);
+    if (sv && sv.ok !== false) voiceApplySnapshot(sv, true);
+  } catch (_) { /* 服务端未起：静默，UI 保持现状 */ }
+}
+
+/** 推进阶段：POST /api/voice/state；失败不影响主链路（服务端不可达时页面仍继续走） */
+async function voicePostState(body) {
+  try {
+    const j = await voiceFetchJson('/api/voice/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 6000);
+    if (j && j.voice) voiceApplySnapshot(j.voice, false);
+    return !!(j && j.ok);
+  } catch (_) { return false; }
+}
+
+/* 识别：Web Speech API（只认麦克风，故与播放同时进行）。返回 { promise, stopSoft, abort } */
+function voiceStartAsr(durMs) {
+  const out = { promise: null, stopSoft: () => {}, abort: () => {} };
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    out.promise = Promise.resolve({
+      ok: false,
+      error: 'unsupported',
+      reason: '当前浏览器不支持 Web Speech API（SpeechRecognition）：请改用 Chrome / Edge 打开本页，或直接用下方文字输入。',
+    });
+    return out;
+  }
+  let rec = null;
+  out.promise = new Promise((resolve) => {
+    let done = false;
+    let finalText = '';
+    let interim = '';
+    let timer = 0;
+    const pick = () => (finalText || interim || '').trim();
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      try { rec.stop(); } catch (_) {}
+      resolve(r);
+    };
+    try {
+      rec = new SR();
+    } catch (e) {
+      finish({ ok: false, error: 'init_failed', reason: '浏览器语音识别初始化失败：' + (e && e.message ? e.message : String(e)) + '。请改用下方文字输入。' });
+      return;
+    }
+    rec.lang = 'zh-CN';            // 硬性要求：识别语言必须中文
+    rec.interimResults = true;
+    rec.maxAlternatives = 3;
+    rec.continuous = false;
+
+    rec.onresult = (ev) => {
+      for (let i = ev.resultIndex || 0; i < ev.results.length; i++) {
+        const r = ev.results[i];
+        if (!r || !r[0]) continue;
+        if (r.isFinal) finalText += r[0].transcript;
+        else interim = r[0].transcript;
+      }
+      const live = pick();
+      if (live) {
+        voiceSetSeg('asr', 'run', `已听到「${live}」…`);
+        renderVoiceSegments();
+      }
+    };
+    rec.onerror = (ev) => {
+      const err = (ev && ev.error) || 'asr_error';
+      finish({ ok: false, error: err, reason: VOICE_ASR_ERROR_TEXT[err] || `浏览器识别失败（${err}）。请点「重新识别这段录音」重试，或改用下方文字输入。` });
+    };
+    rec.onend = () => {
+      const t = pick();
+      if (t) finish({ ok: true, text: t });
+      else finish({ ok: false, error: 'no-speech', reason: VOICE_ASR_ERROR_TEXT['no-speech'] });
+    };
+    // 超时兜底：录音时长 + 10 秒，最少 12 秒（识别服务偶尔很慢）
+    const limit = Math.max(12000, (Number(durMs) || 0) + 10000);
+    timer = setTimeout(() => {
+      finish({
+        ok: false,
+        timeout: true,
+        reason: `识别等待超过 ${Math.round(limit / 1000)} 秒仍未返回结果（浏览器识别服务没有响应）。`,
+      });
+    }, limit);
+    // 播放结束 → 稍等一会儿再收尾，给最后一段识别结果留出返回时间
+    out.stopSoft = () => setTimeout(() => { try { rec.stop(); } catch (_) {} }, 700);
+    out.abort = () => finish({ ok: false, error: 'aborted', reason: '识别被中断。' });
+    try {
+      rec.start();
+    } catch (e) {
+      finish({ ok: false, error: 'start_failed', reason: '启动浏览器识别失败：' + (e && e.message ? e.message : String(e)) + '。请改用下方文字输入。' });
+    }
+  });
+  return out;
+}
+
+/* 播报：speechSynthesis。文本长度决定兜底超时，避免 onerror 不触发时永久挂住 */
+function voiceSpeak(text) {
+  return new Promise((resolve) => {
+    const t = String(text || '').trim();
+    if (!t) { resolve({ ok: false, error: 'empty' }); return; }
+    if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
+      resolve({ ok: false, error: 'unsupported' });
+      return;
+    }
+    let done = false;
+    let timer = 0;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      resolve(r);
+    };
+    try { window.speechSynthesis.cancel(); } catch (_) {}
+    const u = new SpeechSynthesisUtterance(t);
+    u.lang = 'zh-CN';
+    u.rate = 1;
+    u.pitch = 1;
+    u.onend = () => finish({ ok: true });
+    u.onerror = (ev) => finish({ ok: false, error: (ev && ev.error) || 'speech_error' });
+    timer = setTimeout(() => finish({ ok: false, error: 'timeout' }), Math.min(60000, 8000 + t.length * 260));
+    try { window.speechSynthesis.speak(u); } catch (e) {
+      finish({ ok: false, error: 'speak_failed' });
+    }
+  });
+}
+
+/* 主链路：接管一段新录音，依次走完 播放+识别 → /api/nl → 播报，每步推进服务端状态 */
+async function voiceStartChain(audioId) {
+  if (VOICE.busy || !audioId) return;
+  VOICE.busy = true;
+  VOICE.lastAudioId = audioId;
+  voiceSegReset();
+  voiceSetSeg('record', 'run', '正在从服务端读取这段 WAV…');
+  renderVoiceSegments();
+  renderVoiceFailure(null);
+  voiceNote('已发现新录音，正在自动走链路：播放 → 识别 → 任务 → 播报。');
+
+  try {
+    // ---- ① 录音：取服务端实测元信息（时长 / 字节 / 电平，静音判定的事实来源）----
+    let latest = null;
+    try {
+      const j = await voiceFetchJson('/api/voice', null, 6000);
+      if (j && j.latest && j.latest.audio_id === audioId) latest = j.latest;
+    } catch (_) { /* 取不到元信息也不阻断，后面用状态快照里的值 */ }
+    const sv = VOICE.state || {};
+    const durMs = (latest && latest.duration_ms != null) ? latest.duration_ms : sv.duration_ms;
+    const bytes = (latest && latest.bytes != null) ? latest.bytes : sv.bytes;
+    renderVoiceFacts({ duration_ms: durMs, bytes });
+    voiceSetSeg('record', 'done', `${voiceDurLabel(durMs)} · ${voiceBytesLabel(bytes)} · 板载麦克风`);
+    renderVoiceSegments();
+
+    // ---- ② 无声 / 过短：先判掉，别让识别白跑一趟 ----
+    const tooShort = durMs != null && Number(durMs) > 0 && Number(durMs) < 300;
+    const silentHint = !!(latest && latest.silent_hint === true);
+    const nearlyEmpty = bytes != null && Number(bytes) < 200;
+    if (silentHint || tooShort || nearlyEmpty) {
+      const peak = latest && latest.peak_dbfs != null ? `服务端实测峰值 ${latest.peak_dbfs} dBFS（低于 -40 dBFS 判为无声）` : '服务端判定这段 WAV 基本无声';
+      const reason = '没有检测到语音：' + peak
+        + (tooShort ? `；录音仅 ${voiceDurLabel(durMs)}，太短` : '')
+        + (nearlyEmpty ? `；文件只有 ${voiceBytesLabel(bytes)}` : '')
+        + '。';
+      voiceSetSeg('record', 'fail', '没有检测到语音');
+      voiceSetSeg('asr', 'wait', '未进入识别（这段录音没有语音）');
+      voiceSetSeg('task', 'wait', '未执行');
+      voiceSetSeg('tts', 'wait', '未执行');
+      renderVoiceSegments();
+      renderVoiceFailure('silent', reason);
+      voiceNote('这段录音没有可识别的语音：' + peak + '。请靠近板载麦克风重录，或使用下方文字入口。');
+      await voicePostState({ stage: 'silent', audio_id: audioId, reason });
+      return;
+    }
+
+    // ---- ③ 播放 + 识别（同时进行：识别只能听麦克风，靠外放让它听到这段录音）----
+    els.voicePlayer.src = `/api/voice/audio/${encodeURIComponent(audioId)}`;
+    try { els.voicePlayer.currentTime = 0; } catch (_) {}
+    voiceSetSeg('asr', 'run', '浏览器正在听这段录音（zh-CN）…');
+    renderVoiceSegments();
+    voiceNote('正在播放并识别：请保持扬声器可听见、音量适中，识别期间不要说话。');
+
+    const asr = voiceStartAsr(durMs);
+    let played = true;
+    let playErr = '';
+    try {
+      await els.voicePlayer.play();
+    } catch (e) {
+      played = false;
+      playErr = (e && e.message) ? e.message : '浏览器拒绝了自动播放';
+    }
+    if (!played) {
+      // 自动播放被拦不是「识别失败」，是「录音没放出来」：单独说清楚，不冒充识别结果
+      asr.abort();
+      const reason = `浏览器阻止了自动播放，这段录音没能放出来，麦克风也就听不到它（${playErr}）。请点页面上的播放按钮后再点「重新识别这段录音」，或改用文字输入。`;
+      voiceSetSeg('asr', 'fail', '未识别（录音未能播放）');
+      voiceSetSeg('task', 'wait', '未执行');
+      voiceSetSeg('tts', 'wait', '未执行');
+      renderVoiceSegments();
+      // 服务端只失败分支有枚举：这里用 asr_failed（识别这一步没完成），原因如实写明是自动播放被拦
+      renderVoiceFailure('asr_failed', reason);
+      voiceNote('自动播放被浏览器拦截。点播放按钮听过这段录音后，再点「重新识别这段录音」；也可以直接用文字入口。');
+      await voicePostState({ stage: 'asr_failed', audio_id: audioId, reason });
+      return;
+    }
+    const onEnded = () => asr.stopSoft();
+    els.voicePlayer.addEventListener('ended', onEnded, { once: true });
+
+    const speech = await asr.promise;
+    if (!speech.ok) {
+      if (speech.timeout) {
+        const reason = `识别超时：${speech.reason || ''} 可点「重新识别这段录音」重试；如果一直超时，请直接用下方文字入口输入任务。`;
+        voiceSetSeg('asr', 'fail', '识别超时');
+        voiceSetSeg('task', 'wait', '未执行');
+        voiceSetSeg('tts', 'wait', '未执行');
+        renderVoiceSegments();
+        renderVoiceFailure('timeout', reason);
+        voiceNote('识别超时。检查网络（Web Speech API 依赖浏览器厂商的识别服务）后重试，或改用文字入口。');
+        await voicePostState({ stage: 'timeout', audio_id: audioId, reason });
+        return;
+      }
+      const reason = speech.reason || `浏览器识别失败（${speech.error || '未知原因'}）。请重试或改用文字输入。`;
+      voiceSetSeg('asr', 'fail', speech.error === 'unsupported' ? '浏览器不支持 Web Speech API' : '识别失败');
+      voiceSetSeg('task', 'wait', '未执行');
+      voiceSetSeg('tts', 'wait', '未执行');
+      renderVoiceSegments();
+      renderVoiceFailure('asr_failed', reason);
+      voiceNote(reason);
+      await voicePostState({ stage: 'asr_failed', audio_id: audioId, reason });
+      return;
+    }
+
+    const text = String(speech.text || '').trim();
+    voiceSetSeg('asr', 'done', `识别文本：「${text}」`);
+    renderVoiceSegments();
+    await voicePostState({ stage: 'transcribed', audio_id: audioId, transcript: text });
+
+    // ---- ④ 任务：复用第 4 周 /api/nl（不另造判定规则）----
+    voiceSetSeg('task', 'run', '正在交给 /api/nl…');
+    renderVoiceSegments();
+    voiceNote('识别成功，正在执行任务（采集类请求会等待设备真实结果，可能需要几秒）。');
+    await voicePostState({ stage: 'task_running', audio_id: audioId });
+
+    let nl = null;
+    let nlErr = null;
+    try {
+      nl = await voiceFetchJson('/api/nl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      }, 25000);
+    } catch (e) { nlErr = e; }
+
+    if (!nl || nl.ok === false) {
+      const isTimeout = !!(nlErr && (nlErr.name === 'AbortError' || nlErr.name === 'TimeoutError'));
+      const detail = nlErr
+        ? (isTimeout ? '/api/nl 超过 25 秒没有返回' : `请求 /api/nl 失败：${nlErr.message || nlErr.name}`)
+        : ((nl && (nl.message || nl.error)) || '服务端未返回结果');
+      const reason = isTimeout
+        ? `${detail}（采集类任务可能卡在设备侧）。可等设备恢复后重试，或直接用下方文字入口输入同一句话。`
+        : `${detail}。请稍后点「重新识别这段录音」重试，或直接用下方文字入口输入同一句话。`;
+      voiceSetSeg('task', 'fail', isTimeout ? '任务执行超时' : '任务请求失败');
+      voiceSetSeg('tts', 'wait', '未执行');
+      renderVoiceSegments();
+      /* 服务端失败枚举里能描述「卡住 / 没做完」的只有 timeout 一档，故阶段如实上报 timeout；
+       * 但页面横幅按真实原因分两种措辞，不能让用户看到「超时」却发现其实是被拒绝 / 报错。 */
+      renderVoiceFailure(isTimeout ? 'timeout' : 'task_failed', reason);
+      voiceNote(reason);
+      await voicePostState({ stage: 'timeout', audio_id: audioId, reason });
+      return;
+    }
+
+    const intent = nl.intent || '(未识别意图)';
+    const reply = nl.reply || '(服务端没有给出回复)';
+    VOICE.reply = reply;
+    voiceSetSeg('task', 'done', `intent=${intent} · ${reply}`);
+    renderVoiceSegments();
+    await voicePostState({ stage: 'task_done', audio_id: audioId, intent, reply });
+
+    // ---- ⑤ 播报：speechSynthesis ----
+    voiceSetSeg('tts', 'run', '正在播报…');
+    renderVoiceSegments();
+    voiceNote('任务完成，正在播报回复。');
+    const spoken = await voiceSpeak(reply);
+    if (spoken.ok) {
+      voiceSetSeg('tts', 'done', '已在本机浏览器播报');
+      renderVoiceSegments();
+      await voicePostState({ stage: 'spoken', audio_id: audioId });
+      voiceNote('链路完成：板端录音 → 浏览器识别 → /api/nl 任务 → 浏览器播报。');
+    } else {
+      voiceSetSeg('tts', 'fail', `播报失败（${spoken.error}）`);
+      renderVoiceSegments();
+      voiceNote('回复已显示在页面上，但浏览器没能播报（' + spoken.error + '）。可点「再播报一次」重试。');
+    }
+  } catch (e) {
+    voiceNote('链路异常：' + ((e && e.message) || String(e)) + '。可使用下方文字入口完成任务。');
+    renderVoiceSegments();
+  } finally {
+    VOICE.busy = false;
+    voicePoll();   // 收尾后与服务端对齐一次（服务端是唯一真源）
+  }
+}
+
+/* 按钮：文字入口只发 /api/nl，不伪造语音状态（它本来就没有音频） */
+if (els.voiceTextForm) {
+  els.voiceTextForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const text = (els.voiceTextInput.value || '').trim();
+    if (!text) return;
+    els.voiceTextInput.value = '';
+    els.voiceTextSend.disabled = true;
+    els.voiceTextResult.innerHTML = `正在执行「${escHtml(text)}」…`;
+    try {
+      const j = await voiceFetchJson('/api/nl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      }, 30000);
+      if (!j || j.ok === false) throw new Error((j && (j.error || j.message)) || '服务端未返回结果');
+      const intent = j.intent || '(未识别意图)';
+      const reply = j.reply || '(服务端没有给出回复)';
+      els.voiceTextResult.innerHTML =
+        `已执行：<b>${escHtml(text)}</b><br>` +
+        `intent：<code>${escHtml(intent)}</code> · 引擎：${escHtml(j.engine || '—')} · 文案：${j.reply_by === 'llm' ? 'LLM' : '模板'}<br>` +
+        `回复：${escHtml(reply)}`;
+      els.voiceTextTag.textContent = '刚刚执行成功';
+      els.voiceTextTag.className = 'tag tag-ok';
+      const sp = await voiceSpeak(reply);
+      els.voiceTextResult.innerHTML += sp.ok
+        ? '<br><span class="obs-check ok">✓ 已用浏览器播报这条回复</span>'
+        : `<br><span class="obs-check no">浏览器未能播报（${escHtml(String(sp.error))}）</span>`;
+    } catch (e) {
+      const msg = (e && e.name === 'AbortError')
+        ? '服务端超过 30 秒没有返回（可能卡在采集任务上）'
+        : ((e && e.message) || '未知错误');
+      els.voiceTextResult.innerHTML = `文字入口执行失败：${escHtml(msg)}。语音链路不受影响。`;
+      els.voiceTextTag.textContent = '请求失败';
+      els.voiceTextTag.className = 'tag tag-warn';
+    } finally {
+      els.voiceTextSend.disabled = false;
+    }
+  });
+}
+
+if (els.btnVoiceRetry) {
+  els.btnVoiceRetry.onclick = () => {
+    const sv = VOICE.state || {};
+    if (VOICE.busy) { voiceNote('链路正在运行，请等这一步结束再重试。'); return; }
+    if (!sv.audio_id || !sv.has_audio) { voiceNote('还没有可重试的录音：先在开发板上按键录一段。'); return; }
+    voiceStartChain(sv.audio_id);
+  };
+}
+
+if (els.btnVoiceSpeak) {
+  els.btnVoiceSpeak.onclick = async () => {
+    const reply = (VOICE.state && VOICE.state.reply) || VOICE.reply || '';
+    if (!reply) { voiceNote('还没有可播报的回复：等任务执行完成，或先用文字入口执行一次。'); return; }
+    voiceSetSeg('tts', 'run', '正在播报…');
+    renderVoiceSegments();
+    const sp = await voiceSpeak(reply);
+    if (sp.ok) {
+      voiceSetSeg('tts', 'done', '已在本机浏览器播报');
+      renderVoiceSegments();
+      if (VOICE.state && VOICE.state.audio_id) await voicePostState({ stage: 'spoken', audio_id: VOICE.state.audio_id });
+    } else {
+      voiceSetSeg('tts', 'fail', `播报失败（${sp.error}）`);
+      renderVoiceSegments();
+      voiceNote('播报失败（' + sp.error + '）：请确认系统有可用的语音合成引擎或已选中中文语音。');
+    }
+  };
+}
+
+if (els.btnVoiceUseText) {
+  els.btnVoiceUseText.onclick = () => {
+    if (els.voiceTextInput) {
+      els.voiceTextInput.focus();
+      els.voiceTextInput.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  };
+}
+
 // ---------------------------------------------------------------- 分页路由
 // 单页应用 + hash 路由：地址栏 #live / #collect / #records，刷新不丢页面。
-const PAGES = ['live', 'collect', 'help', 'cam', 'records', 'ask'];
+const PAGES = ['live', 'collect', 'help', 'cam', 'records', 'ask', 'voice'];
 function showPage(name) {
   if (!PAGES.includes(name)) name = 'live';
   S.page = name;
@@ -1551,6 +2238,7 @@ function showPage(name) {
   invalidateCanvasRects();   // 页面切换会改变画布可见尺寸，缓存的 rect 需重测
   if (name === 'cam') loadCam();   // 进入摄像头页立即刷新一次状态
   if (name === 'ask') loadNlCap(); // 进入自然语言页刷新能力说明（引擎/白名单）
+  if (name === 'voice') voicePoll();   // 进入语音页立即同步一次全链状态
 }
 window.addEventListener('hashchange', () => showPage(location.hash.slice(1)));
 showPage(location.hash.slice(1) || 'live');
@@ -1866,6 +2554,8 @@ function connect() {
       // 教学求助：刷新页面后恢复当前状态
       HELP.channelReady = !!(m.help && m.help.channelReady);
       if (m.help) renderHelp(m.help);
+      // 语音链路：刷新页面不丢四段状态（服务端 hello 里带快照）
+      if (m.voice) voiceApplySnapshot(m.voice, true);
       renderStatus();
       return;
     }
@@ -1923,6 +2613,12 @@ function connect() {
       return;
     }
 
+    // 语音链路：阶段推进广播（板端上传 WAV / 其它页面推进 / 本页 Post 后回推）
+    if (m.type === 'voice') {
+      voiceApplySnapshot(m.voice, true);
+      return;
+    }
+
     if (m.type === 'stale') {
       S.live = false; S.stale = true;
       S.lastDataAt = m.lastDataAt || S.lastDataAt;
@@ -1963,6 +2659,10 @@ renderStatus();
 loadCollect();
 renderCollectMode();
 loadHelp();
+// 语音链路：每 3 秒轮询一次服务端全链状态（WS 推送之外的第二重保险，
+// 板端上传 WAV 时 WS 可能正好断开）。只在语音页轮询，避免无谓请求。
+renderVoiceSegments();
+setInterval(() => { if (S.page === 'voice') voicePoll(); }, 3000);
 connect();
 
 })();

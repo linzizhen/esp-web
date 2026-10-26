@@ -87,6 +87,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-10.9 6.7L4 20l1.8-5.1A7.5 7.5 0 1 1 20 11.5z" /></svg>
       自然语言
     </a>
+    <a href="#voice"   class="pagetab" data-page="voice">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2.5" width="6" height="11" rx="3" /><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0" /><path d="M12 18v3.5" /></svg>
+      语音<span id="voiceBadge" class="tab-badge hidden"></span>
+    </a>
   </nav>
 
   <main class="pages">
@@ -495,10 +499,114 @@
       </div>
     </section>
 
+    <!-- ==================== ⑥ 按键说话（第 5 周功能） ==================== -->
+    <section class="page" data-page="voice">
+      <div class="grid">
+
+        <!-- 四段链路总览 -->
+        <section class="card" style="grid-column: 1 / -1">
+          <div class="card-head">
+            <h2>按键说话 · 语音四段链路</h2>
+            <span id="voiceStageTag" class="tag">尚无语音链路</span>
+          </div>
+
+          <!-- 失败提示（无声 / 识别失败 / 超时）：默认隐藏，出问题才显示 -->
+          <div id="voiceFailure" class="help-alert hidden">
+            <div id="voiceFailureIcon" class="ha-icon">!</div>
+            <div class="ha-body">
+              <strong id="voiceFailureTitle">链路未完成</strong>
+              <p id="voiceFailureDesc">—</p>
+              <p class="hint">
+                <button id="btnVoiceUseText" class="btn btn-ghost btn-sm" type="button">改用文字输入</button>
+              </p>
+            </div>
+          </div>
+
+          <!-- 四段状态：录音 → 识别 → 任务执行 → 播放 -->
+          <ol id="voiceSegments" class="steps"></ol>
+
+          <!-- 录音实测元信息（音频来源必须如实可见） -->
+          <div class="obs-grid">
+            <div class="obs-item"><div class="k">录音时长</div><div class="v" id="voiceDurText">—</div></div>
+            <div class="obs-item"><div class="k">WAV 字节数</div><div class="v" id="voiceBytesText">—</div></div>
+            <div class="obs-item"><div class="k">录音来源</div><div class="v" id="voiceSrcText">板载麦克风</div></div>
+          </div>
+
+          <div class="collect-actions">
+            <button id="btnVoiceRetry" class="btn btn-ghost" type="button">重新识别这段录音</button>
+            <button id="btnVoiceSpeak" class="btn btn-ghost" type="button">再播报一次</button>
+            <a id="voiceDownload" class="btn btn-ghost hidden" download="voice.wav">下载这段 WAV</a>
+          </div>
+
+          <audio id="voicePlayer" style="width:100%;margin-top:12px" controls preload="auto"></audio>
+
+          <div id="voiceNote" class="ctrl-note">
+            等待开发板按键录音。板端录好后会上传 WAV，本页自动播放并识别，不需要手点。
+          </div>
+
+          <p class="hint">
+            链路顺序：<b>板端按键录音</b>（I2S 板载麦克风 → WAV 上传）→ <b>本机浏览器播放</b> →
+            <b>Web Speech API 识别（zh-CN）</b> → <b>复用第 4 周 /api/nl 执行任务</b> →
+            <b>speechSynthesis 播报回复</b>。每一步都单独显示状态，任一步失败都会给出中文原因，
+            <b>文字输入始终可用</b>。
+          </p>
+        </section>
+
+        <!-- 文字入口：与语音入口并排对照（语音失败也能继续完成作业） -->
+        <section class="card">
+          <div class="card-head">
+            <h2>文字入口（同一套任务）</h2>
+            <span id="voiceTextTag" class="tag">可用</span>
+          </div>
+          <p class="hint">
+            直接把同一句任务打进下面的框，走同一个 <code>/api/nl</code>。语音识别不可用、浏览器不支持、
+            或环境太吵时，用这里照样能完成任务 —— 这也是课程要求「文字入口必须可用」的落点。
+          </p>
+          <form id="voiceTextForm" class="nl-form">
+            <input id="voiceTextInput" class="nl-input" maxlength="200" autocomplete="off"
+                   placeholder="例如：查看上次数据 / 重新采集一次" />
+            <button id="voiceTextSend" class="btn btn-primary" type="submit">发送</button>
+          </form>
+          <div id="voiceTextResult" class="ctrl-note">还没有通过文字入口执行任务。</div>
+        </section>
+
+        <!-- 音频来源与运行位置（作业硬性要求：必须如实记录） -->
+        <section class="card">
+          <div class="card-head">
+            <h2>音频来源与运行位置</h2>
+          </div>
+          <div class="kv"><span class="k">录音（采集）</span><span class="v" id="voiceSrcAudio">开发板板载 MEMS 麦克风 · I2S 采集，录音在板端</span></div>
+          <div class="kv"><span class="k">识别（ASR）</span><span class="v" id="voiceSrcAsr">电脑浏览器 · Web Speech API（zh-CN）</span></div>
+          <div class="kv"><span class="k">播报（TTS）</span><span class="v" id="voiceSrcTts">电脑浏览器 · speechSynthesis（板端无扬声器）</span></div>
+          <div class="kv"><span class="k">任务判定</span><span class="v">本机服务端 · 复用第 4 周 /api/nl</span></div>
+          <div class="kv"><span class="k">WAV 落盘</span><span class="v mono" id="voiceAudioDir">data/voice/</span></div>
+          <div class="kv"><span class="k">事件流水</span><span class="v mono" id="voiceEventsFile">data/voice/events.ndjson</span></div>
+          <p class="hint">
+            <b>录音在板端</b>：MEMS 麦克风接到 ESP32-S3 的 I2S，按键后整段录成标准 WAV 再上传；
+            <b>识别与播报都在电脑浏览器</b>：板子既不做 ASR 也不做 TTS，它没有扬声器。
+          </p>
+        </section>
+
+        <!-- 历史语音事件（落盘留证） -->
+        <section class="card" style="grid-column: 1 / -1">
+          <div class="card-head">
+            <h2>历史语音事件</h2>
+            <span id="voiceHistoryCount" class="mono req-id">—</span>
+          </div>
+          <div id="voiceHistory" class="obs-empty">尚无语音事件。</div>
+          <p class="hint">
+            事件已写入服务端 <code>data/voice/events.ndjson</code>（只追加不删），<b>服务重启后仍可追溯</b>。
+            这里显示最近 50 条；盘上保留全部。
+          </p>
+        </section>
+
+      </div>
+    </section>
+
   </main>
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=31"></script>
+<script src="/app.js?v=32"></script>
 </body>
 </html>
