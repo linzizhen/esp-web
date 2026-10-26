@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（16 个测试文件、248 项断言，全部通过）
+## 7. 自检脚本（19 个测试文件、380 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -344,6 +344,18 @@ node test/verify-test.js      #  6 项  本组设备身份校验（本组/非本
 node test/help-test.js        # 26 项  第 3 周教学求助闭环（状态不前进 / 回执确认 / 不污染数据链路）
 node test/nl-test.js          # 37 项  第 4 周意图解析与诚实性回复
 node test/nl-config-test.js   # 44 项  第 4 周 LLM 配置增删改查与降级
+node test/handleline-guard-test.js  # 23 项  空帧守卫：只含元数据的帧不落盘（8091）
+node test/voice-test.js       # 84 项  第 5 周语音链路接口契约（8090）
+node test/voice-layout-contract-test.js  # 25 项  第 5 周 WAV 数据布局静态契约
+```
+
+以下两个需真实开发板在线，**不在**编排器内，手动跑：
+
+```bash
+node test/voice-hil.js            # 真机端到端：录音 → 上传 → 独立复核 WAV 电平
+node test/voice-hil.js --speak    # 同上，并提示你对着板子说话
+node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
+node test/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
 ```
 
 改完代码后可再跑只读审计（不改任何文件）：

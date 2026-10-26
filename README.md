@@ -123,7 +123,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 ├── data/                     # NDJSON 持久化（运行后生成）：records.ndjson 采样、help.ndjson 求助事件
 ├── recordings/               # 录制导出的 CSV（运行后生成）
 ├── public/
-│   ├── index.html            # 监控页面（分页：实时监控 / 远程采集 / 记录与设备 / LLM 配置）
+│   ├── index.html            # 监控页面（分页：实时监控 / 远程采集 / 教学求助 / 记录与设备 / 语音 / LLM 配置）
 │   ├── style.css             # 全部样式（CSS 变量 token 体系 + 浅色/深色双主题）
 │   └── app.js                # WebSocket 接收、卡片渲染、Canvas 绘制（含滑动平均）、记录查询、分页路由、主题切换
 ├── firmware/
@@ -134,6 +134,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   │   │   └── gen_font.py   # LCD 点阵字模生成脚本（输出 lcd_font.h + 预览图）
 │   │   └── main/
 │   │       ├── main.c        # 主程序：IMU / JSON 组帧 / USB-CDC + WiFi 上报 / 按键 / LED / LCD
+│   │       ├── voice_record.c # 第 5 周：BOOT 键录音 → I2S 去交错 → WAV → 上传
 │   │       ├── lcd_font.h    # 自动生成的点阵字模（中文 32×32 × 25 字 + ASCII 8×16）
 │   │       └── app_config.h  # ★ 唯一需要改的配置：WiFi 凭据 / 服务器 IP / 设备 ID
 │   ├── esp32_monitor.ino       # （旧）Arduino USB 串口版草稿
@@ -164,6 +165,12 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── help-persist-test.js  # 第 3 周：求助事件落盘与启动回读（隔离端口 8092）
     ├── nl-test.js            # 第 4 周：意图解析与诚实性回复（隔离端口 8098）
     ├── nl-config-test.js     # 第 4 周：LLM 配置增删改查与降级（隔离端口 8095）
+    ├── handleline-guard-test.js # 空帧守卫：只含元数据的帧不落盘（隔离端口 8091）
+    ├── voice-test.js         # 第 5 周：语音链路接口契约 + 合成 WAV（隔离端口 8090）
+    ├── voice-layout-contract-test.js # 第 5 周：WAV 数据布局静态契约（去交错）
+    ├── voice-hil.js          # 第 5 周：真机端到端，录音 → 上传 → 独立复核电平（需硬件）
+    ├── probe-voice-stop.js   # 第 5 周：真机探针，连续多轮 start/stop 稳定性（需硬件）
+    ├── records-pollution-check.js # 真实 data/records.ndjson 污染取证（手动）
     ├── week4-verify.js       # 第 4 周：按设计直连 8080 现网验证
     └── listen.js COM4 25     # 原样监听某串口 N 秒，看板子在发什么（调试用，不参与断言）
 ```
@@ -511,7 +518,7 @@ Web 页「**教学求助**」标签页与开发板上的**功能按键 + LED + �
 
 ### 跑测试
 
-全套 **16 个测试文件、248 项断言**，一条命令：
+全套 **19 个测试文件、380 项断言**，一条命令：
 
 ```bash
 npm test
@@ -527,15 +534,25 @@ npm test
 按分组跑：
 
 ```bash
-npm run test:unit          # 纯静态/解析，无需硬件，快（theme + parse + feature）
-npm run test:integration   # 服务端链路（storage/p0/verify/ws/help/acceptance）
+npm run test:unit          # 纯静态/解析，无需硬件，快（theme/isolation/help-ui/cam-config/parse/feature/voice-layout）
+npm run test:integration   # 服务端链路（guard/storage/p0/verify/ws/help/help-persist/acceptance/nl/nl-config/voice）
 npm run test:nl            # 第 4 周自然语言模块
 node test/run-all.js e2e   # 只跑端到端
 node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在发什么（调试用，不算断言）
 ```
 
-当前端口分配（改端口时注意别撞车）：`8093` feature ｜ `8094` parse ｜ `8095` verify+nl-config
-｜ `8096` acceptance ｜ `8097` help+p0 ｜ `8098` ws+nl ｜ `8099` storage+e2e ｜ `8080` 生产实例。
+需真实开发板在线、**不在**编排器内，手动跑：
+
+```bash
+node test/voice-hil.js            # 第 5 周真机端到端：录音 → 上传 → 独立复核 WAV 电平
+node test/voice-hil.js --speak    # 同上，并提示你对着板子说话
+node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
+node test/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
+```
+
+当前端口分配（改端口时注意别撞车）：`8090` voice ｜ `8091` handleline-guard ｜ `8092` help-persist
+｜ `8093` feature ｜ `8094` parse ｜ `8095` verify+nl-config ｜ `8096` acceptance
+｜ `8097` help+p0 ｜ `8098` ws+nl ｜ `8099` storage+e2e ｜ `8080` 生产实例。
 
 ### 硬件在环取证（排查固件行为时用）
 
