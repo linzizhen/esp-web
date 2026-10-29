@@ -69,5 +69,41 @@ const gitignore = fs.readFileSync(path.join(TEST_DIR, '..', '.gitignore'), 'utf8
 check('.gitignore 覆盖 test/.test-data*', /test\/\.test-data\*/.test(gitignore),
   '漏掉会让 git add . 把测试数据带进仓库');
 
+/* 编排器端口隔离契约（2026-10-28 新增）。
+ *
+ * 存在理由：run-all.js 里曾写成 `env.E2E_PORT = env.E2E_PORT || '8099'`（尊重外部显式值），
+ * 而 e2e-test.js 把 E2E_PORT=8080 定义为「连生产实例」。两者叠加的后果是：
+ * 在设过 E2E_PORT=8080 的 shell / CI 里跑 `node test/run-all.js`，e2e 会打到**生产 8080**。
+ * 实测复现：e2e 7 通过 / 7 失败，并向生产 /api/data 注入了合成帧
+ * {"hello":"world","flag":true}，生产 raw 流被污染并触发一次「断开 → cleared」。
+ *
+ * 这类缺陷和上面 DATA_DIR 那个同性质：没有运行时异常、单看测试结果还以为是环境问题，
+ * 只能靠静态契约拦住。断言两条：
+ *   a) 编排器给 e2e 注入的 E2E_PORT 必须是**字面量常量**，不得透传外部值（|| / ??）；
+ *   b) 想打生产只能绕过编排器，所以编排器代码里不应出现 8080。 */
+const runAllSrc = fs.readFileSync(path.join(TEST_DIR, 'run-all.js'), 'utf8');
+// 去掉块注释与行注释后再检查，避免把说明文字里的反面示例当成代码
+const runAllCode = runAllSrc
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+const e2ePortAssign = /env\.E2E_PORT\s*=\s*([^;\n]+)/.exec(runAllCode);
+check('编排器给 e2e 注入 E2E_PORT（端口可预期）', !!e2ePortAssign,
+  e2ePortAssign ? `env.E2E_PORT = ${e2ePortAssign[1].trim()}` : '未找到注入语句，e2e 端口将不可预期');
+
+const e2ePortExpr = e2ePortAssign ? e2ePortAssign[1].trim() : '';
+const isLiteral = /^['"`]8\d{3}['"`]$/.test(e2ePortExpr);
+const passesThrough = /\|\||\?\?/.test(e2ePortExpr);
+check('编排器的 E2E_PORT 是字面量、不透传外部值', isLiteral && !passesThrough,
+  isLiteral && !passesThrough
+    ? `字面量 ${e2ePortExpr}（外部 E2E_PORT 一律被覆盖，整套跑恒隔离）`
+    : `表达式为 ${e2ePortExpr} —— 透传外部值会让 E2E_PORT=8080 的环境把 e2e 打到生产。` +
+      `必须改成 env.E2E_PORT = '8099'; 想打生产请绕过编排器直接跑 e2e-test.js`);
+
+check('编排器代码里不出现生产端口 8080', !/8080/.test(runAllCode),
+  /8080/.test(runAllCode)
+    ? 'run-all.js 代码里出现 8080 —— 编排器职责是整套隔离，不得有打生产的路径'
+    : '无 8080 引用（打生产必须绕过编排器）');
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);

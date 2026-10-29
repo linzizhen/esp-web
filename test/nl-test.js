@@ -15,13 +15,52 @@
  * 用法：node test/nl-test.js
  */
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 
-const PORT = 8098;
+/* ★ 端口动态挑选（审查 F8 的第二半）：原写法是写死 `const PORT = 8098`，
+ * 而 test/ws-test.js 也写死 8098 —— 两个套件一旦并发（多成员同时跑 run-all、
+ * 或 CI 并行分片）就互抢同一个端口，实测表现为本套件偶发
+ *   Error: read ECONNRESET at TCP.onStreamRead (node:internal/stream_base_commons:216:20)
+ * 且失败点落在 ② 「重新采集：等待对应新结果」。改为从 8090-8099 挑当前空闲端口。
+ * 优先级：显式 PORT 环境变量 > 8090 起第一个空闲端口。 */
+const PORT_RANGE = [8090, 8099];
+function portFree(port) {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.once('error', () => resolve(false));
+    s.once('listening', () => s.close(() => resolve(true)));
+    s.listen(port, '127.0.0.1');
+  });
+}
+async function pickPort() {
+  const forced = Number(process.env.PORT);
+  if (Number.isInteger(forced) && forced > 0) {
+    if (await portFree(forced)) return forced;
+    throw new Error(`PORT=${forced} 已被占用，无法启动隔离实例`);
+  }
+  /* ★ 起始探测点按 pid 错开（并发实测逼出来的，不是预防性设计）：
+   * 只做「从 8090 顺序探测第一个空闲端口」不够 —— portFree() 是先探测后使用，
+   * 两个进程同时探测都会看到 8090 空闲，双双选中同一个端口。2026-10-28 实测：
+   * ws-test 与 nl-test 并发时两边都打印「隔离实例端口：8090」，结果 ws 8 通过 /
+   * 1 失败、nl 直接 ECONNRESET 崩掉。按 pid 取模错开起点后候选序列不再重合。 */
+  const span = PORT_RANGE[1] - PORT_RANGE[0] + 1;
+  const start = PORT_RANGE[0] + (process.pid % span);
+  for (let k = 0; k < span; k++) {
+    const p = PORT_RANGE[0] + ((start - PORT_RANGE[0] + k) % span);
+    if (await portFree(p)) return p;
+  }
+  throw new Error(`${PORT_RANGE[0]}-${PORT_RANGE[1]} 全被占用，无法自建隔离实例`);
+}
+let PORT = 0;   // 由 main() 里 pickPort() 填入
+
 const ROOT = path.join(__dirname, '..');
-const DATA_DIR = process.platform === 'win32' ? 'D:/tmp/nl-test-data' : '/tmp/nl-test-data';
+/* ★ 数据目录带进程唯一后缀（同审查 F8）：原来是固定 `D:/tmp/nl-test-data`，
+ * 两个实例并发时会互相 rmSync 掉对方的 records.ndjson，让「有记录/无记录」类
+ * 断言随机错位。 */
+const DATA_DIR = (process.platform === 'win32' ? 'D:/tmp/nl-test-data-' : '/tmp/nl-test-data-') + process.pid;
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log('  ✓', m); } else { fail++; console.error('  ✗', m); } };
@@ -57,6 +96,8 @@ const FRAME = (seq, extra) => Object.assign({
 }, extra || {});
 
 (async () => {
+  PORT = await pickPort();
+  console.log(`  隔离实例端口：${PORT}`);
   fs.rmSync(DATA_DIR, { recursive: true, force: true });
   fs.mkdirSync(DATA_DIR, { recursive: true });
 

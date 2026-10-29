@@ -123,8 +123,19 @@ async function main() {
     }
 
     const env = Object.assign({}, process.env);
-    // e2e 强制隔离实例，避免依赖"生产服务是否在跑"这个环境前提
-    if (s.name === 'e2e') env.E2E_PORT = env.E2E_PORT || '8099';
+    // e2e 走隔离实例：**无条件**注入 8099。
+    //
+    // 这里曾经写成 `env.E2E_PORT = env.E2E_PORT || '8099'`（尊重外部显式值），
+    // 而 test/e2e-test.js 把 E2E_PORT=8080 定义为「连生产实例」——
+    // 两者叠加的后果是：在设过 E2E_PORT=8080 的 shell / CI 里跑本编排器，
+    // e2e 会打到**生产 8080**（2026-10-28 实测复现：e2e 7 通过 / 7 失败，
+    // 且向生产 /api/data 注入了合成帧 {"hello":"world","flag":true}，
+    // 生产 raw 流被污染并触发一次「断开 → cleared」）。
+    //
+    // 编排器的职责是「整套跑都隔离」，不是「猜调用方意图」。因此改为无条件覆盖：
+    // 想打生产必须绕过编排器，直接 `E2E_PORT=8080 node test/e2e-test.js`。
+    // test/isolation-contract-test.js 有一条静态断言锁住这个行为。
+    if (s.name === 'e2e') env.E2E_PORT = '8099';
 
     const t0 = Date.now();
     const r = await runNode(file, env, ROOT);
