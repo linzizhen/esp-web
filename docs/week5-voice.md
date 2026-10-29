@@ -128,7 +128,7 @@ node test/probe-voice-stop.js 5 2
 ### 验证 3：接口契约（无需硬件）
 
 ```powershell
-node test/voice-test.js          # 84 项：隔离实例 + 合成 WAV
+node test/voice-test.js          # 104 项：隔离实例 + 合成 WAV
 node test/voice-layout-contract-test.js   # 25 项：数据布局静态契约
 ```
 
@@ -186,6 +186,8 @@ node test/voice-layout-contract-test.js   # 25 项：数据布局静态契约
 
 建议后续在 `sendCommand()` 后等待 ack 再定论，把 `accepted` 改成「板端确认」而非「写出口成功」。
 **本周不修**，已在 `test/voice-hil.js` 第 ⑥ 段登记为已知缺口，不判失败——登记不等于认可。
+
+> **状态更新（2026-10-26）**：该缺口**已修复**，详见下文「修复二：命令下发 ≠ 板端已接受」。
 
 ---
 
@@ -273,6 +275,47 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 - `test/voice-layout-contract-test.js`（25 项静态契约）：改固件时立刻发现"有人又把交错数据当单声道用了"
 - 文件头写了「数据布局」段落，把坑记在原地
 
+### 修复二：命令下发 ≠ 板端已接受（服务端等 ack）
+
+上面「缺口」一节登记的问题，本轮一并修掉。
+
+**缺陷表现**：`POST /api/voice/record` 返回 `ok=true accepted=true`，但命令其实被板端丢弃。
+实测（2026-10-26）：板端正在上传上一段录音时请求录音，服务端报成功，串口上板端回的是
+`{"type":"ack","device":"S3EYE-GROUP01","request_id":"voice-rec-1792981981759","seq":4434,"status":"recording"}`
+之外的 `status:"busy"` —— 命令被明确拒绝，服务端却毫无察觉。
+
+**根因**：`sendCommand(obj, device)` 里 `port.write(..., cb)` 的回调只记录写错误，**不等回执**。
+串口 `write` 成功只证明字节进了驱动缓冲，与板端是否处理完全是两件事。板端固件
+`voice_record.c:571` 的 `voice_record_toggle()` 首段是 `if (s_uploading) { ESP_LOGW(...); return false; }`，
+`main.c:1377-1388` 据此回 `cmd_ack(rid, "busy")`。
+
+**修复方式**：新增 `sendCommandAndWaitAck()`（`server.js`）——
+
+1. 下发前按 `request_id` 在 `PENDING_ACKS` 里登记等待槽（必须早于 `sendCommand()`，否则极快的 ack 会漏）；
+2. 板端上行 ack 到达 `handleLine()` 的 `type:"ack"` 分支时结算等待槽；
+3. 超时未结算判 `timeout`，默认 1800 ms（`config.commandAckTimeoutMs`，环境变量 `COMMAND_ACK_TIMEOUT_MS` 可覆盖）。
+
+结局区分六种：`accepted`（板端 ack 且 status 非 busy/error）、`busy`、`error`、`timeout`、
+`channel_unavailable`（串口没开且板端未轮询）、`mock`（`config.mockDevice` 时不伪造回执）。
+
+**`ok` 字段语义变化**：`/api/voice/record` 的 `ok` 现在等于 `accepted`，即**「板端已接受」**，
+不再是「写进串口成功」。命令是否写出去了由新增的 `dispatched` 字段单独表达。
+返回体另含 `outcome` / `ack_status` / `ack_seq` / `waited_ms` / `timeout_ms` / `simulated` / `note`。
+
+| 场景 | 板端实际 | 修复前 | 修复后 |
+|------|---------|--------|--------|
+| 正常 | `recording` | `ok=true` | `ok=true, outcome=accepted` |
+| 正在上传上一段 | `busy`（命令被丢弃） | `ok=true` ← **谎报** | `ok=false, outcome=busy, dispatched=true` |
+| 取走命令但没回执 | 无 ack | `ok=true` | `ok=false, outcome=timeout` |
+| 串口没开且板端未轮询 | — | `ok=false`（note 无细分） | `ok=false, outcome=channel_unavailable` |
+
+**防回归**：`test/command-ack-test.js` 95 项断言，覆盖六种结局、`request_id` 匹配（不相关 rid 的 ack
+不能冒充）、超时时长实测、mock 不伪造回执，以及「旧写法 `accepted: ok` 已移除」的静态契约。
+
+> **取证边界**：本轮验证在隔离实例内完成 —— 用真实上行入口 `POST /api/data` 注入板端 ack
+> （与固件同一路径），**未在真机上制造 busy 场景**。真机 busy 取证仍待补（预期
+> `outcome=busy`、`ok=false`、`dispatched=true`）。
+
 ---
 
 ## 六、文件改动清单
@@ -282,14 +325,15 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 | `firmware/s3eye_imu_idf/main/voice_record.c` | 新增，录音 + 去交错 + 上传 + LED + BOOT 键 |
 | `firmware/s3eye_imu_idf/main/voice_record.h` | 新增，对外接口 |
 | `firmware/s3eye_imu_idf/main/main.c` | 接入 `voice_record` / `voice_status` 远程命令，启动 `voice_record_init()` |
-| `server.js` | `/api/voice*` 七个接口 + 阶段状态机 + WAV 校验 + 事件落盘 |
+| `server.js` | `/api/voice*` 七个接口 + 阶段状态机 + WAV 校验 + 事件落盘；收尾新增 `sendCommandAndWaitAck()` 等板端 ack |
 | `public/app.js` | 语音页：录音回放、Web Speech 识别、`speechSynthesis` 播报 |
 | `public/index.html` | 语音页 DOM（样式全部复用既有类，未新增 CSS） |
-| `test/voice-test.js` | 新增，84 项接口契约 |
+| `test/voice-test.js` | 新增，104 项接口契约 |
 | `test/voice-hil.js` | 新增，真机端到端（需硬件），含板端回执核对与 45 秒等待预算 |
 | `test/voice-layout-contract-test.js` | 新增，25 项数据布局静态契约 |
+| `test/command-ack-test.js` | 收尾新增，95 项命令 ack 通道契约（accepted/busy/timeout/channel_unavailable/mock） |
 | `test/probe-voice-stop.js` | 新增，真机稳定性探针（需硬件） |
-| `test/run-all.js` | 登记 `voice` / `voice-layout` 两个套件，并修正「N 项通过」格式的结果计数 |
+| `test/run-all.js` | 登记 `voice` / `voice-layout` / `command-ack` 套件，并修正「N 项通过」格式的结果计数 |
 
 ---
 
@@ -301,6 +345,7 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 |--------|---------|
 | ✅ 接口契约（`voice-test.js`） | ❌ 板子真的能录到声音 |
 | ✅ 数据布局（`voice-layout-contract-test.js`） | ❌ 麦克风接线是否正确 |
+| ✅ 命令 ack 通道（`command-ack-test.js`，注入真实上行 ack） | ❌ 真机 `busy` 场景（固件 `s_uploading` 期间请求录音） |
 | ✅ 页面交互（浏览器打开就能点） | ❌ BOOT 键是否好使 |
 
 真机项必须补验，**不能拿"模拟通过"当实物通过**。

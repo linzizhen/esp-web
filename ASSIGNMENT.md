@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（19 个测试文件、380 项断言，全部通过）
+## 7. 自检脚本（20 个测试文件、498 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -345,18 +345,25 @@ node test/help-test.js        # 26 项  第 3 周教学求助闭环（状态不�
 node test/nl-test.js          # 37 项  第 4 周意图解析与诚实性回复
 node test/nl-config-test.js   # 44 项  第 4 周 LLM 配置增删改查与降级
 node test/handleline-guard-test.js  # 23 项  空帧守卫：只含元数据的帧不落盘（8091）
-node test/voice-test.js       # 84 项  第 5 周语音链路接口契约（8090）
+node test/voice-test.js       # 104 项 第 5 周语音链路接口契约（8090）
 node test/voice-layout-contract-test.js  # 25 项  第 5 周 WAV 数据布局静态契约
+node test/command-ack-test.js # 95 项  命令 ack 通道：accepted/busy/timeout/error/channel_unavailable/mock
 ```
 
-以下两个需真实开发板在线，**不在**编排器内，手动跑：
+以下需真实开发板在线，**不在**编排器内，手动跑：
 
 ```bash
 node test/voice-hil.js            # 真机端到端：录音 → 上传 → 独立复核 WAV 电平
 node test/voice-hil.js --speak    # 同上，并提示你对着板子说话
 node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
+node test/fps-baseline-test.js    # 帧率基线回归：中位帧间隔 > 250ms 即失败（只读 GET /api/state）
 node test/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
 ```
+
+`fps-baseline-test.js` 判据是**相邻帧间隔的中位数**（不用「快慢帧次数比」—— 2026-10-15 那次用次数比在未修复固件上误报过全绿）。
+它把采集窗口切成 4 段各算中位数，超标窗占比 ≥ 2/3 才判失败，避免恰好挑到链路好的几十秒。
+**采集窗口跑满却凑不满 60 帧不是 skip 而是 fail**：0.33 fps 时该来的帧没来，本身就是退化。
+没有设备在线（`connected=false` / 服务端不可达）时明确打印「跳过 ≠ 通过」并以退出码 0 结束。
 
 改完代码后可再跑只读审计（不改任何文件）：
 
@@ -771,7 +778,7 @@ BOOT 键 → 板载 MEMS 麦克风 I2S 直采 → WAV(16kHz/16bit/单声道)
 ```bash
 node test/voice-hil.js --speak            # 真机：录音 → 上传 → 独立复核 WAV 电平
 node test/probe-voice-stop.js 5 2         # 真机探针：5 轮 start → 2s → stop 时长稳定性
-node test/voice-test.js                   # 84 项接口契约（隔离实例 + 合成 WAV）
+node test/voice-test.js                   # 104 项接口契约（隔离实例 + 合成 WAV）
 node test/voice-layout-contract-test.js   # 25 项数据布局静态契约
 ```
 

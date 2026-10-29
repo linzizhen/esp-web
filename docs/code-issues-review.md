@@ -17,12 +17,13 @@
 | 2 | P1 摄像头推流致板子重启 | **无法复现**（见下方硬件取证） | 46s 推流 + 5 次高清抓拍均 0 重启；`de77c39` 的互斥锁修复可能已解决 |
 | 3 | P1 WiFi 上传同步阻塞 | **根因已修复**（见下方硬件取证） | 实为退避失效；修复后帧率 0.33 → 6.93 帧/秒 |
 | 4 | P2 help 事件不落盘 | **已修复** | 新增 `data/help.ndjson`（只追加不滚动）+ 启动回读 `loadHelpHistory()`（`server.js:33/585/596`）；`help-persist-test.js` 17 项断言覆盖 |
-| 5 | P2 e2e 默认连生产实例 | **已缓解** | 编排器 `test/run-all.js` 自动注入 `E2E_PORT=8099`；但直接跑 `node test/e2e-test.js` 仍默认 8080（`e2e-test.js:20`） |
+| 5 | P2 e2e 默认连生产实例 | **已修复** | `e2e-test.js` 默认自建隔离实例（8090-8099 内自选空闲端口 + 独立 `DATA_DIR`），直接跑 `node test/e2e-test.js` 不再连 8080；只有显式 `E2E_PORT=8080` 或 `--production` 才连生产。编排器另注入 `E2E_PORT=8099` 让端口可预期 |
 | 6 | P2 前端每帧全量重绘 | **已优化** | 新增 `lowerBoundByTime()` 二分定位窗口起点、`RANGE_BUF` 复用缓冲、`_chartCache` 缓存（`app.js:525/531/574`） |
 | 7 | P2 LLM 未接入 | **已接入** | 已配置智谱 `glm-4.5-flash`；新增模型润色与 Base URL 归一化 |
+| 8 | P2 命令下发 ≠ 板端已接受（第 5 周发现） | **已修复** | `sendCommand()` 只把字节写进串口就算成功，`/api/voice/record` 直接把 `ok` 当 `accepted` 返回；板端 `voice_record.c:571` 的 `if (s_uploading) return false;` 会让 `main.c:1377-1388` 回 `cmd_ack(rid,"busy")`，命令实际被丢弃而服务端仍报 `accepted=true`。现改为按 `request_id` 等板端 ack 再定论（`sendCommandAndWaitAck()`，默认超时 1800 ms），区分 `accepted`/`busy`/`error`/`timeout`/`channel_unavailable`/`mock`；`command-ack-test.js` 95 项断言覆盖 |
 
 > 报告原文提到的「145 项测试全过」是当时（2026-10-08）的实际数字。当前为
-> **16 个测试文件、248 项断言**（入口 `npm test`）。
+> **20 个测试文件、498 项断言**（入口 `npm test`）。
 
 ---
 
@@ -132,6 +133,11 @@
 - **位置**：`test/e2e-test.js:20`。
 - **建议**：改为默认隔离实例，或文档/脚本封装固定传 `E2E_PORT=8099`。
 
+> **状态更新（2026-10-26）**：已按建议改为**默认隔离实例** —— 直接 `node test/e2e-test.js`
+> 会在 `8090-8099` 内自选空闲端口、用独立 `DATA_DIR` 起实例，不再依赖生产服务；
+> 只有**显式** `E2E_PORT=8080` 或 `--production` 才连生产。原「表现 / 位置 / 建议」保留为
+> 当时（2026-10-08）的判断，其中 `e2e-test.js:20` 的行号已随改造失效。
+
 ### 6. 前端图表每帧全量重绘（60fps）
 
 - **表现**：流畅化后 `frame()` 每帧重绘整个 canvas，且 Y 量程分位计算每帧执行（~150 值排序 + 指数平滑）。
@@ -145,6 +151,14 @@
 - **位置**：`server.js` NL 模块，密钥在 `config.local.json`（gitignored）。
 - **说明**：诚实性设计已如实标注引擎；拿到授权 endpoint+key 填入即启用，**代码零改动**。
 - **优先级**：低（规则兜底已覆盖全部当堂验证）。
+
+### 8. 命令下发 ≠ 板端已接受（第 5 周收尾发现，已修复）
+
+- **表现**：`POST /api/voice/record` 返回 `ok=true accepted=true`，但命令其实被板端丢弃。
+- **位置**：`server.js` 的 `sendCommand(obj, device)`；`/api/voice/record` 处理器。
+- **根因**：`port.write(..., cb)` 的回调只记录写错误，**不等板端回执**。串口 `write` 成功只证明字节进了驱动缓冲。板端固件 `voice_record.c:571` 的 `voice_record_toggle()` 首段是 `if (s_uploading) { ESP_LOGW(...); return false; }`，`main.c:1377-1388` 据此回 `cmd_ack(rid, "busy")` —— 板端明确拒绝，服务端仍报成功。
+- **修复**：新增 `sendCommandAndWaitAck()`，下发前按 `request_id` 登记等待槽，板端上行 ack 到达时结算，超时判 `timeout`（默认 1800 ms，可配）。结局区分 `accepted` / `busy` / `error` / `timeout` / `channel_unavailable` / `mock`。`/api/voice/record` 的 `ok` 字段语义改为「板端已接受」，`dispatched` 单独表达「命令写出去了」。
+- **防回归**：`test/command-ack-test.js` 95 项断言，覆盖六种结局与 `request_id` 匹配。
 
 ---
 
@@ -193,13 +207,14 @@
 | ~~P1~~ | #2 摄像头推流致板子重启 | 稳定性缺陷 | ✅ **根因已修复**：帧缓冲 15360 → 65536；640x480 由「卡死」恢复为 5.25 帧/秒 |
 | ~~P1~~ | #3 WiFi 上传同步阻塞 | 性能缺陷 | ✅ **根因已修复**：实为退避失效；帧率 0.33 → 6.93 帧/秒（21 倍）<br>遗留：上报仍同步（成功路径约 30ms），异步化可再逼近 10Hz |
 | ~~P2~~ | #4 help 事件不落盘 | 可留证性 | ✅ **已修复**：`data/help.ndjson` + 启动回读 |
-| ~~P2~~ | #5 e2e 默认连生产实例 | 测试易用性 | ✅ **已缓解**：编排器自动注入 `E2E_PORT=8099` |
+| ~~P2~~ | #5 e2e 默认连生产实例 | 测试易用性 | ✅ **已修复**：`e2e-test.js` 默认自建隔离实例（8090-8099 内选空闲端口 + 独立 DATA_DIR），连生产须显式 `E2E_PORT=8080` / `--production` |
 | ~~P2~~ | #6 前端每帧重绘 | 性能优化 | ✅ **已优化**：二分定位 + 缓冲复用 + 缓存 |
 | ~~P2~~ | #7 LLM 未接入 | 待凭据 | ✅ **已接入**：智谱 `glm-4.5-flash` + 数字核对护栏 |
+| ~~P2~~ | #8 命令下发 ≠ 板端已接受 | 正确性/诚实性 | ✅ **已修复**：按 `request_id` 等板端 ack（默认 1800 ms），区分 accepted/busy/error/timeout/channel_unavailable/mock；`ok` 语义改为「板端已接受」 |
 
-**核心结论（2026-10-23 更新）**：报告原始 7 项问题**全部闭环**（P0 正确性 bug
-与两项 P1 稳定性缺陷均已根治）。代码整体质量良好：固件编译零警告，
-**16 个测试文件、248 项断言全过**。
+**核心结论（2026-10-26 更新）**：报告原始 7 项问题**全部闭环**（P0 正确性 bug
+与两项 P1 稳定性缺陷均已根治），第 5 周收尾新增的 #8「命令下发 ≠ 板端已接受」亦已修复。
+代码整体质量良好：固件编译零警告，**20 个测试文件、498 项断言全过**。
 
 原文「145 项测试」为 2026-10-08 的历史数字；本清单保留原判定与证据供追溯，
 以本节的「当前状态」为准。

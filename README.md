@@ -155,7 +155,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── upload-block-forensics.js # 硬件在环：上传阻塞对帧率的影响量化
     ├── cam-repro.js          # 硬件在环：摄像头推流复现（含重启检测）
     ├── acceptance-test.js    # 全链路验收：固件帧→落盘→页面→停采（隔离端口 8096）
-    ├── e2e-test.js           # 链路自检：空状态 / 上报解析 / 停采保留 / 断开清空（E2E_PORT，默认 8080）
+    ├── e2e-test.js           # 链路自检：空状态 / 上报解析 / 停采保留 / 断开清空（默认自建隔离实例，8090-8099 内挑空闲端口；连生产须显式 E2E_PORT=8080 或 --production）
     ├── storage-test.js       # 持久化 + 查询 + 停采保留（隔离端口 8099）
     ├── p0-dedup-test.js      # 请求去重/幂等（隔离端口 8097）
     ├── verify-test.js        # 本组身份校验：device ↔ expectedDeviceId（隔离端口 8095）
@@ -169,8 +169,10 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── handleline-guard-test.js # 空帧守卫：只含元数据的帧不落盘（隔离端口 8091）
     ├── voice-test.js         # 第 5 周：语音链路接口契约 + 合成 WAV（隔离端口 8090）
     ├── voice-layout-contract-test.js # 第 5 周：WAV 数据布局静态契约（去交错）
+    ├── command-ack-test.js   # 第 5 周：命令下发与板端 ack 的区分（accepted/busy/timeout/channel_unavailable/mock，端口 8090-8099 内自选空闲）
     ├── voice-hil.js          # 第 5 周：真机端到端，录音 → 上传 → 独立复核电平（需硬件）
     ├── probe-voice-stop.js   # 第 5 周：真机探针，连续多轮 start/stop 稳定性（需硬件）
+    ├── fps-baseline-test.js  # 帧率基线回归：相邻帧间隔中位数超阈值即失败（需真机，不进编排器）
     ├── records-pollution-check.js # 真实 data/records.ndjson 污染取证（手动）
     ├── week4-verify.js       # 第 4 周：按设计直连 8080 现网验证
     └── listen.js COM4 25     # 原样监听某串口 N 秒，看板子在发什么（调试用，不参与断言）
@@ -192,6 +194,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 | `staleAfterMs` | 5000 | 超过此时间无数据 → 标记「设备无数据」 |
 | `offlineAfterMs` | 15000 | 超过此时间无数据 → 判定设备已移除并清空 |
 | `wifiTimeoutMs` | 8000 | WiFi 上报心跳超时（预留，停采阈值统一用 `staleAfterMs`） |
+| `commandAckTimeoutMs` | 1800 | 下发命令后等板端 ack 的时长；超时未收到回执判 `timeout`（不报成功）。可用环境变量 `COMMAND_ACK_TIMEOUT_MS` 覆盖 |
 | `stalePolicy` | `keep` | 停采策略：`keep`=保留末次数据与旧时间并提示"未更新"（作业默认）；`clear`=超时后清空 |
 | `expectedDeviceId` | null | **本组设备身份校验**：设为固件里的 `DEVICE_ID` 后，平台标记每帧数据是否来自本组（前端显示 ✓本组/⚠非本组），避免邻组数据混显 |
 | `storageEnabled` | true | 是否把每帧真实采样落盘为 NDJSON（`data/records.ndjson`）。求助事件单独写 `data/help.ndjson`（只追加不滚动） |
@@ -200,7 +203,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 
 修改后重启服务生效（也可通过 `POST /api/config` 热更新部分字段）。
 
-**环境变量**（部署 VPS 时常用，覆盖配置里的端口/监听）：`PORT=8080`、`HOST=0.0.0.0`（允许局域网/外网访问）。
+**环境变量**（部署 VPS 时常用，覆盖配置里的端口/监听）：`PORT=8080`、`HOST=0.0.0.0`（允许局域网/外网访问）、`COMMAND_ACK_TIMEOUT_MS=1800`（命令 ack 等待时长）。
 
 ## 五、接入自己的传感器
 
@@ -524,17 +527,23 @@ Web 页「**语音**」标签页让佩戴者**按 BOOT 键说一句话**，查�
 | GET / POST | `/api/voice/state` | 读当前阶段 / 浏览器推进阶段 |
 | GET | `/api/voice/audio/:id` | 回放 WAV |
 | GET | `/api/voice/audio/:id/download` | 下载取证 |
-| POST | `/api/voice/record` | 远程触发一次录音（等价按 BOOT 键） |
+| POST | `/api/voice/record` | 远程触发一次录音（等价按 BOOT 键）。**等板端 ack 后才回答**：`ok`/`accepted` 表示板端真的接受了，`dispatched` 只表示命令写出去了，`outcome` ∈ `accepted`/`busy`/`timeout`/`error`/`channel_unavailable`/`mock` |
 
 ### 当堂验证
 
 ```bash
 node test/voice-hil.js --speak    # 真机：录音 → 上传 → 独立复核 WAV 电平（需硬件）
 node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
-node test/voice-test.js           # 84 项接口契约（隔离实例 + 合成 WAV，无需硬件）
+node test/voice-test.js           # 104 项接口契约（隔离实例 + 合成 WAV，无需硬件）
+node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/timeout/mock，无需硬件）
 ```
 
 `voice-hil.js` 会**自己重新下载 WAV 并解码算 RMS**，不信服务端自报——服务端说「录到声音」不算证据。
+
+> `/api/voice/record` 的 `ok` 字段自第 5 周收尾起等于「板端已接受」，不再是「写进串口成功」。
+> 板端忙（正在上传上一段录音）时会回 `ack(status=busy)`，此时接口返回 `ok=false` + `outcome=busy`，
+> 而不是像以前那样报成功。超时默认 1800 ms，可用 `config.commandAckTimeoutMs` 或环境变量
+> `COMMAND_ACK_TIMEOUT_MS` 覆盖；`GET /api/state` 的 `commandAck` 字段可查最近一次结局。
 
 > 完整说明（含真机暴露的 I2S 交错缺陷取证与修复、失败分支表、迁移判据）见
 > [`docs/week5-voice.md`](docs/week5-voice.md)。
@@ -572,7 +581,7 @@ node test/voice-test.js           # 84 项接口契约（隔离实例 + 合成 W
 
 ### 跑测试
 
-全套 **19 个测试文件、380 项断言**，一条命令：
+全套 **20 个测试文件、498 项断言**，一条命令：
 
 ```bash
 npm test
@@ -582,18 +591,21 @@ npm test
 所以**开发板插着、服务没起也能跑**，不会互相干扰。
 
 > 关键前提：板子自 2026-09-28 起会 WiFi 常驻 POST 到 8080，**任何直连 8080 的测试都会被真实数据污染**。
-> 因此除 e2e 外所有测试都自建隔离实例；e2e 由编排器自动注入 `E2E_PORT=8099` 走隔离模式，
-> 不依赖「生产服务是否在跑」这个环境前提（直接 `node test/e2e-test.js` 会去连 8080，服务没起就 ECONNREFUSED —— 那不是 bug）。
+> 因此**所有**测试都自建隔离实例（端口 8090-8099、独立 `DATA_DIR`），`e2e` 也不例外：
+> 直接 `node test/e2e-test.js` 会在 8090-8099 内自选空闲端口起隔离实例，不依赖「生产服务是否在跑」这个环境前提。
+> 只有**显式**指定 `E2E_PORT=8080` 或加 `--production` 才会去连生产实例 —— 那是明确的意图，不是默认行为。
 
 按分组跑：
 
 ```bash
-npm run test:unit          # 纯静态/解析，无需硬件，快（theme/isolation/help-ui/cam-config/parse/feature/voice-layout）
-npm run test:integration   # 服务端链路（guard/storage/p0/verify/ws/help/help-persist/acceptance/nl/nl-config/voice）
-npm run test:nl            # 第 4 周自然语言模块
+npm run test:unit          # 纯静态/解析，无需硬件，快（theme + parse + feature）
+npm run test:integration   # 服务端链路（storage/p0/verify/ws/help/acceptance）
+npm run test:nl            # 第 4 周自然语言模块（nl + nl-config）
 node test/run-all.js e2e   # 只跑端到端
 node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在发什么（调试用，不算断言）
 ```
+
+> 分组脚本只跑一部分；要跑全部 20 个文件请用 `npm test`（= `node test/run-all.js`）。
 
 需真实开发板在线、**不在**编排器内，手动跑：
 
@@ -601,12 +613,23 @@ node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在�
 node test/voice-hil.js            # 第 5 周真机端到端：录音 → 上传 → 独立复核 WAV 电平
 node test/voice-hil.js --speak    # 同上，并提示你对着板子说话
 node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
+node test/fps-baseline-test.js    # 帧率基线回归：相邻帧间隔中位数 > 250ms 即失败（只读 GET /api/state）
 node test/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
 ```
+
+`fps-baseline-test.js` 默认打 8080 上的运行实例（要观察真实串口上的板子，自建隔离实例拿不到串口，只会永远 skip），
+但**只发 `GET /api/state`**，不写数据、不注入合成帧。没有设备在线时它会明确打印「跳过 ≠ 通过」并以退出码 0 结束 ——
+**跳过不等于通过**，别把它当绿灯。可用 `FPS_PORT` / `FPS_BASE` / `FPS_MAX_MEDIAN_MS` / `FPS_MIN_FRAMES` 覆盖默认值。
+
+它量的是**上传帧率**（服务端实收），不是板端采样率 —— 纯 WiFi 上报时采样可以是 10 fps 而上传只有 0.47–2.2 fps。
+两条判据并列：① 采集窗口内收到 ≥ 60 帧；② 中位间隔 ≤ 250 ms。**采集窗口跑满却凑不满 60 帧不是 skip 而是 fail**
+（0.33 fps 时该来的帧没来，本身就是退化；旧实现把它当「样本不足」跳过，等于把最该报警的场景静默放过）。
+4 个等量窗口各算中位数，有结论窗口里超标占比 ≥ 2/3 才判失败，避免恰好落在链路好的几十秒而假绿。
 
 当前端口分配（改端口时注意别撞车）：`8090` voice ｜ `8091` handleline-guard ｜ `8092` help-persist
 ｜ `8093` feature ｜ `8094` parse ｜ `8095` verify+nl-config ｜ `8096` acceptance
 ｜ `8097` help+p0 ｜ `8098` ws+nl ｜ `8099` storage+e2e ｜ `8080` 生产实例。
+`command-ack` 不固定占端口：它每次在 `8090-8099` 内探测一个当前空闲端口起实例，避免与上表任一项撞车。
 
 ### 硬件在环取证（排查固件行为时用）
 

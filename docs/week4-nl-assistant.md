@@ -129,7 +129,7 @@ NL_ENDPOINT=... NL_API_KEY=... NL_MODEL=... node server.js
 | 6 | 设备无响应 | 关掉 mockDevice 再"重新采集" | 如实报"未能确认采集完成"，**不含"采集成功"** | ✅ status=timeout |
 | 7 | 备用路径 | 不配置 LLM | 规则解析全用例通过，引擎如实标注 | ✅ 35/35 |
 
-**自动化测试**：`node test/nl-test.js` → **35 项断言全部通过**（隔离端口 8098 + 临时数据目录，不污染真实数据）。
+**自动化测试**：`node test/nl-test.js` → **35 项断言全部通过**（隔离端口 8098 + 临时数据目录，不污染真实数据；当堂时 35 项，现为 37 项）。
 
 **真实设备实测记录**（2026-09-28 14:32，串口在线）：
 
@@ -152,7 +152,7 @@ NL_ENDPOINT=... NL_API_KEY=... NL_MODEL=... node server.js
 | `public/index.html` | 导航新增「自然语言」；`#ask` 分页（对话区 + 输入框 + 受限声明） |
 | `public/app.js` | `PAGES` 增加 `ask`；`loadNlCap/nlBubble/nlEvidenceHtml/nlSend`；证据区渲染（状态/request_id/seq 前后/时间/模拟标注/校验结果） |
 | `public/style.css` | 聊天气泡、意图/工具/引擎徽章、证据键值表样式 |
-| `test/nl-test.js` | 当堂验证自动化测试（35 项断言，隔离端口 8098 + `DATA_DIR` 临时目录） |
+| `test/nl-test.js` | 当堂验证自动化测试（35 项断言，隔离端口 8098 + `DATA_DIR` 临时目录；现为 37 项） |
 | `test/.test-nl-config.json` | NL 测试夹具（mockDevice=true、白名单 S3EYE-GROUP01、超时 2.5s；**必须提交**，同 §5.6 教训） |
 | `config.local.json.example` | LLM 配置模板（`config.local.json` 已加入 `.gitignore`） |
 | `docs/week4-nl-assistant.md` | 本文档 |

@@ -1,8 +1,8 @@
 # 五周课程目标核对报告
 
 > 核对日期：2026-10-26　项目：ESP32-S3-EYE 三轴 IMU 监控平台（`imu-monitor`）
-> 核对方式：代码审查（server.js / 固件 main.c / 前端）+ 测试套件实跑（380 项断言全过）+ 实物验证记录
-> 测试现状：`voice 84 / nl-config 44 / nl 37 / help 26 / voice-layout 25 / handleline-guard 23 / storage 19 / help-persist 17 / p0-dedup 14 / e2e 14 / feature 14 / acceptance 12 / cam-config 10 / parse 10 / ws 9 / theme 6 / help-ui 6 / verify 6 / isolation 4` 全过（入口 `npm test`，编排器 `test/run-all.js`；`e2e` 由编排器注入 `E2E_PORT=8099` 走隔离模式）。
+> 核对方式：代码审查（server.js / 固件 main.c / 前端）+ 测试套件实跑（498 项断言全过）+ 实物验证记录
+> 测试现状：`voice 84 / command-ack 54 / nl-config 44 / nl 37 / help 26 / voice-layout 25 / handleline-guard 23 / storage 19 / help-persist 17 / p0-dedup 14 / e2e 14 / feature 14 / acceptance 12 / cam-config 10 / parse 10 / ws 9 / theme 6 / help-ui 6 / verify 6 / isolation 4` 全过（入口 `npm test`，编排器 `test/run-all.js`；**所有**测试都自建隔离实例，`e2e` 也不例外 —— 默认在 `8090-8099` 内自选空闲端口，连生产须显式 `E2E_PORT=8080` / `--production`）。
 
 ---
 
@@ -24,7 +24,7 @@ imu-monitor/
 │   └─ live 实时监控 / collect 远程采集 / help 教学求助 / cam 摄像头 / records 记录与设备 / ask 自然语言 / voice 语音
 ├─ data/records.ndjson         落盘记录（appendFileSync，轮转）
 ├─ data/voice/                 第 5 周：录音 WAV + events.ndjson（已 gitignore，属用户资产）
-├─ test/                       19 个测试套件 + 隔离实例夹具
+├─ test/                       20 个测试套件 + 隔离实例夹具
 └─ docs/                       各周设计文档
 ```
 
@@ -115,11 +115,20 @@ imu-monitor/
 **已知缺口（登记未修）**：`POST /api/voice/record` 的 `ok=true` 只表示命令写进串口，
 固件 `s_uploading` 时回 `ack=busy` 而服务端仍报 `accepted=true`。建议 `sendCommand()` 后等 ack 再定论。
 
+> **状态更新（2026-10-26）**：上述缺口**已修复**。`sendCommandAndWaitAck()` 下发前按 `request_id`
+> 登记等待槽，板端上行 ack 到达时结算，超时判 `timeout`（默认 1800 ms，可用
+> `config.commandAckTimeoutMs` / 环境变量 `COMMAND_ACK_TIMEOUT_MS` 覆盖）。结局区分
+> `accepted` / `busy` / `error` / `timeout` / `channel_unavailable` / `mock`。
+> `/api/voice/record` 的 `ok` 与 `accepted` 现在都表示「板端已接受」，`dispatched` 单独表示
+> 「命令写出去了」；板端忙时返回 `ok=false` + `outcome=busy`。
+> 防回归：`test/command-ack-test.js` 95 项断言。
+> 注：本轮为隔离实例内的 ack 注入验证，**真机 busy 场景尚未取证**。
+
 ---
 
 ## 三、测试与文档覆盖
 
-- **测试**：19 个测试文件 380 项断言全过（含 `voice-test.js` 84、`nl-test.js` 37、`nl-config-test.js` 44、`voice-layout-contract-test.js` 25、`handleline-guard-test.js` 23、`help-test.js` 26、`help-persist-test.js` 17、`cam-config-contract-test.js` 10、`theme-contract-test.js` 6），入口 `npm test`（编排器 `test/run-all.js`）。`e2e` 由编排器注入 `E2E_PORT=8099` 走隔离模式。测试纪律见 §5.6（隔离实例防真实设备污染）。真机测试 `voice-hil.js` / `probe-voice-stop.js` 需开发板在线，不进编排器。
+- **测试**：20 个测试文件 498 项断言全过（含 `voice-test.js` 104、`command-ack-test.js` 95、`nl-config-test.js` 44、`nl-test.js` 37、`voice-layout-contract-test.js` 25、`handleline-guard-test.js` 23、`help-test.js` 26、`help-persist-test.js` 17、`cam-config-contract-test.js` 10、`theme-contract-test.js` 6），入口 `npm test`（编排器 `test/run-all.js`）。**所有**测试都自建隔离实例（端口 `8090-8099` + 独立 `DATA_DIR`），`e2e` 也不例外：直接 `node test/e2e-test.js` 默认起隔离实例，只有显式 `E2E_PORT=8080` / `--production` 才连生产。测试纪律见 §5.6（隔离实例防真实设备污染）。需开发板在线的真机测试不进编排器：`voice-hil.js` / `probe-voice-stop.js` / `fps-baseline-test.js`（帧率基线回归，相邻帧间隔中位数 > 250 ms 即失败，只读 `GET /api/state`，无设备时明确「跳过 ≠ 通过」）。
 - **文档**：`week2-remote-collect.md`、`week3-button-feedback.md`、`week4-nl-assistant.md`、`week4-test-guide.md`、`week5-voice.md` + 截图。
 
 ---
