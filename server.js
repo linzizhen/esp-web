@@ -1303,9 +1303,16 @@ function loadVoiceHistory() {
 }
 
 /* ---- WAV 头解析：只读头部，不解码 PCM（服务端不需要听声音） ---- */
-/* totalBytes：文件真实总大小。只读头部时 buf 可能只是前 4 KB，
- * data 块声明的长度才是真实值，用 totalBytes 兜住，否则时长会被截短。 */
-function parseWavHeader(buf, totalBytes) {
+/* totalBytes：文件真实总大小。只读头部时 buf 可能只是前 64 KB，
+ * data 块声明的长度才是真实值，用 totalBytes 兜住，否则时长会被截短。
+ *
+ * 【2026-10-28 修复】块遍历原来只在 buf（文件前 64 KB）内进行：一旦 data 块
+ * 起点落在这之外（例如 fmt 块异常大），就找不到 data 块，于是兜底成
+ * 「偏移 44 + 全文件剩余」，把 fmt 块的内容当成 PCM 读 —— 电平算错却不报错，
+ * 属静默错误。现在遍历上限改为文件真实大小 total，落在 buf 之外的块头用
+ * 可选的 readAt(offset, len) 补读（回读路径传的是 fs.readSync）。
+ * 不传 readAt 时行为与原来一致（只走内存，上传路径即如此）。 */
+function parseWavHeader(buf, totalBytes, readAt) {
   const out = {
     ok: false, riff: null, wave: null, format: null, channels: null,
     sample_rate: null, bits: null, data_bytes: null, duration_ms: null, error: null,
@@ -1316,17 +1323,33 @@ function parseWavHeader(buf, totalBytes) {
   if (out.riff !== 'RIFF') { out.error = 'not_riff'; return out; }
   if (out.wave !== 'WAVE') { out.error = 'not_wave'; return out; }
   const total = Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : buf.length;
+  /* 取 [from, to) 字节：完全落在 buf 内就直接切片，否则用 readAt 补读。
+   * 补读失败（文件被截断 / IO 错误）返回 null，由调用处停止遍历。 */
+  const need = (from, to) => {
+    if (from < 0 || to < from) return null;
+    if (to <= buf.length) return buf.subarray(from, to);
+    if (typeof readAt !== 'function') return null;
+    try {
+      const b = readAt(from, to - from);
+      return b && b.length === to - from ? b : null;
+    } catch (_) { return null; }
+  };
   let off = 12;
   let dataOff = null;
-  while (off + 8 <= buf.length) {
-    const id = buf.toString('latin1', off, off + 4);
-    const size = buf.readUInt32LE(off + 4);
+  while (off + 8 <= total) {
+    const hdr = need(off, off + 8);
+    if (!hdr) break;                         // 块头读不到：就此打住
+    const id = hdr.toString('latin1', 0, 4);
+    const size = hdr.readUInt32LE(4);
     const body = off + 8;
-    if (id === 'fmt ' && body + 16 <= buf.length) {
-      out.format = buf.readUInt16LE(body);
-      out.channels = buf.readUInt16LE(body + 2);
-      out.sample_rate = buf.readUInt32LE(body + 4);
-      out.bits = buf.readUInt16LE(body + 14);
+    if (id === 'fmt ') {
+      const fb = need(body, body + 16);
+      if (fb) {
+        out.format = fb.readUInt16LE(0);
+        out.channels = fb.readUInt16LE(2);
+        out.sample_rate = fb.readUInt32LE(4);
+        out.bits = fb.readUInt16LE(14);
+      }
     } else if (id === 'data') {
       dataOff = body;
       // 声明长度可能大于实际文件（截断录音）：取二者较小者
@@ -1337,6 +1360,7 @@ function parseWavHeader(buf, totalBytes) {
     off = body + size + (size % 2);          // 块按偶数字节对齐
   }
   if (out.data_bytes == null) {
+    // 真的没有 data 块（或块头全读不到）：只能按最保守的 44 兜底
     out.data_bytes = Math.max(0, total - 44);
     dataOff = 44;
   }
@@ -1348,33 +1372,98 @@ function parseWavHeader(buf, totalBytes) {
 }
 
 /* 电平统计：给「无声 / 过短」一个服务端可复核的依据，而不是只靠浏览器自述。
- * 只抽样计算（每 16 个样本取 1），1 MB 以内开销可忽略。 */
-function wavLevelStats(buf, wav) {
+ *
+ * 【2026-10-28 修复】此前回读路径（readVoiceAudioMeta）只把文件前 64 KB 读进
+ * 来做统计：6 秒录音约 190 KB，等于只看了前 ~2 秒 —— 前段安静、后段有人说话
+ * 时服务端会报静音，前端提示「未录到声音」，而实际录到了。真机实测同一文件
+ * 服务端 -39.8 dBFS、全量 -44.3 dBFS，差 4.5 dB。
+ * 现在拆成「累加器 + 两种喂法」：
+ *   · wavLevelStats(buf, wav)              —— 上传路径，内存里已有完整 PCM；
+ *   · wavLevelStatsFromFile(file, wav)     —— 回读路径，流式分块读全量 PCM。
+ * 两条路径共用同一套累加逻辑，保证 /api/voice/audio 与 GET /api/voice 报的
+ * 电平值一致（否则前端看到的值取决于走哪个接口）。
+ *
+ * 抽样步长固定 32 字节（= 16 个 16-bit 样本），分块大小取 32 的整数倍，
+ * 这样「流式分块读」与「一次读完」的抽样点完全相同，结果逐位一致。 */
+const LEVEL_STRIDE = 32;
+
+function newLevelAcc() {
+  return { peak: 0, sum: 0, n: 0, zeros: 0 };
+}
+
+/** 把 buf[from, to) 里的抽样点累加进 acc。from 必须与 data 起点 32 字节对齐。 */
+function feedLevelAcc(acc, buf, from, to) {
+  for (let i = from; i + 1 < to; i += LEVEL_STRIDE) {
+    const v = buf.readInt16LE(i);
+    const a = Math.abs(v);
+    if (a > acc.peak) acc.peak = a;
+    if (a <= 1) acc.zeros++;
+    acc.sum += v * v;
+    acc.n++;
+  }
+}
+
+/** 累加器 → 对外字段。保留 peak / rms / peak_dbfs / rms_dbfs / silent_hint /
+ *  zero_ratio 这些既有字段名（前端与 test/voice-test.js 都依赖）。 */
+function finishLevelAcc(acc) {
   const out = { peak: 0, rms: 0, silent_hint: null, zero_ratio: null };
+  if (!acc.n) return out;
+  out.peak = acc.peak;
+  out.peak_dbfs = acc.peak > 0 ? Math.round(20 * Math.log10(acc.peak / 32768) * 10) / 10 : null;
+  out.rms = Math.round(Math.sqrt(acc.sum / acc.n));
+  out.rms_dbfs = out.rms > 0 ? Math.round(20 * Math.log10(out.rms / 32768) * 10) / 10 : null;
+  out.zero_ratio = Math.round((acc.zeros / acc.n) * 1000) / 1000;
+  // 峰值 <= -40 dBFS（约 328）视为基本无声；仅作提示，最终 stage 由前端判定
+  out.silent_hint = acc.peak < 328;
+  return out;
+}
+
+const EMPTY_LEVEL = () => ({ peak: 0, rms: 0, silent_hint: null, zero_ratio: null });
+const SILENT_LEVEL = () => ({ peak: 0, rms: 0, silent_hint: true, zero_ratio: null });
+
+/** 上传路径：内存里已有完整 WAV，直接在 buf 上算。 */
+function wavLevelStats(buf, wav) {
   try {
-    if (!wav || !wav.ok || wav.format !== 1 || wav.bits !== 16) return out;
+    if (!wav || !wav.ok || wav.format !== 1 || wav.bits !== 16) return EMPTY_LEVEL();
     const start = wav.data_offset || 44;
     const end = Math.min(buf.length, start + wav.data_bytes);
-    if (end - start < 4) { out.silent_hint = true; out.rms = 0; out.peak = 0; return out; }
-    let peak = 0, sum = 0, n = 0, zeros = 0;
-    for (let i = start; i + 1 < end; i += 32) {          // 32 字节 = 16 个 16-bit 样本
-      const v = buf.readInt16LE(i);
-      const a = Math.abs(v);
-      if (a > peak) peak = a;
-      if (a <= 1) zeros++;
-      sum += v * v;
-      n++;
-    }
-    if (!n) return out;
-    out.peak = peak;
-    out.peak_dbfs = peak > 0 ? Math.round(20 * Math.log10(peak / 32768) * 10) / 10 : null;
-    out.rms = Math.round(Math.sqrt(sum / n));
-    out.rms_dbfs = out.rms > 0 ? Math.round(20 * Math.log10(out.rms / 32768) * 10) / 10 : null;
-    out.zero_ratio = Math.round((zeros / n) * 1000) / 1000;
-    // 峰值 <= -40 dBFS（约 328）视为基本无声；仅作提示，最终 stage 由前端判定
-    out.silent_hint = peak < 328;
-    return out;
-  } catch (_) { return out; }
+    if (end - start < 4) return SILENT_LEVEL();
+    const acc = newLevelAcc();
+    feedLevelAcc(acc, buf, start, end);
+    return finishLevelAcc(acc);
+  } catch (_) { return EMPTY_LEVEL(); }
+}
+
+/** 回读路径：只从盘上流式读 data 段的 PCM，**不把整个 WAV 读进内存**。
+ * 块大小 64 KB（32 的整数倍，保证抽样点与一次读完一致）。
+ * 10 秒上限 = 320 KB 虽然整读也可承受，但流式的好处是不随上限增长而变差：
+ * 将来放宽 VOICE_MAX_BYTES 或写入更长的录音，这里的内存占用恒为 64 KB。 */
+function wavLevelStatsFromFile(file, wav) {
+  const CHUNK = 64 * 1024;
+  try {
+    if (!wav || !wav.ok || wav.format !== 1 || wav.bits !== 16) return EMPTY_LEVEL();
+    const start = wav.data_offset || 44;
+    const total = Math.max(0, wav.data_bytes || 0);
+    if (total < 4) return SILENT_LEVEL();
+    const acc = newLevelAcc();
+    const chunk = Buffer.alloc(Math.min(CHUNK, total));
+    const fd = fs.openSync(file, 'r');
+    try {
+      let pos = 0;
+      while (pos < total) {
+        const want = Math.min(chunk.length, total - pos);
+        const got = fs.readSync(fd, chunk, 0, want, start + pos);
+        if (got <= 0) break;
+        feedLevelAcc(acc, chunk, 0, got);
+        pos += got;
+        if (got < want) break;        // 文件被截断：已读到的部分照样算，不补零
+      }
+    } finally { fs.closeSync(fd); }
+    return finishLevelAcc(acc);
+  } catch (e) {
+    console.error('[voice] 电平统计读盘失败：', file, e.message);
+    return EMPTY_LEVEL();
+  }
 }
 
 /* audio_id → 绝对路径（严格校验，非法一律当不存在） */
@@ -1434,13 +1523,25 @@ function readVoiceAudioMeta(audioId) {
   if (!file) return null;
   try {
     const st = fs.statSync(file);
-    // 读前 64 KB 足够覆盖 WAV 头 + 若干采样，用于头部解析与电平抽样
+    /* 头部只读前 64 KB（绝大多数 WAV 的块头都在这一段里）；
+     * 但**电平统计不能只看这一段** —— 见 wavLevelStatsFromFile 的说明。
+     * 2026-10-28 修复前这里直接对 head 做统计，6 秒录音只覆盖了前 ~2 秒。
+     * 另外块遍历的上限是文件真实大小：data 块起点若落在 64 KB 之外，
+     * 用 readAt 补读块头，避免兜底成偏移 44 把 fmt 内容当 PCM（静默错误）。 */
     const headLen = Math.min(65536, st.size);
     const head = Buffer.alloc(headLen);
     const fd = fs.openSync(file, 'r');
-    try { fs.readSync(fd, head, 0, headLen, 0); } finally { fs.closeSync(fd); }
-    const wav = parseWavHeader(head, st.size);
-    const lv = wavLevelStats(head, wav);
+    let wav;
+    try {
+      fs.readSync(fd, head, 0, headLen, 0);
+      const readAt = (from, len) => {
+        const b = Buffer.alloc(len);
+        const got = fs.readSync(fd, b, 0, len, from);
+        return got === len ? b : b.subarray(0, got);
+      };
+      wav = parseWavHeader(head, st.size, readAt);
+    } finally { fs.closeSync(fd); }
+    const lv = wavLevelStatsFromFile(file, wav);   // 流式读全量 PCM，不整文件进内存
     return {
       audio_id: audioId,
       file: path.basename(file),

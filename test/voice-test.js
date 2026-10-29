@@ -118,6 +118,117 @@ function makeWav(dataBytes = 0, amplitude = 0) {
   return b;
 }
 
+/* 分段合成 WAV：segments = [{ seconds, amplitude }]，按顺序拼 PCM。
+ * 存在理由（2026-10-28 t8）：服务端曾只读文件前 64 KB 做电平统计，
+ * 6 秒录音约 190 KB 就只看了前 ~2 秒 —— 用「前段静音 + 后段有信号」这种
+ * 形状才能把该缺陷照出来（整段等幅度的 WAV 无论只读前段还是读全量，
+ * RMS 都一样，永远测不出来）。
+ * 幅度用常数（DC）而不是正弦，是为了理论值可精确手算：
+ *   peak = amp；RMS = amp × sqrt(有信号样本占比)。 */
+function makeWavSegments(segments) {
+  const perSec = 16000;
+  const counts = segments.map((s) => Math.round(s.seconds * perSec));
+  const samples = counts.reduce((a, b) => a + b, 0);
+  const dataBytes = samples * 2;
+  const b = Buffer.alloc(44 + dataBytes);
+  b.write('RIFF', 0, 'latin1');
+  b.writeUInt32LE(36 + dataBytes, 4);
+  b.write('WAVE', 8, 'latin1');
+  b.write('fmt ', 12, 'latin1');
+  b.writeUInt32LE(16, 16);
+  b.writeUInt16LE(1, 20);
+  b.writeUInt16LE(1, 22);
+  b.writeUInt32LE(perSec, 24);
+  b.writeUInt32LE(perSec * 2, 28);
+  b.writeUInt16LE(2, 32);
+  b.writeUInt16LE(16, 34);
+  b.write('data', 36, 'latin1');
+  b.writeUInt32LE(dataBytes, 40);
+  let off = 44;
+  segments.forEach((seg, i) => {
+    for (let k = 0; k < counts[i]; k++) { b.writeInt16LE(seg.amplitude, off); off += 2; }
+  });
+  return b;
+}
+
+/* 与 makeWavSegments 配套的「标准答案」：按全量 PCM 手算峰值 / RMS（dBFS）。
+ * 断言服务端自报值时用它做独立参照，而不是拿服务端自己的算法自证。 */
+function expectedLevel(segments) {
+  const perSec = 16000;
+  let sum = 0, n = 0, peak = 0;
+  for (const seg of segments) {
+    const cnt = Math.round(seg.seconds * perSec);
+    for (let k = 0; k < cnt; k++) {
+      const v = seg.amplitude;
+      if (Math.abs(v) > peak) peak = Math.abs(v);
+      sum += v * v;
+      n++;
+    }
+  }
+  const rms = Math.sqrt(sum / n);
+  const db = (x) => (x <= 0 ? -Infinity : Math.round(20 * Math.log10(x / 32768) * 10) / 10);
+  return { peak, rms, peakDb: db(peak), rmsDb: db(rms), samples: n };
+}
+
+/* 把 data 块挪到非 44 偏移：在 fmt 与 data 之间插一个 2 字节的 'LIST' 块，
+ * 使 data 从 46 开始。用来验证服务端是否按块遍历、而不是硬编码偏移 44。 */
+function shiftDataBlock(buf) {
+  const dataBody = buf.subarray(44);
+  const extra = Buffer.alloc(10);              // 8 字节块头 + 2 字节内容（偶数对齐）
+  extra.write('LIST', 0, 'latin1');
+  extra.writeUInt32LE(2, 4);
+  extra.writeUInt16LE(0, 8);
+  const out = Buffer.concat([buf.subarray(0, 36), extra, Buffer.from('data', 'latin1')]);
+  const size = Buffer.alloc(4);
+  size.writeUInt32LE(dataBody.length, 0);
+  const head = Buffer.concat([out, size]);
+  const full = Buffer.concat([head, dataBody]);
+  full.writeUInt32LE(full.length - 8, 4);      // 重算 RIFF 长度
+  return full;
+}
+
+/* 把 fmt 块撑大，使 data 块的起点超过 64 KB（服务端回读只读前 64 KB 做头解析）。
+ * 存在理由（2026-10-28 t8 复查）：回读路径只读文件前 64 KB 去遍历块，
+ * 一旦 data 起点在这之外，就找不到 data 块、兜底成「偏移 44 + 全文件剩余」，
+ * 于是把 fmt 块的内容当成 PCM 读 —— 电平值会算错，但不会报错，属静默错误。
+ * 现实中固件不会写 64 KB 的 fmt 块，但「按块遍历」的健壮性正是这条用例守的。 */
+function makeWavWideFmt(extraFmtBytes, segments) {
+  const fmtBody = Buffer.alloc(16 + extraFmtBytes);
+  fmtBody.writeUInt16LE(1, 0);                 // PCM
+  fmtBody.writeUInt16LE(1, 2);                 // 单声道
+  fmtBody.writeUInt32LE(16000, 4);
+  fmtBody.writeUInt32LE(16000 * 2, 8);
+  fmtBody.writeUInt16LE(2, 12);
+  fmtBody.writeUInt16LE(16, 14);
+  const parts = [];
+  const h = Buffer.alloc(12);
+  h.write('RIFF', 0, 'latin1');
+  h.write('WAVE', 8, 'latin1');
+  parts.push(h);
+  const fh = Buffer.alloc(8);
+  fh.write('fmt ', 0, 'latin1');
+  fh.writeUInt32LE(fmtBody.length, 4);
+  parts.push(fh, fmtBody);
+  if (fmtBody.length % 2) parts.push(Buffer.alloc(1));
+  const perSec = 16000;
+  const counts = segments.map((s) => Math.round(s.seconds * perSec));
+  const samples = counts.reduce((a, b) => a + b, 0);
+  const dataBytes = samples * 2;
+  const dh = Buffer.alloc(8);
+  dh.write('data', 0, 'latin1');
+  dh.writeUInt32LE(dataBytes, 4);
+  parts.push(dh);
+  const pcm = Buffer.alloc(dataBytes);
+  let off = 0;
+  segments.forEach((seg, i) => {
+    for (let k = 0; k < counts[i]; k++) { pcm.writeInt16LE(seg.amplitude, off); off += 2; }
+  });
+  parts.push(pcm);
+  const all = Buffer.concat(parts);
+  all.writeUInt32LE(all.length - 8, 4);
+  return all;
+}
+
 const listWavs = () => {
   try { return fs.readdirSync(VOICE_DIR).filter((n) => n.endsWith('.wav')); } catch (_) { return []; }
 };
@@ -243,6 +354,107 @@ function staticContract() {
     ok(up2.status === 200 && up2.json.silent_hint === false,
       '有声音录音 silent_hint=false', `peak=${up2.json.peak_dbfs} dBFS`);
     ok(up2.json.duration_ms === 100, '未自报时长时由 WAV 头算出 100ms', String(up2.json.duration_ms));
+
+    /* ---- ①-3 电平统计必须覆盖全量 PCM，不能只看开头 ----
+     * 缺陷背景（2026-10-28）：readVoiceAudioMeta() 曾只把文件前 64 KB 读进来做
+     * 电平统计。6 秒录音约 190 KB，等于只看了前 ~2 秒 —— 前段安静、后段有人
+     * 说话时服务端会报静音，前端提示「未录到声音」，而其实录到了。
+     * 形状特意做成「前 2 秒全零 + 后 4 秒满幅」：只读前段的实现必然报静音，
+     * 全量实现则能算出真实电平，两者结果差异极大，测不出来就说明判据失效。 */
+    console.log('\n— ①-3 电平统计覆盖全量 PCM（不是只看开头 64 KB）—');
+    const mixed = [{ seconds: 2, amplitude: 0 }, { seconds: 4, amplitude: 8000 }];
+    const mixedWav = makeWavSegments(mixed);
+    const exp = expectedLevel(mixed);
+    ok(mixedWav.length > 64 * 1024,
+      `用例 WAV 大于 64 KB（${mixedWav.length} 字节），能照出「只读前 64 KB」的缺陷`);
+    const upMix = await uploadWav(mixedWav);
+    ok(upMix.status === 200, '分段 WAV 上传返回 200', `bytes=${mixedWav.length}`);
+    ok(upMix.json.duration_ms === 6000, '分段 WAV 时长由头算出 6000ms', String(upMix.json.duration_ms));
+    ok(typeof upMix.json.rms_dbfs === 'number' && Math.abs(upMix.json.rms_dbfs - exp.rmsDb) <= 1.0,
+      'rms_dbfs 反映全量 PCM（后段信号没有被漏掉）',
+      `服务端 ${upMix.json.rms_dbfs} dBFS vs 全量手算 ${exp.rmsDb} dBFS` +
+      `（只读前 2 秒的实现会得到静音/无值）`);
+    ok(upMix.json.silent_hint === false,
+      '前静音后有声的录音不得被判为静音（silent_hint=false）',
+      `silent_hint=${upMix.json.silent_hint}，peak_dbfs=${upMix.json.peak_dbfs}`);
+    ok(typeof upMix.json.peak_dbfs === 'number' && Math.abs(upMix.json.peak_dbfs - exp.peakDb) <= 1.0,
+      'peak_dbfs 反映全量 PCM 的峰值', `服务端 ${upMix.json.peak_dbfs} vs 手算 ${exp.peakDb} dBFS`);
+
+    /* 反向用例：前段有信号 + 后段静音。只读前段的实现会算出「有声」，
+     * 全量实现应得到被后段拉低的 RMS —— 两个方向都要覆盖，避免只修一半。 */
+    const mixed2 = [{ seconds: 2, amplitude: 8000 }, { seconds: 4, amplitude: 0 }];
+    const exp2 = expectedLevel(mixed2);
+    const upMix2 = await uploadWav(makeWavSegments(mixed2));
+    ok(upMix2.status === 200 &&
+      typeof upMix2.json.rms_dbfs === 'number' &&
+      Math.abs(upMix2.json.rms_dbfs - exp2.rmsDb) <= 1.0,
+      '前有声后静音的录音，rms_dbfs 同样按全量计算',
+      `服务端 ${upMix2.json.rms_dbfs} dBFS vs 全量手算 ${exp2.rmsDb} dBFS`);
+
+    /* 电平统计不能硬编码 data 块在偏移 44：这里把 data 块挪到偏移 54，
+     * 若实现写死 44 就会把 LIST 块的内容当 PCM 读，结果必然错。 */
+    const shifted = shiftDataBlock(mixedWav);
+    const upShift = await uploadWav(shifted);
+    ok(upShift.status === 200, 'data 块不在偏移 44 的 WAV 仍能上传', `bytes=${shifted.length}`);
+    ok(typeof upShift.json.rms_dbfs === 'number' &&
+      Math.abs(upShift.json.rms_dbfs - exp.rmsDb) <= 1.0,
+      'data 块不在偏移 44 时电平统计仍正确（按块遍历，不硬编码 44）',
+      `服务端 ${upShift.json.rms_dbfs} dBFS vs 全量手算 ${exp.rmsDb} dBFS`);
+
+    /* ---- ①-4 回读路径的电平统计也必须覆盖全量 ----
+     * 上传路径拿到的是内存里的完整 buf，天然是全量；但 GET /api/voice 走的是
+     * readVoiceAudioMeta()，它只从盘上读文件开头 64 KB 再算电平 —— 这才是
+     * 2026-10-28 真机实测「服务端 -39.8 dBFS vs 全量 -44.3 dBFS」的来源
+     * （test/voice-hil.js ② 段正是拿这个值和本地全量解码比对）。
+     * 所以缺陷必须在这条路径上被照出来，否则测试是假绿。 */
+    // 重新上传一次分段 WAV，确保 latest 就是它（前面几个用例已经把它挤下去了）
+    const upMix3 = await uploadWav(mixedWav);
+    ok(upMix3.status === 200, '为回读断言重新上传分段 WAV');
+    const vMix = await jget('/api/voice');
+    ok(vMix.latest && vMix.latest.audio_id === upMix3.json.audio_id,
+      'GET /api/voice 的 latest 指向刚上传的分段录音');
+    ok(vMix.latest && typeof vMix.latest.rms_dbfs === 'number' &&
+      Math.abs(vMix.latest.rms_dbfs - exp.rmsDb) <= 1.0,
+      '回读路径（GET /api/voice）的 rms_dbfs 也按全量 PCM 计算',
+      `回读 ${vMix.latest && vMix.latest.rms_dbfs} dBFS vs 全量手算 ${exp.rmsDb} dBFS` +
+      `（只读前 64 KB 会得到静音/无值）`);
+    ok(vMix.latest && vMix.latest.silent_hint === false,
+      '回读路径不得把「前静音后有声」判成静音',
+      `silent_hint=${vMix.latest && vMix.latest.silent_hint}`);
+    ok(vMix.latest && typeof vMix.latest.peak_dbfs === 'number' &&
+      Math.abs(vMix.latest.peak_dbfs - exp.peakDb) <= 1.0,
+      '回读路径的 peak_dbfs 也按全量 PCM 计算',
+      `回读 ${vMix.latest && vMix.latest.peak_dbfs} vs 手算 ${exp.peakDb} dBFS`);
+
+    /* 最近录音列表也走 readVoiceAudioMeta，一并盯住 */
+    const inRecent = (vMix.recent || []).find((r) => r.audio_id === upMix3.json.audio_id);
+    ok(inRecent && typeof inRecent.rms_dbfs === 'number' &&
+      Math.abs(inRecent.rms_dbfs - exp.rmsDb) <= 1.0,
+      'recent 列表里的 rms_dbfs 同样按全量计算',
+      `recent ${inRecent && inRecent.rms_dbfs} dBFS vs 全量手算 ${exp.rmsDb} dBFS`);
+
+    /* ---- ①-5 data 块起点超出「前 64 KB 头部窗口」时仍要按块遍历 ----
+     * 回读路径只把文件前 64 KB 读进来做头解析。若 data 起点在这之外，
+     * 解析器找不到 data 块就会兜底成「偏移 44 + 全文件剩余」，
+     * 把 fmt 块内容当 PCM 读 —— 电平值算错却不报错（静默错误）。
+     * 这里用 70 KB 的 fmt 块把 data 推到偏移 70044，直接验证这一点。 */
+    const wide = makeWavWideFmt(70000, mixed);
+    const expWide = expectedLevel(mixed);
+    ok(wide.length > 70000, `宽 fmt 用例 WAV 的 data 起点在 64 KB 之外（${wide.length} 字节）`);
+    const upWide = await uploadWav(wide);
+    ok(upWide.status === 200, '宽 fmt 块 WAV 上传返回 200', `bytes=${wide.length}`);
+    ok(upWide.json.duration_ms === 6000,
+      '上传路径：宽 fmt 块时 data_bytes 由块头正确读出（时长 6000ms 而非按 44 兜底）',
+      `duration_ms=${upWide.json.duration_ms}`);
+    const vWide = await jget('/api/voice');
+    const rowWide = (vWide.recent || []).find((r) => r.audio_id === upWide.json.audio_id);
+    ok(rowWide && rowWide.data_bytes === 192000,
+      '回读路径：宽 fmt 块的 data_bytes 同样正确',
+      `回读 data_bytes=${rowWide && rowWide.data_bytes}`);
+    ok(rowWide && typeof rowWide.rms_dbfs === 'number' &&
+      Math.abs(rowWide.rms_dbfs - expWide.rmsDb) <= 1.0,
+      '回读路径：宽 fmt 块时电平仍按真正的 data 段计算（不把 fmt 当 PCM）',
+      `回读 ${rowWide && rowWide.rms_dbfs} dBFS vs 全量手算 ${expWide.rmsDb} dBFS`);
 
     console.log('\n— ② 非 WAV → 400 且不落盘 —');
     let n0 = listWavs().length;
