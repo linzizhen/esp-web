@@ -55,6 +55,18 @@ const DEFAULT_CONFIG = {
   mockDevice: false,     // true = 模拟板端（服务端自答回执与观测），仅供无板联调；
                          //        所有模拟结果都会带 simulated 标记，绝不冒充实物命令
   collectTimeoutMs: 8000,// 下发采集命令后，多久没等到新观测判超时
+  // ---- 命令回执（第 5 周收尾）：下发 ≠ 板端已接受 ----
+  //   下发成功后等板端按 request_id 回 ack，超过该时长没等到就判 timeout。
+  //   实测板端 ack 通常 <100ms，板端忙（正在上传上一段录音）时几百 ms；
+  //   默认 1800ms 给足余量。可用环境变量 COMMAND_ACK_TIMEOUT_MS 覆盖。
+  commandAckTimeoutMs: 1800,
+  //   WiFi 下行通道额外再加一份回执预算（默认 1200ms，即纯 WiFi 时总计 3000ms）。
+  //   依据（2026-10-28 实测）：板端 ack 走 ack_task → http_post("/api/data")，
+  //   http_post 每次都 esp_http_client_init 新建 TCP、无 keep-alive，一次「建连 + 发一行」
+  //   在丢包重传下可达 1–3 秒，与 1800ms 同量级；纯 WiFi 模式下不加这份预算就会把
+  //   「慢回执」误判成 timeout（从"谎报成功"翻成"谎报失败"）。设 0 即关闭。
+  //   可用环境变量 COMMAND_ACK_WIFI_EXTRA_MS 覆盖。
+  commandAckWifiExtraMs: 1200,
   // ---- 持久化存储（作业要求：VPS 原始记录可查）----
   storageEnabled: true,  // 是否把每一帧真实数据落盘为 NDJSON，便于核对"一帧观测对应一条记录"
   storageMaxMb: 32,       // 单个记录文件超过该大小后滚动归档
@@ -301,6 +313,30 @@ function broadcast(obj) {
 const REQUESTS = new Map();          // request_id -> request
 const REQUEST_KEEP = 50;             // 内存中保留最近 N 条
 const collectTimeoutMs = () => config.collectTimeoutMs || 8000;   // 下发后多久没等到新观测 → 超时
+/* 等板端 ack 的默认时长（第 5 周收尾）。
+ * 环境变量 COMMAND_ACK_TIMEOUT_MS 优先，其次 config.commandAckTimeoutMs，最后 1800ms。
+ * 为什么不是「写完就成功」：串口 write 回调只证明字节进了驱动缓冲，
+ * 板端完全可能因为忙（如正在上传上一段录音）把命令丢弃 —— 只有 ack 才是板端的态度。 */
+const commandAckTimeoutMs = () => {
+  const env = Number(process.env.COMMAND_ACK_TIMEOUT_MS);
+  if (Number.isFinite(env) && env > 0) return env;
+  const cfg = Number(config.commandAckTimeoutMs);
+  return Number.isFinite(cfg) && cfg > 0 ? cfg : 1800;
+};
+
+/* WiFi 通道额外的回执等待预算（2026-10-28 实测依据）。
+ * 串口回执是「板端 printf 一行」，通常 <100ms；WiFi 回执走的是固件
+ * ack_task → http_post("/api/data")，而 http_post 每次都 esp_http_client_init
+ * 新建 TCP 连接（没有 keep-alive），板端当前空口 RTT 实测 p50 124–409ms，
+ * 一次「建连 + 发一行」在丢包重传下可能要 1–3 秒 —— 与 1800ms 默认预算同量级。
+ * 因此纯 WiFi 通道单独加一份预算，而不是把串口那条也一起拉长（那会让串口
+ * 模式下的失败反馈变迟钝）。可用 COMMAND_ACK_WIFI_EXTRA_MS 覆盖，设 0 即关闭。 */
+const commandAckWifiExtraMs = () => {
+  const env = Number(process.env.COMMAND_ACK_WIFI_EXTRA_MS);
+  if (Number.isFinite(env) && env >= 0) return env;
+  const cfg = Number(config.commandAckWifiExtraMs);
+  return Number.isFinite(cfg) && cfg >= 0 ? cfg : 1200;
+};
 let requestCounter = 0;
 
 function newRequestId() {
@@ -368,6 +404,19 @@ function dropExpiredCommands() {
   while (cmdQueue.length && now - cmdQueue[0].queued_at > cmdQueue[0].ttl) cmdQueue.shift();
 }
 
+/* 撤回一条还没被板端取走的命令（按 id）。
+ * 用途见 sendCommandAndWaitAck 的 channel_unavailable 分支：既然已经告诉调用方
+ * 「通道不可用、没下发」，就不能让这条命令 15 秒内又被板端取走执行 —— 否则
+ * 用户按报错重试一次，板端会录两段，而服务端只认后面那条的回执。
+ * 返回 true = 确实撤掉了；false = 已被板端取走（那就只能如实说"已发出"）。 */
+function withdrawQueuedCommand(id) {
+  if (!id) return false;
+  const i = cmdQueue.findIndex((c) => c.id === id);
+  if (i < 0) return false;
+  cmdQueue.splice(i, 1);
+  return true;
+}
+
 /* 板端来取命令：返回一条匹配本设备的命令，没有则 null */
 function takeCommand(device) {
   dropExpiredCommands();
@@ -382,13 +431,24 @@ function wifiDownlinkActive() {
   return !!stats.lastCmdPollAt && (Date.now() - stats.lastCmdPollAt) < 2000;
 }
 
-/* 下发一行命令。
- * 返回 true = 【当前确实能送达】（串口写出成功，或板端正通过 WiFi 轮询来取）。
- * 串口不在线时命令仍会入队，这样板端一旦上线就能取走，不会丢；
- * 但若板端当前并未轮询，则返回 false —— 调用方据此如实提示"未送达"，
- * 绝不在没有任何送达证据时声称已下发。 */
-function sendCommand(obj, device) {
-  if (config.mockDevice) return false;       // 模拟模式不走真实通道
+/* 下发一行命令，并如实报出【实际走了哪条通道】。
+ *
+ * 返回 { ok, channel }：
+ *   ok      = 当前确实能送达（串口写出成功，或板端正通过 WiFi 轮询来取）
+ *   channel = 'serial' | 'wifi' | null —— 取的是【真实写路径】，
+ *             不是用 serialOpen() 反推的（见下方 2026-10-28 修复说明）
+ *   queued  = 是否进了 WiFi 待取队列（即便 ok=false 也可能入队，这是既有设计：
+ *             板端 15 秒内上线仍能取走，不能丢命令）
+ *
+ * ★ 2026-10-28 修复：原 sendCommandAndWaitAck() 里的
+ *     `const channel = serialOpen() ? 'serial' : 'wifi';`
+ *   是用「串口此刻开着吗」去猜「这条命令走了哪条路」，两者并不等价：
+ *   port.write() 抛异常（驱动已半死、写缓冲满）时会落到入队分支，命令其实
+ *   走 WiFi，channel 却仍报 'serial'。取证时这条错信息会把排查引向
+ *   「串口明明开着为什么板端没回执」的错误方向。现在由真正执行写入的
+ *   分支直接给出 channel，调用方不再自己推断。 */
+function sendCommandEx(obj, device) {
+  if (config.mockDevice) return { ok: false, channel: null, queued: false };  // 模拟模式不走真实通道
   if (port && port.isOpen) {
     try {
       port.write(JSON.stringify(obj) + '\n', (err) => {
@@ -396,16 +456,262 @@ function sendCommand(obj, device) {
       });
       stats.cmdSent = (stats.cmdSent || 0) + 1;
       stats.cmdViaSerial = (stats.cmdViaSerial || 0) + 1;
-      return true;
+      return { ok: true, channel: 'serial', queued: false };
     } catch (e) {
       stats.lastError = String(e.message || e);
-      return false;
+      // 写失败 → 继续走下面的入队分支，命令不丢
     }
   }
-  // 串口不在线 → 入队，等板端经 WiFi 来取
-  queueCommand(obj, device);
+  // 串口不在线（或写出失败）→ 入队，等板端经 WiFi 来取
+  const item = queueCommand(obj, device);
   stats.cmdViaWifi = (stats.cmdViaWifi || 0) + 1;
-  return wifiDownlinkActive();
+  // queueId 供调用方在「判定为通道不可用」时撤回这条命令（见 withdrawQueuedCommand）
+  return { ok: wifiDownlinkActive(), channel: 'wifi', queued: true, queueId: item.id };
+}
+
+/* 兼容包装：旧调用方（/api/collect、求助、摄像头…）只关心「能不能送达」。
+ * 行为与改前完全一致，只是内部改用 sendCommandEx() 以免两处逻辑漂移。 */
+function sendCommand(obj, device) {
+  return sendCommandEx(obj, device).ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* 板端回执等待（第 5 周收尾）：把「命令已下发」与「板端已接受」分开      */
+/*                                                                     */
+/* 背景（实测，非推测）：2026-10-26 POST /api/voice/record 返回          */
+/* ok=true accepted=true，但固件 voice_record.c:571 的 voice_record_    */
+/* toggle() 首段是 if (s_uploading) { ESP_LOGW(...); return false; }，   */
+/* main.c:1377-1388 据此回 cmd_ack(rid,"busy") —— 命令被板端丢弃，      */
+/* 服务端却报成功。串口 write 回调只说明字节进了驱动缓冲，不是板端态度。  */
+/*                                                                     */
+/* 做法：下发前按 request_id 登记一个等待槽，板端 ack 上行到达时结算；    */
+/* 超时未结算 → timeout。三种基本结局：accepted / busy / timeout，       */
+/* 另外把「板端明确报错」「通道不可用」「模拟模式」也如实区分。           */
+/* ------------------------------------------------------------------ */
+const PENDING_ACKS = new Map();   // request_id -> { settle, timer, sentAt }
+/* 等 ack 类命令的序号：拼进 request_id，保证同一毫秒内的多个请求不会撞号。
+ * 只用于本进程内唯一性（板端原样回传，跨重启无需全局唯一）。 */
+let ackRequestSeq = 0;
+
+/* ack status 分类：板端 status 是自由字符串（recording / uploading / busy /
+ * paused / cam_on / "linked=1 ip=..." 等），只有明确表示"拒绝/失败"的才算负向。 */
+function classifyAckStatus(status) {
+  const s = String(status == null ? '' : status).trim();
+  if (!s) return 'accepted';                 // 有回执但没带 status：视为已接受（至少证明板端处理了）
+  if (/(^|[^a-z])busy([^a-z]|$)/i.test(s)) return 'busy';
+  if (/^(error|failed|unknown_cmd|no_camera|no_active_help|rejected|denied)/i.test(s)) return 'error';
+  return 'accepted';
+}
+
+/* 登记一个等待槽：返回 { promise, cancel, collision }。
+ * 必须在 sendCommand() 之前调用 —— 否则极快的 ack 会赶在登记前到达而漏掉。
+ *
+ * ★ 2026-10-28 修复（审查 blocker F1：request_id 撞号导致请求永久挂死）：
+ * 原实现 `PENDING_ACKS.set(requestId, entry)` 会直接覆盖同 id 的旧等待槽，
+ * 而旧槽的 setTimeout 回调开头有守卫 `if (PENDING_ACKS.get(requestId) !== entry) return;`
+ * —— 于是旧槽既不结算也不删除，那个 await 永不 resolve（cancel() 有同样守卫，救不回来）。
+ * 实测（隔离实例、ACK 超时 400ms、同一 tick 发 8 个 POST、板端只取命令不回执）：
+ * 返回 2/8、挂死 6/8，且再等 3 倍超时挂死数不变 —— 服务端没有任何兜底。
+ * 现在两道保险：
+ *   ① 撞号时不覆盖旧槽，新请求立刻拿到 outcome=request_id_collision 的明确结局；
+ *   ② 每个等待槽额外挂一个 timeoutMs+2s 的硬兜底定时器，任何异常都不许永久挂起。
+ */
+function createAckWaiter(requestId, timeoutMs) {
+  if (PENDING_ACKS.has(requestId)) {
+    // 不覆盖：让新请求拿到明确结局，而不是把两个请求都拖进"永挂"
+    const promise = Promise.resolve({
+      outcome: 'request_id_collision', ack_status: null, ack_seq: null,
+      ack_channel: null, waited_ms: 0,
+    });
+    return { promise, cancel: () => {}, collision: true };
+  }
+  let settle;
+  const promise = new Promise((resolve) => { settle = resolve; });
+  const entry = { sentAt: Date.now(), timer: null, hardTimer: null, settled: false };
+  /* 唯一的结算出口：保证「只结算一次」+「一定从 PENDING_ACKS 里摘掉」。
+   * 所有路径（ack 到达 / 超时 / 取消 / 硬兜底）都走这里，不再各自删表。 */
+  const finish = (result) => {
+    if (entry.settled) return;
+    entry.settled = true;
+    if (PENDING_ACKS.get(requestId) === entry) PENDING_ACKS.delete(requestId);
+    clearTimeout(entry.timer);
+    clearTimeout(entry.hardTimer);
+    settle(result);
+  };
+  entry.timer = setTimeout(() => finish({
+    outcome: 'timeout', ack_status: null, ack_seq: null,
+    ack_channel: null, waited_ms: Date.now() - entry.sentAt,
+  }), timeoutMs);
+  entry.hardTimer = setTimeout(() => finish({
+    outcome: 'timeout', ack_status: null, ack_seq: null, ack_channel: null,
+    waited_ms: Date.now() - entry.sentAt, hard_timeout: true,
+  }), timeoutMs + 2000);
+  // settlePendingAck() 通过 entry.finish() 结算，必须挂到 entry 上（否则 ack 到达时会抛错）
+  entry.finish = finish;
+  // 定时器不应把进程钉在事件循环里（服务端长期运行，但测试要能干净退出）
+  if (entry.timer.unref) entry.timer.unref();
+  if (entry.hardTimer.unref) entry.hardTimer.unref();
+  PENDING_ACKS.set(requestId, entry);
+  const cancel = (result) => finish(result);   // finish 自带"已结算就不覆盖真实回执"的保护
+  /* 延长等待预算（2026-10-28）：通道在登记之后才确定（串口 vs WiFi），
+   * 而 WiFi 回执要新建 TCP 连接、可能吃掉 1–3 秒，所以允许在拿到真实通道后
+   * 把超时重设一次。重设只对「尚未结算」的槽生效，且总预算仍受硬兜底约束。 */
+  const extend = (extraMs) => {
+    if (entry.settled || !(extraMs > 0)) return;
+    const total = timeoutMs + extraMs;
+    const left = () => Math.max(0, total - (Date.now() - entry.sentAt));
+    clearTimeout(entry.timer);
+    clearTimeout(entry.hardTimer);
+    entry.timer = setTimeout(() => finish({
+      outcome: 'timeout', ack_status: null, ack_seq: null,
+      ack_channel: null, waited_ms: Date.now() - entry.sentAt,
+    }), left());
+    entry.hardTimer = setTimeout(() => finish({
+      outcome: 'timeout', ack_status: null, ack_seq: null, ack_channel: null,
+      waited_ms: Date.now() - entry.sentAt, hard_timeout: true,
+    }), left() + 2000);
+    if (entry.timer.unref) entry.timer.unref();
+    if (entry.hardTimer.unref) entry.hardTimer.unref();
+  };
+  return { promise, cancel, collision: false, finish, extend };
+}
+
+/* 板端 ack 上行到达：结算对应等待槽。返回 true = 确有等待方被唤醒。
+ * transport 是 ack 实际到达的那条上行（serial / wifi），用于取证
+ * 「命令走 WiFi、回执也从 WiFi 回来」这类链路判断。 */
+function settlePendingAck(request_id, status, seq, transport) {
+  if (typeof request_id !== 'string' || !request_id) return false;
+  const entry = PENDING_ACKS.get(request_id);
+  if (!entry) return false;
+  const outcome = classifyAckStatus(status);
+  entry.finish({
+    outcome,
+    ack_status: status == null ? null : String(status),
+    ack_seq: typeof seq === 'number' ? seq : null,
+    ack_channel: transport || null,
+    waited_ms: Date.now() - entry.sentAt,
+  });
+  return true;
+}
+
+/* 超时文案（2026-10-28）：只写「没收到回执」没法排查。
+ * 固件改完后串口与 WiFi 两条上行都能回执，所以超时确实只剩两种成因：
+ *   ① 板端真的没回（固件没跑 / 命令没被取走 / 卡在别处）
+ *   ② 回执发了但回不来（WiFi 上行失败，或串口线被拔）
+ * 下面按【这条命令实际走的通道】分别给出下一步动作，两者指向不同的取证位置。 */
+function ackTimeoutNote(channel) {
+  const diag = '/api/diag 的 downlink 与 commandAck、/api/state 的 raw 尾部';
+  if (channel === 'serial') {
+    return '命令已写进串口，但超时内没收到板端回执。排查顺序：'
+      + `① 看 ${diag}，确认 raw 里有没有同一 request_id 的 {"type":"ack"} 原文；`
+      + '② 若 raw 里完全没有该 request_id，说明板端没处理这条命令 —— 看板端串口日志有没有 '
+      + '"WiFi 取到命令" / "远程录音命令" 字样，或命令是否被 pause 之类状态挡住；'
+      + '③ 若 raw 里有 ack 但本接口仍报超时，那是 rid 不匹配，把两边 request_id 贴出来比对。';
+  }
+  return '命令已进 WiFi 待取队列，但超时内没收到板端回执。排查顺序：'
+    + `① 看 ${diag}：downlink.wifiPolling=false 表示板端根本没来取命令（GET /api/cmd），`
+    + '此时命令还躺在队列里（downlink.queued>0），不是"板端不回执"；'
+    + '② wifiPolling=true 而 queued=0 说明命令已被取走 —— 那问题在回执上行：'
+    + '板端日志里找 "★ 回执 WiFi 上行失败" 计数，它对应 http_post("/api/data") 失败；'
+    + '③ 回执走的是和帧同一条 WiFi 上行，若帧能到而 ack 不到，检查板端是否刚好处在断网瞬间。';
+}
+
+const ACK_OUTCOME_TEXT = {
+  accepted: '板端已接受命令',
+  busy: '板端忙，命令被丢弃（板端返回 busy）',
+  error: '板端拒绝或执行失败',
+  timeout: '命令已写出，但在超时时间内没收到板端回执',
+  channel_unavailable: '命令通道不可用（串口未打开，且板端未通过 WiFi 轮询取命令）',
+  mock: '模拟模式（config.mockDevice=true）：未走真实通道，不伪造板端回执',
+  no_request_id: '命令缺少 request_id，无法与板端回执配对',
+  request_id_collision: 'request_id 已被另一条在途命令占用，本命令未下发（拒绝冒用同一 id）',
+};
+
+/* 下发一条带 request_id 的命令，并等板端 ack。
+ * 返回（永不 reject）：
+ *   { outcome, dispatched, accepted, channel, request_id, ack_status, ack_seq,
+ *     waited_ms, timeout_ms, simulated, message }
+ *   outcome ∈ accepted | busy | error | timeout | channel_unavailable | mock | no_request_id
+ * 关键语义：
+ *   · dispatched=true 只代表"确实写进了通道"，不代表板端接受；
+ *   · accepted=true 只有在真的收到板端 ack 且 status 非 busy/error 时才成立；
+ *   · 模拟模式下既不发命令也不伪造回执（outcome=mock）。 */
+async function sendCommandAndWaitAck(obj, device, opts = {}) {
+  const optTimeout = Number(opts.timeoutMs);
+  const timeoutMs = Number.isFinite(optTimeout) && optTimeout > 0 ? optTimeout : commandAckTimeoutMs();
+  const requestId = obj && obj.request_id ? String(obj.request_id) : null;
+  const shell = {
+    dispatched: false,
+    accepted: false,
+    channel: null,
+    queued: false,
+    withdrawn: false,   // 通道不可用时是否已把入队的命令撤回（撤回失败=板端可能已取走）
+    request_id: requestId,
+    ack_status: null,
+    ack_seq: null,
+    ack_channel: null,
+    waited_ms: null,
+    timeout_ms: timeoutMs,
+    simulated: false,
+    message: null,
+  };
+  const done = (o) => Object.assign({}, shell, o,
+    { message: o.message || ACK_OUTCOME_TEXT[o.outcome] || null });
+
+  // 模拟模式：绝不在没有真实板端时假装收到 ack
+  if (config.mockDevice) return done({ outcome: 'mock', simulated: true });
+  if (!requestId) return done({ outcome: 'no_request_id' });
+
+  const waiter = createAckWaiter(requestId, timeoutMs);
+  // 撞号：同一 request_id 已有在途命令，绝不能冒用同一个 id 下发
+  // （否则板端的回执会被先登记的那条请求认领，两条命令的真实态度都失真）
+  if (waiter.collision) {
+    return done({ outcome: 'request_id_collision', dispatched: false });
+  }
+  // 用 sendCommandEx 而不是 sendCommand：要拿【真实写路径】给出的 channel，
+  // 不能事后用 serialOpen() 猜（见 sendCommandEx 上方 2026-10-28 修复说明）。
+  const sent = sendCommandEx(obj, device);
+  if (!sent.ok) {
+    /* ★ 2026-10-28 修复（审查 F5）：原实现在通道不可用时只 cancel 等待槽，
+     * 命令却留在 WiFi 队列里（TTL 15s）—— 调用方收到「没下发」，板端随后
+     * 却把它取走执行（实测：POST 返回 channel_unavailable 后板端 GET /api/cmd
+     * 取到 {"cmd":"voice_record","request_id":"voice-rec-..."}，用户按报错重试
+     * 就会录两段）。既然回答「没送达」，就必须把这条命令撤回来。
+     * 撤回失败（刚好已被板端取走）则如实报 queued=true + withdrawn=false。 */
+    let withdrawn = false;
+    if (sent.queued && sent.queueId) withdrawn = withdrawQueuedCommand(sent.queueId);
+    waiter.cancel({ outcome: 'channel_unavailable' });
+    return done({
+      outcome: 'channel_unavailable',
+      channel: sent.channel,
+      queued: sent.queued && !withdrawn,
+      withdrawn,
+    });
+  }
+  /* WiFi 通道单独加一份回执预算（2026-10-28 实测依据见 commandAckWifiExtraMs）。
+   * 必须在 sendCommandEx() 之后调 —— 只有那时才知道命令真的走了哪条路。
+   * 串口那条不改：printf 一行 <100ms，拉长只会让失败反馈变迟钝。 */
+  let effectiveTimeout = timeoutMs;
+  if (sent.channel === 'wifi') {
+    const extra = commandAckWifiExtraMs();
+    if (extra > 0) { waiter.extend(extra); effectiveTimeout = timeoutMs + extra; }
+  }
+  const acked = await waiter.promise;
+  const outcome = acked.outcome;
+  stats.lastAckOutcome = outcome;
+  stats.lastAckAt = Date.now();
+  stats.lastCommandChannel = sent.channel || null;
+  stats.lastAckChannel = acked.ack_channel || null;
+  const res = done(Object.assign({
+    dispatched: true,
+    channel: sent.channel,
+    queued: sent.queued,
+    timeout_ms: effectiveTimeout,
+    accepted: outcome === 'accepted',
+  }, acked));
+  // 超时/通道类结局给出可执行的排查方向（不只是"没回执"三个字）
+  if (outcome === 'timeout') res.message = ackTimeoutNote(sent.channel);
+  return res;
 }
 
 /* 幂等闸门：返回仍在进行中的采集请求（submitted/dispatched/acked），没有则 null。
@@ -431,11 +737,13 @@ function createCollectRequest() {
   trimRequests();
   pushRequest(r);
 
-  const sent = sendCommand({ cmd: 'collect_once', request_id: r.request_id }, r.device_id);
-  if (sent) {
+  // 用 sendCommandEx 取真实写路径：原写法 sent 为真时用 serialOpen() 反推
+  // channel，若 port.write() 抛异常落到入队分支，channel 会错报 'serial'。
+  const sent = sendCommandEx({ cmd: 'collect_once', request_id: r.request_id }, r.device_id);
+  if (sent.ok) {
     r.status = 'dispatched';
     r.dispatched_at = Date.now();
-    r.channel = serialOpen() ? 'serial' : 'wifi';
+    r.channel = sent.channel;
   } else if (config.mockDevice) {
     // 模拟板端：明确标注 simulated，绝不冒充实物命令
     r.simulated = true;
@@ -662,10 +970,12 @@ function createHelpAck() {
     return { ok: false, note: '当前没有待回应的求助。' };
   }
   const rid = help.help_id || `help-${Date.now()}`;
-  const ok = sendCommand({ cmd: 'viewer_ack', request_id: rid }, help.device_id);
+  // 用 sendCommandEx 取真实写路径，别用 serialOpen() 反推（见其上方说明）
+  const ackSent = sendCommandEx({ cmd: 'viewer_ack', request_id: rid }, help.device_id);
+  const ok = ackSent.ok;
   help.ack_sent_at = Date.now();
   help.ack_channel_ok = ok;
-  help.ack_channel = ok ? ((port && port.isOpen) ? 'serial' : 'wifi') : null;
+  help.ack_channel = ok ? ackSent.channel : null;
   if (ok) {
     help.status = 'acknowledged';
     help.ack_delivered = null;   // 等板端回执
@@ -791,9 +1101,14 @@ function resetHelp() {
 /*                                                                     */
 /* 7) POST /api/voice/record —— 远程触发一次录音（等价按板端 BOOT 键）    */
 /*    body：{ action?:"start"|"stop"|"toggle" }（缺省 toggle）           */
-/*    200 → { ok, accepted, action, request_id, channel, note }          */
+/*    200 → { ok, accepted, dispatched, outcome, action, request_id,     */
+/*           channel, ack_status, ack_seq, waited_ms, timeout_ms, note } */
 /*    说明：板端是纯 HTTP 客户端，命令走串口直写或 WiFi 轮询队列；       */
-/*          通道不可用时 ok=false + note 说明原因，绝不谎报已下发。       */
+/*          第 5 周收尾起本接口【等板端 ack】再回答：                     */
+/*            dispatched=true 只代表写进了通道，accepted=true 才代表      */
+/*            板端真的接受了（ok 与 accepted 同义，保留 ok 兼容旧调用方）。*/
+/*          板端回 busy/error、超时未回执、通道不可用、模拟模式 → ok=false */
+/*          并在 note 里给中文原因，绝不谎报。                            */
 /*                                                                     */
 /* WS：阶段推进广播 { type:"voice", voice:<同上快照> }；                  */
 /*     新连接 hello 消息里带 voice 快照，刷新页面不丢链路。               */
@@ -2160,6 +2475,15 @@ function handleLine(line, source) {
           stats.linesValid++;
           pushRaw(trimmed, true);
           onDeviceAck(obj.request_id, obj.status, obj.seq);
+          /* 第 5 周收尾：唤醒正在等这条回执的下发方。
+           * 必须在 onDeviceAck 之后 —— 采集请求表的状态更新与命令通道的
+           * 等待槽是两套语义，互不干扰（同一 rid 可能两处都不存在）。
+           * 第 4 个参数带上行通道：固件自 2026-10-28 起 ack 走串口 + WiFi
+           * 双通道，取证时需要知道这一条是从哪条路回来的。
+           * 注意不能引用下面的 const transport —— 它在 ack 分支之后才声明，
+           * 在这里读会踩 TDZ（ReferenceError）。故就地取值。 */
+          settlePendingAck(obj.request_id, obj.status, obj.seq,
+            (source && source.transport) || state.transport || 'serial');
           return;
         }
         // 教学求助事件（第 3 周）：板端按键/取消，单独处理，不当作传感数据
@@ -2635,6 +2959,19 @@ async function handleRequest(req, res) {
       stalePolicy: config.stalePolicy,
       storageEnabled: config.storageEnabled,
       raw: rawLog.slice(-60),
+      /* 命令回执取证（第 5 周收尾）：raw 里能看到板端 ack 原文，
+       * 这里给出最近一次下发的结局与当前等待数，便于核对
+       * 「命令写出去了」与「板端真的接受了」不是一回事。
+       * 2026-10-28 补：固件改为 ack 双通道（串口 + WiFi）后，
+       * lastCommandChannel / lastAckChannel 才能分别取证下行与上行路径。 */
+      commandAck: {
+        timeoutMs: commandAckTimeoutMs(),
+        pendingAcks: PENDING_ACKS.size,
+        lastOutcome: stats.lastAckOutcome || null,
+        lastAckAt: stats.lastAckAt || null,
+        lastCommandChannel: stats.lastCommandChannel || null,
+        lastAckChannel: stats.lastAckChannel || null,
+      },
       meta: { units: config.fieldUnits, labels: config.fieldLabels, historyMax: config.historyMax },
     });
   }
@@ -2754,6 +3091,19 @@ async function handleRequest(req, res) {
         queued: cmdQueue.length,
         sentViaSerial: stats.cmdViaSerial || 0,
         sentViaWifi: stats.cmdViaWifi || 0,
+      },
+      /* 命令回执（第 5 周收尾）：便于取证「下发」与「板端接受」的区别。
+       * pendingAcks = 当前还在等回执的命令数；lastAckOutcome = 最近一次的结局。
+       * lastChannel = 最近一条命令实际走的下行通道；lastAckChannel = 它的回执
+       * 实际从哪条上行回来（2026-10-28 固件改为 ack 双通道后才可能非空）。
+       * 两者都是"实际发生"的记录，不是用 serialOpen() 反推的推断值。 */
+      commandAck: {
+        timeoutMs: commandAckTimeoutMs(),
+        pendingAcks: PENDING_ACKS.size,
+        lastOutcome: stats.lastAckOutcome || null,
+        lastAckAt: stats.lastAckAt || null,
+        lastCommandChannel: stats.lastCommandChannel || null,
+        lastAckChannel: stats.lastAckChannel || null,
       },
       hints,
     });
@@ -3056,24 +3406,44 @@ async function handleRequest(req, res) {
   // ---- 语音链路：⑦ 远程触发一次录音（等价于按板端 BOOT 键）----
   //   板端是纯 HTTP 客户端，服务端无法主动连它；命令走串口直写或 WiFi 轮询队列。
   //   用途：① 自动化取证脚本触发录音；② BOOT 键 GPIO 异常时的兜底入口。
-  //   200 → { ok, accepted, action:"start"|"stop", channel, note }
-  //   说明：accepted=false 时 ok 也可能为 false —— 绝不谎报"已下发"。
+  //   第 5 周收尾：本接口改为【等板端 ack】后再回答 —— 此前只把"写进串口"当成功，
+  //   板端忙时 voice_record_toggle() 直接 return false、固件回 ack("busy")，
+  //   命令其实被丢弃，服务端却报 accepted=true（已实测复现）。
+  //   返回体字段：
+  //     ok            —— 兼容旧前端/旧脚本：等价于 accepted（板端真的接受了）
+  //     accepted      —— 板端 ack 且 status 非 busy/error
+  //     dispatched    —— 命令确实写进了通道（串口写出 / WiFi 队列且板端在轮询）
+  //     outcome       —— accepted | busy | error | timeout | channel_unavailable | mock | no_request_id
+  //     ack_status / ack_seq / waited_ms / timeout_ms / channel / request_id / note
   if (p === '/api/voice/record' && req.method === 'POST') {
     const body = await readJsonBody(req);
     const action = body.action === 'stop' ? 'stop' : (body.action === 'start' ? 'start' : 'toggle');
-    const rid = `voice-rec-${Date.now()}`;
-    const ok = sendCommand({ cmd: 'voice_record', request_id: rid }, state.deviceId || null);
-    const channel = ok ? ((port && port.isOpen) ? 'serial' : 'wifi') : null;
-    console.log(`[voice] 远程录音命令已下发（${action}）→ channel=${channel || 'none'}`);
+    /* request_id 必须强唯一（审查 blocker F1）。
+     * 原写法 `voice-rec-${Date.now()}` 在同一毫秒内的多个请求会拿到同一个 id，
+     * 叠加等待槽「后登记覆盖先登记」的旧实现 → 先登记的那个请求永久挂死。
+     * 现在用「时间戳 + 单调递增序号」，同毫秒内也不会重复。 */
+    const rid = `voice-rec-${Date.now()}-${++ackRequestSeq}`;
+    const r = await sendCommandAndWaitAck({ cmd: 'voice_record', request_id: rid }, state.deviceId || null);
+    console.log(`[voice] 远程录音命令（${action}）→ outcome=${r.outcome}`
+      + ` dispatched=${r.dispatched} accepted=${r.accepted}`
+      + ` channel=${r.channel || 'none'} ack=${r.ack_status || '-'} waited=${r.waited_ms ?? '-'}ms`);
     return json(res, 200, {
-      ok,
-      accepted: ok,
+      ok: r.accepted,                 // 向后兼容：ok 不再等于"写出成功"，而是"板端已接受"
+      accepted: r.accepted,
+      dispatched: r.dispatched,       // 与 accepted 分开：写出成功但板端未确认时 dispatched=true
+      outcome: r.outcome,
       action,
       request_id: rid,
-      channel,
-      note: ok ? null : (config.mockDevice
-        ? '模拟模式：未走真实串口'
-        : '命令通道不可用（串口未打开，且板端未通过 WiFi 轮询取命令）'),
+      channel: r.channel,             // 命令实际走的下行通道（serial / wifi / null）
+      queued: r.queued,               // 是否进了 WiFi 待取队列（channel=wifi 且 queued=true）
+      withdrawn: r.withdrawn,         // 通道不可用时命令是否已撤回（true=板端不会再执行它）
+      ack_status: r.ack_status,
+      ack_seq: r.ack_seq,
+      ack_channel: r.ack_channel,     // 回执实际从哪条上行回来（serial / wifi / null）
+      waited_ms: r.waited_ms,
+      timeout_ms: r.timeout_ms,
+      simulated: r.simulated,
+      note: r.accepted ? null : r.message,
     });
   }
 
@@ -3379,7 +3749,7 @@ async function handleRequest(req, res) {
   if (p === '/api/config') {
     if (req.method === 'GET') return json(res, 200, config);
     const body = await readJsonBody(req);
-    for (const k of ['baudRate', 'portPath', 'autoDetect', 'autoReconnect', 'staleAfterMs', 'wifiTimeoutMs', 'expectedDeviceId', 'storageEnabled', 'stalePolicy', 'collectTimeoutMs', 'mockDevice']) {
+    for (const k of ['baudRate', 'portPath', 'autoDetect', 'autoReconnect', 'staleAfterMs', 'wifiTimeoutMs', 'expectedDeviceId', 'storageEnabled', 'stalePolicy', 'collectTimeoutMs', 'commandAckTimeoutMs', 'commandAckWifiExtraMs', 'mockDevice']) {
       if (body[k] !== undefined) config[k] = body[k];
     }
     saveConfig();

@@ -34,6 +34,8 @@ const TEST = (...p) => path.join(__dirname, ...p);
 // 端口占用现状：8090 voice / 8091 handleline-guard / 8092 help-persist / 8093 feature
 //              8094 parse / 8095 verify+nl-config / 8096 acceptance / 8097 help+p0
 //              8098 ws+nl / 8099 storage+e2e
+//              command-ack 不固定端口：每次在 8090-8099 里挑一个当前空闲的，
+//              避免与上表任一测试撞车（它会自建实例并自行探测空闲端口）
 const SUITES = [
   { name: 'theme',        file: 'theme-contract-test.js', kind: 'unit' },
   { name: 'isolation',    file: 'isolation-contract-test.js', kind: 'unit' },
@@ -53,6 +55,7 @@ const SUITES = [
   { name: 'nl-config',    file: 'nl-config-test.js',   kind: 'integration' },
   { name: 'voice',        file: 'voice-test.js',       kind: 'integration' },
   { name: 'voice-layout', file: 'voice-layout-contract-test.js', kind: 'unit' },
+  { name: 'command-ack',  file: 'command-ack-test.js', kind: 'integration' },
   { name: 'e2e',          file: 'e2e-test.js',         kind: 'e2e', needsServer: false },
 ];
 

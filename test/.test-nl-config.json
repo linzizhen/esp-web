@@ -13,6 +13,8 @@
   "historyMax": 600,
   "mockDevice": true,
   "collectTimeoutMs": 2500,
+  "commandAckTimeoutMs": 1800,
+  "commandAckWifiExtraMs": 1200,
   "storageEnabled": true,
   "storageMaxMb": 32,
   "stalePolicy": "keep",
