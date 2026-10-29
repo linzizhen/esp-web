@@ -187,7 +187,9 @@ node test/voice-layout-contract-test.js   # 25 项：数据布局静态契约
 建议后续在 `sendCommand()` 后等待 ack 再定论，把 `accepted` 改成「板端确认」而非「写出口成功」。
 **本周不修**，已在 `test/voice-hil.js` 第 ⑥ 段登记为已知缺口，不判失败——登记不等于认可。
 
-> **状态更新（2026-10-26）**：该缺口**已修复**，详见下文「修复二：命令下发 ≠ 板端已接受」。
+> **状态更新（2026-10-26）**：该缺口**服务端侧已修复**，详见下文「修复二：命令下发 ≠ 板端已接受」。
+> ⚠ 但修复只在串口模式生效：固件侧回执双通道代码已就绪、**尚未烧录**，烧录前纯 WiFi 部署仍判 timeout
+> （见「修复二之边界」）。
 
 ---
 
@@ -316,6 +318,44 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 > （与固件同一路径），**未在真机上制造 busy 场景**。真机 busy 取证仍待补（预期
 > `outcome=busy`、`ok=false`、`dispatched=true`）。
 
+### 修复二之边界：固件侧回执双通道「代码就绪、未烧录」
+
+服务端等 ack 只解决了一半问题 —— 它依赖**板端回执真的到达服务端**。而板端 `cmd_ack()`
+原本只有一条上行路：`printf` 到 USB-Serial/JTAG console。
+
+纯 WiFi 部署（板子插充电头、不连电脑）下没人在读串口，回执被驱动直接丢弃：
+
+```
+服务端下发命令 → 板端经 GET /api/cmd 取到并真的执行 → 回执进黑洞
+             → 服务端等满超时 → outcome=timeout
+```
+
+即：**t1 把「谎报成功」翻成了「谎报失败」**。同一文件的摄像头帧早就是双通道
+（`cam_send_frame_locked` 的 `printf` + `http_post`），回执只有一路属于既有缺口。
+
+**固件侧改动（已落盘、已提交 `f76e0cd`，但未烧录）**：
+
+| 项 | 内容 |
+|---|---|
+| `cmd_ack()` | 仍先 `printf`（串口通道任何情况下保留），再 `wifi_wait(0)` 判在线，然后非阻塞 `xQueueSend` |
+| `ack_task` | 独立任务（栈 8192、优先级 4）：`xQueueReceive` → `http_post("/api/data", line)` |
+| `s_ack_q` | 静态队列，深度 8、行 192 B；建在 `cmd_task` 之前，上电最初几秒的回执也能走 WiFi |
+| `s_ack_fail` | 只统计「WiFi 在线但发不出去」（队列满 / http_post 失败），不统计 `wifi_wait(0)` 为假 |
+| 编译验证 | `s3eye_imu.bin` = 0x10b2b0 字节，分区余量 29%，零警告 |
+
+为什么用独立队列 + 独立任务而不是在 `cmd_ack()` 里同步 `http_post`：`cmd_task` 优先级 5（全板最高），
+`http_post` 的客户端超时是 3000 ms，同步调等于「服务端不可达时每条命令把最高优先级任务钉住 3 秒」；
+栈上也可沿用 `btn_task` 的既有结论给 8192（`main.c` 里记录过 3072 跑同路径被打穿、整板复位），
+**`cmd_task` 保持 4096 不动**。
+
+> ⚠ **在烧录这个固件之前，纯 WiFi 部署仍会判 timeout。** 当前 8080 生产实例是
+> `transport=serial`，所以看不到这个问题 —— 不能据此认为已经全好。
+>
+> 真机补测（**尚未进行，不计入已验证**）：板子在场且获用户批准后，断开 USB、确认纯 WiFi 上报状态，
+> `POST /api/voice/record`，预期 `outcome=accepted` + `ack_status` 非空 + `waited_ms < 1800`，
+> 并观察串口日志出现「回执 WiFi 上行已恢复（此前失败/丢弃 N 条）」。
+> 在此之前本条在文档里保持「**代码就绪、未经真机验证**」标注。
+
 ---
 
 ## 六、文件改动清单
@@ -324,7 +364,7 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 |------|------|
 | `firmware/s3eye_imu_idf/main/voice_record.c` | 新增，录音 + 去交错 + 上传 + LED + BOOT 键 |
 | `firmware/s3eye_imu_idf/main/voice_record.h` | 新增，对外接口 |
-| `firmware/s3eye_imu_idf/main/main.c` | 接入 `voice_record` / `voice_status` 远程命令，启动 `voice_record_init()` |
+| `firmware/s3eye_imu_idf/main/main.c` | 接入 `voice_record` / `voice_status` 远程命令，启动 `voice_record_init()`；收尾新增 `cmd_ack()` 双通道（`printf` + `ack_task` 走 `http_post`）——**已提交 `f76e0cd` 但未烧录** |
 | `server.js` | `/api/voice*` 七个接口 + 阶段状态机 + WAV 校验 + 事件落盘；收尾新增 `sendCommandAndWaitAck()` 等板端 ack |
 | `public/app.js` | 语音页：录音回放、Web Speech 识别、`speechSynthesis` 播报 |
 | `public/index.html` | 语音页 DOM（样式全部复用既有类，未新增 CSS） |
@@ -347,6 +387,7 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 | ✅ 数据布局（`voice-layout-contract-test.js`） | ❌ 麦克风接线是否正确 |
 | ✅ 命令 ack 通道（`command-ack-test.js`，注入真实上行 ack） | ❌ 真机 `busy` 场景（固件 `s_uploading` 期间请求录音） |
 | ✅ 页面交互（浏览器打开就能点） | ❌ BOOT 键是否好使 |
+| ✅ 服务端等 ack 的六种结局（隔离实例注入） | ❌ 纯 WiFi 下的回执上行（固件双通道已改代码但**未烧录**，烧录前纯 WiFi 仍判 timeout） |
 
 真机项必须补验，**不能拿"模拟通过"当实物通过**。
 

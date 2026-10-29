@@ -20,7 +20,7 @@
 | 5 | P2 e2e 默认连生产实例 | **已修复** | `e2e-test.js` 默认自建隔离实例（8090-8099 内自选空闲端口 + 独立 `DATA_DIR`），直接跑 `node test/e2e-test.js` 不再连 8080；只有显式 `E2E_PORT=8080` 或 `--production` 才连生产。编排器另注入 `E2E_PORT=8099` 让端口可预期 |
 | 6 | P2 前端每帧全量重绘 | **已优化** | 新增 `lowerBoundByTime()` 二分定位窗口起点、`RANGE_BUF` 复用缓冲、`_chartCache` 缓存（`app.js:525/531/574`） |
 | 7 | P2 LLM 未接入 | **已接入** | 已配置智谱 `glm-4.5-flash`；新增模型润色与 Base URL 归一化 |
-| 8 | P2 命令下发 ≠ 板端已接受（第 5 周发现） | **已修复** | `sendCommand()` 只把字节写进串口就算成功，`/api/voice/record` 直接把 `ok` 当 `accepted` 返回；板端 `voice_record.c:571` 的 `if (s_uploading) return false;` 会让 `main.c:1377-1388` 回 `cmd_ack(rid,"busy")`，命令实际被丢弃而服务端仍报 `accepted=true`。现改为按 `request_id` 等板端 ack 再定论（`sendCommandAndWaitAck()`，默认超时 1800 ms），区分 `accepted`/`busy`/`error`/`timeout`/`channel_unavailable`/`mock`；`command-ack-test.js` 95 项断言覆盖 |
+| 8 | P2 命令下发 ≠ 板端已接受（第 5 周发现） | **服务端侧已修复（串口模式生效），固件侧双通道待烧录验证** | `sendCommand()` 只把字节写进串口就算成功，`/api/voice/record` 直接把 `ok` 当 `accepted` 返回；板端 `voice_record.c:571` 的 `if (s_uploading) return false;` 会让 `main.c:1377-1388` 回 `cmd_ack(rid,"busy")`，命令实际被丢弃而服务端仍报 `accepted=true`。现改为按 `request_id` 等板端 ack 再定论（`sendCommandAndWaitAck()`，默认超时 1800 ms），区分 `accepted`/`busy`/`error`/`timeout`/`channel_unavailable`/`mock`；`command-ack-test.js` 95 项断言覆盖。⚠ **但回执上行原本只有串口一条路**：固件侧双通道（`printf` + `ack_task` 走 `http_post`）代码已提交 `f76e0cd`、编译零警告，**尚未烧录**；烧录前纯 WiFi 部署每条命令仍判 `timeout` |
 
 > 报告原文提到的「145 项测试全过」是当时（2026-10-08）的实际数字。当前为
 > **20 个测试文件、498 项断言**（入口 `npm test`）。
@@ -168,13 +168,15 @@
 - **说明**：诚实性设计已如实标注引擎；拿到授权 endpoint+key 填入即启用，**代码零改动**。
 - **优先级**：低（规则兜底已覆盖全部当堂验证）。
 
-### 8. 命令下发 ≠ 板端已接受（第 5 周收尾发现，已修复）
+### 8. 命令下发 ≠ 板端已接受（第 5 周收尾发现，服务端侧已修复，固件侧待烧录验证）
 
 - **表现**：`POST /api/voice/record` 返回 `ok=true accepted=true`，但命令其实被板端丢弃。
 - **位置**：`server.js` 的 `sendCommand(obj, device)`；`/api/voice/record` 处理器。
 - **根因**：`port.write(..., cb)` 的回调只记录写错误，**不等板端回执**。串口 `write` 成功只证明字节进了驱动缓冲。板端固件 `voice_record.c:571` 的 `voice_record_toggle()` 首段是 `if (s_uploading) { ESP_LOGW(...); return false; }`，`main.c:1377-1388` 据此回 `cmd_ack(rid, "busy")` —— 板端明确拒绝，服务端仍报成功。
-- **修复**：新增 `sendCommandAndWaitAck()`，下发前按 `request_id` 登记等待槽，板端上行 ack 到达时结算，超时判 `timeout`（默认 1800 ms，可配）。结局区分 `accepted` / `busy` / `error` / `timeout` / `channel_unavailable` / `mock`。`/api/voice/record` 的 `ok` 字段语义改为「板端已接受」，`dispatched` 单独表达「命令写出去了」。
+- **修复（服务端侧，串口模式生效）**：新增 `sendCommandAndWaitAck()`，下发前按 `request_id` 登记等待槽，板端上行 ack 到达时结算，超时判 `timeout`（默认 1800 ms，可配）。结局区分 `accepted` / `busy` / `error` / `timeout` / `channel_unavailable` / `mock`。`/api/voice/record` 的 `ok` 字段语义改为「板端已接受」，`dispatched` 单独表达「命令写出去了」。
+- **修复（固件侧，代码就绪、未烧录）**：`cmd_ack()` 原来只有 `printf` 一条上行路，纯 WiFi 部署（板子插充电头、不连电脑）时没人在读串口，回执被驱动丢弃 → 服务端必然判 `timeout`。现改为双通道：`printf` 保留 + `wifi_wait(0)` 判在线后非阻塞入队 `s_ack_q`，由独立 `ack_task`（栈 8192、优先级 4）调 `http_post("/api/data", line)`。已提交 `f76e0cd`，编译零警告（`s3eye_imu.bin` 0x10b2b0 字节 / 29% 余量），**但尚未烧录**。
 - **防回归**：`test/command-ack-test.js` 95 项断言，覆盖六种结局与 `request_id` 匹配。
+- ⚠ **边界**：**烧录前，纯 WiFi 部署仍会判 timeout**。当前 8080 生产实例是 `transport=serial`，所以看不到这个问题，不能据此认为已经全好。真机补测（断开 USB、纯 WiFi 上报状态下 `POST /api/voice/record`，预期 `outcome=accepted` + `ack_status` 非空 + `waited_ms < 1800`，并观察串口日志出现「回执 WiFi 上行已恢复（此前失败/丢弃 N 条）」）**尚未进行，不计入已验证**。
 
 ---
 
@@ -226,11 +228,12 @@
 | ~~P2~~ | #5 e2e 默认连生产实例 | 测试易用性 | ✅ **已修复**：`e2e-test.js` 默认自建隔离实例（8090-8099 内选空闲端口 + 独立 DATA_DIR），连生产须显式 `E2E_PORT=8080` / `--production` |
 | ~~P2~~ | #6 前端每帧重绘 | 性能优化 | ✅ **已优化**：二分定位 + 缓冲复用 + 缓存 |
 | ~~P2~~ | #7 LLM 未接入 | 待凭据 | ✅ **已接入**：智谱 `glm-4.5-flash` + 数字核对护栏 |
-| ~~P2~~ | #8 命令下发 ≠ 板端已接受 | 正确性/诚实性 | ✅ **已修复**：按 `request_id` 等板端 ack（默认 1800 ms），区分 accepted/busy/error/timeout/channel_unavailable/mock；`ok` 语义改为「板端已接受」 |
+| ~~P2~~ | #8 命令下发 ≠ 板端已接受 | 正确性/诚实性 | ⚠️ **服务端侧已修复（串口模式生效），固件侧双通道待烧录验证**：按 `request_id` 等板端 ack（默认 1800 ms），区分 accepted/busy/error/timeout/channel_unavailable/mock；`ok` 语义改为「板端已接受」。固件侧回执双通道（`printf` + `ack_task` 走 `http_post`）代码已提交 `f76e0cd` 但**未烧录**，烧录前纯 WiFi 部署每条命令仍判 `timeout` |
 
 **核心结论（2026-10-29 更新）**：报告原始 7 项问题中 **6 项闭环**（P0 正确性 bug 与
-摄像头、help、e2e、前端重绘、LLM 均已完成），第 5 周收尾新增的 #8「命令下发 ≠ 板端已接受」
-已修复。**#3 只修掉了一半**：退避失效已修，同步上传 + 每帧建连的根因仍在，
+摄像头、help、e2e、前端重绘、LLM 均已完成）。第 5 周收尾新增的 #8「命令下发 ≠ 板端已接受」
+**服务端侧已修复、串口模式生效**；固件侧回执双通道代码就绪但**未烧录**，纯 WiFi 部署在烧录前
+仍会判 timeout，真机验证未做、不计入已验证。**#3 只修掉了一半**：退避失效已修，同步上传 + 每帧建连的根因仍在，
 2026-10-29 的取证把它的触发条件（链路 RTT）与量级（1.38–9.26 fps 摆动）都定量标定了出来，
 修复方案 A/B 尚未实施（需烧录）。
 

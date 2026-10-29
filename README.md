@@ -545,6 +545,18 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 > 而不是像以前那样报成功。超时默认 1800 ms，可用 `config.commandAckTimeoutMs` 或环境变量
 > `COMMAND_ACK_TIMEOUT_MS` 覆盖；`GET /api/state` 的 `commandAck` 字段可查最近一次结局。
 
+> ⚠ **边界：这条修复目前只在串口模式生效。**
+> 服务端侧（等 ack 再定论）已修复并有 95 项断言守着，**但固件侧的回执上行还只有串口一条路**：
+> 板端 `cmd_ack()` 原实现只有 `printf`，纯 WiFi 部署（插充电头 / 板子不连电脑）时没人在读串口，
+> 回执被驱动丢弃 → 服务端等满超时 → 每条命令都判 `outcome=timeout`。
+> 固件侧「双通道回执」（`printf` + 经 `ack_task` 走 `http_post` 上行）的代码**已改好但尚未烧录**
+> （提交 `f76e0cd`，只做过编译验证：`s3eye_imu.bin` 0x10b2b0 字节、29% 余量、零警告）。
+> **在烧录这个固件之前，纯 WiFi 部署仍会判 timeout**——即从「谎报成功」翻成「谎报失败」。
+> 当前 8080 生产实例是 `transport=serial`，所以看不到这个问题，不能据此认为已经全好。
+> 真机验证（断开 USB、纯 WiFi 上报状态下 `POST /api/voice/record`，预期
+> `outcome=accepted` + `ack_status` 非空 + `waited_ms < 1800`，且串口日志出现
+> 「回执 WiFi 上行已恢复」）**尚未进行**，不计入已验证。
+
 > 完整说明（含真机暴露的 I2S 交错缺陷取证与修复、失败分支表、迁移判据）见
 > [`docs/week5-voice.md`](docs/week5-voice.md)。
 
