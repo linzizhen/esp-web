@@ -25,6 +25,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "esp_system.h"
 #include "esp_log.h"
@@ -1084,13 +1085,106 @@ static bool json_int(const char *json, const char *key, int *out)
     return true;
 }
 
+/* 回执发送失败计数：纯 WiFi 模式下 ack 全丢原本是静默的 —— 服务端只会
+ * 看到「超时」，板端日志里一个字都没有，两边都无从下手。必须能看见。 */
+static uint32_t s_ack_fail = 0;
+
+/* 回执 WiFi 上行队列（见 cmd_ack 处注释）。
+ * 为什么不在 cmd_ack 里直接调 http_post：
+ *   ① cmd_task 优先级 5（全板最高），http_post 的失败路径要等 esp_http_client
+ *      的 3 秒超时（esp-tls select 超时 → 传输层报错 → 清理）。把它塞进
+ *      cmd_task，等于"服务端不可达时每条命令都把最高优先级任务钉住 3 秒"，
+ *      期间的命令全部排队，语音/抓拍这类有时效的命令直接错过窗口。
+ *   ② 栈：btn_task 的注释（见 app_main 里 xTaskCreate(btn_task,…) 上方）已经
+ *      记录过，同一条 http_post 路径把 3072 字节打穿、整板软件复位。回执走
+ *      独立任务就能沿用那条结论给足 8192，而不必把 cmd_task 也从 4096 抬到
+ *      8192（cmd_task 本身只做 fgets + JSON 取值，4096 一直够用）。
+ * 队列项固定 192 字节、深度 8，静态分配，不额外占堆。 */
+#define ACK_LINE_MAX 192
+#define ACK_QUEUE_LEN 8
+static QueueHandle_t s_ack_q = NULL;
+
+/* 回执双通道上行（第 5 周收尾）。
+ *
+ * 缺陷（读代码 + 实测确认，非推测）：原实现只有 printf 一条路，写的是
+ * USB-Serial/JTAG console。纯 WiFi 模式（板子插在插座上、没连电脑，用户
+ * 2026-10-15 实测过的场景）下没有人在读串口，回执被驱动直接丢弃：
+ *   服务端下发命令 → 板端经 GET /api/cmd 取到并真的执行 → 回执进串口黑洞
+ *   → 服务端等满 1800ms 判 timeout，报"没回执"。
+ * 即：从"谎报成功"翻到了"谎报失败"，同样不准。
+ *
+ * 同一文件里摄像头帧早就是双通道（见 cam_send_frame_locked 的
+ * printf + http_post），回执却只有一路，属于既有缺口。
+ *
+ * 顺序：先 printf（串口通道任何情况下都保留），再尝试 WiFi。
+ * WiFi 发送失败绝不回滚已发出的串口那条 —— 两条路互相独立。
+ * 判据用 wifi_wait(0)，与摄像头帧完全一致（没拿到 IP 就不发）。
+ *
+ * 为什么走 /api/data 而不是新开一个端点：服务端 handleLine() 对
+ * {"type":"ack"} 已有早退分支（先 pushRaw 取证、再结算等待槽），
+ * 复用同一条「一行一条 JSON」的上行链路，服务端零改动即可接收。
+ *
+ * 重复风险：串口与 WiFi 同时在线时两条 ack 都会到达，但 /api/data 的
+ * 「串口优先」规则（server.js 里 state.transport==='serial' && connected
+ * 时忽略 WiFi 上报）会把 WiFi 那条挡掉，串口那条照常结算 —— 不会双触发。 */
 static void cmd_ack(const char *request_id, const char *status)
 {
-    char buf[192];
+    char buf[ACK_LINE_MAX];
     snprintf(buf, sizeof(buf),
              "{\"type\":\"ack\",\"device\":\"%s\",\"request_id\":\"%s\",\"seq\":%lu,\"status\":\"%s\"}",
              APP_DEVICE_ID, request_id, (unsigned long)s_seq, status);
-    printf("%s\n", buf);
+    printf("%s\n", buf);                  /* 通道 1：USB 串口（始终输出） */
+
+    /* 通道 2：交给 ack_task 异步发。这里只做一次非阻塞入队（0 tick 超时），
+     * 绝不等待 —— 队列满就丢本条 WiFi 回执，串口那条已经发出去了，
+     * 服务端仍能在串口模式下结算；纯 WiFi 模式下丢的这条由 s_ack_fail 记账。
+     *
+     * 关于 s_ack_fail 的计数口径（2026-10-28 明确，避免将来统计对不上）：
+     *   只统计【WiFi 在线但回执发不出去】的两种情形 —— ① 队列满；
+     *   ② ack_task 里 http_post 失败。
+     *   不统计「WiFi 未连（wifi_wait(0) 为假）」：串口模式下本来就没连 WiFi，
+     *   那是常态而不是故障，计进去会让计数在正常使用中一路涨到没意义。
+     *   代价是：纯 WiFi 模式下若恰好在 printf 与入队之间断网，这条 ack 静默
+     *   只走串口、不计数 —— 可接受（网络确实断了，而且服务端会看到 timeout，
+     *   排查时看板端日志的断连记录即可）。 */
+    if (!wifi_wait(0)) return;            /* WiFi 未连上：不必入队（与帧同一判据，不计失败） */
+    if (!s_ack_q) return;                 /* 任务还没起来（app_main 启动顺序），串口已发 */
+    if (xQueueSend(s_ack_q, buf, 0) == pdTRUE) return;
+    s_ack_fail++;
+    if (s_ack_fail == 1 || s_ack_fail % 20 == 0) {
+        ESP_LOGW(TAG, "★ 回执 WiFi 队列已满，丢弃本条（累计丢 %lu 条，request_id=%s）——"
+                      "服务端可能只看到超时", (unsigned long)s_ack_fail, request_id);
+    }
+}
+
+/* 回执 WiFi 发送任务：从队列取行 → http_post。
+ * 独立于 cmd_task 的两个理由（栈 + 阻塞）见 s_ack_q 定义处注释。
+ * 栈给 8192：与 btn_task 同一个 http_post 路径，那条注释记录过 3072 被打穿
+ * 导致整板复位；主任务 8192 跑同路径 49 万+ 帧未溢出，故对齐 8192。 */
+static void ack_task(void *arg)
+{
+    (void)arg;
+    char line[ACK_LINE_MAX];
+    while (1) {
+        if (xQueueReceive(s_ack_q, line, portMAX_DELAY) != pdTRUE) continue;
+        if (http_post("/api/data", line)) {
+            /* 恢复时打印一次累计失败数，然后把计数归零 —— 不归零的话
+             * 之后每条成功回执都会再打一遍"已恢复"，把日志刷爆。 */
+            if (s_ack_fail) {
+                ESP_LOGI(TAG, "回执 WiFi 上行已恢复（此前失败/丢弃 %lu 条）",
+                         (unsigned long)s_ack_fail);
+                s_ack_fail = 0;
+            }
+            continue;
+        }
+        s_ack_fail++;
+        /* 限频：断网时每条都报会把串口日志刷爆，反而盖住有用信息 */
+        if (s_ack_fail == 1 || s_ack_fail % 20 == 0) {
+            ESP_LOGW(TAG, "★ 回执 WiFi 上行失败 %lu 次 —— 服务端只会看到超时。"
+                          "检查 APP_SERVER_HOST=%s:%d 是否可达、电脑防火墙是否放行。",
+                     (unsigned long)s_ack_fail, APP_SERVER_HOST, APP_SERVER_PORT);
+        }
+    }
 }
 
 /* 立即采集一次：先回执证明收到，再做全新一次采集并回传 */
@@ -1554,6 +1648,13 @@ void app_main(void)
         }
     }
 
+    /* 回执 WiFi 上行：独立任务 + 独立队列。
+     * ★ 必须建在 cmd_task 之前，否则上电最初几秒的命令回执进不了 WiFi 队列
+     *   （cmd_ack 里判 s_ack_q 为空就直接跳过 WiFi，只走串口）。
+     * ★ 栈 8192 的依据见 ack_task 处注释（与 btn_task 同一条 http_post 路径）。 */
+    s_ack_q = xQueueCreate(ACK_QUEUE_LEN, ACK_LINE_MAX);
+    if (!s_ack_q) ESP_LOGW(TAG, "回执 WiFi 队列创建失败，回执只能走串口");
+    else xTaskCreate(ack_task, "ack", 8192, NULL, 4, NULL);
     /* 启动远程命令接收任务（下行通道，与上报共用同一 USB 串口） */
     xTaskCreate(cmd_task, "cmd", 4096, NULL, 5, NULL);
     /* 启动 WiFi 命令轮询任务（串口不在线时的下行兜底通道） */
