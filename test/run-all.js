@@ -19,9 +19,15 @@
  *   node test/run-all.js e2e      只跑 e2e（仍走隔离实例）
  *   node test/run-all.js --serial 只跑单元/集成，跳过 e2e（省时）
  *
- * 不在本编排器内的两个测试（需真实硬件，手动跑）：
- *   node test/voice-hil.js          真机端到端：录音 → 上传 → 电平复核
- *   node test/probe-voice-stop.js   真机探针：连续多轮 start/stop 稳定性
+ * 不在本编排器内的四个测试（需真实硬件，手动跑）：
+ *   node test/voice-hil.js             真机端到端：录音 → 上传 → 电平复核
+ *   node test/probe-voice-stop.js      真机探针：连续多轮 start/stop 稳定性
+ *   node test/fps-baseline-test.js     真机只读：帧率基线（中位上传间隔 + 多窗口）
+ *   node test/firmware-backoff-test.js 真机退避回归：要求服务端**停着**才能测
+ *
+ * 注：后两个从未登记进 SUITES。fps-baseline 默认打 8080 生产实例、
+ * firmware-backoff 要求服务端处于停止状态，两者都与「编排器整套隔离 +
+ * 服务器在跑」的前提冲突，故永久手动跑。
  */
 'use strict';
 const { spawn } = require('node:child_process');
@@ -31,11 +37,12 @@ const fs = require('node:fs');
 const ROOT = path.join(__dirname, '..');
 const TEST = (...p) => path.join(__dirname, ...p);
 
-// 端口占用现状：8090 voice / 8091 handleline-guard / 8092 help-persist / 8093 feature
-//              8094 parse / 8095 verify+nl-config / 8096 acceptance / 8097 help+p0
-//              8098 ws+nl / 8099 storage+e2e
-//              command-ack 不固定端口：每次在 8090-8099 里挑一个当前空闲的，
-//              避免与上表任一测试撞车（它会自建实例并自行探测空闲端口）
+// 端口占用现状（2026-10-29 核对）：8090 voice / 8091 handleline-guard /
+//              8092 help-persist / 8093 feature / 8094 parse / 8095 verify+nl-config /
+//              8096 acceptance / 8097 help+p0 / 8099 storage+e2e
+//              8098 已释放：ws 与 nl 改成在 8090-8099 内动态挑空闲端口
+//              （F8 修复，原先两者都写死 8098，并发跑必然互抢）
+//              command-ack 同样不固定端口：每次自建实例前探测一个当前空闲的
 const SUITES = [
   { name: 'theme',        file: 'theme-contract-test.js', kind: 'unit' },
   { name: 'isolation',    file: 'isolation-contract-test.js', kind: 'unit' },

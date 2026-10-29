@@ -161,10 +161,10 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── verify-test.js        # 本组身份校验：device ↔ expectedDeviceId（隔离端口 8095）
     ├── feature-test.js       # 诊断接口 / 录制导出 / CSV（隔离端口 8093）
     ├── parse-test.js         # 通用解析：JSON / 键值 / 中文键（隔离端口 8094）
-    ├── ws-test.js            # WebSocket sample/stale/cleared 推送结构（隔离端口 8098）
+    ├── ws-test.js            # WebSocket sample/stale/cleared 推送结构（端口动态挑，8090-8099 内空闲）
     ├── help-test.js          # 第 3 周：教学求助闭环（隔离端口 8097）
     ├── help-persist-test.js  # 第 3 周：求助事件落盘与启动回读（隔离端口 8092）
-    ├── nl-test.js            # 第 4 周：意图解析与诚实性回复（隔离端口 8098）
+    ├── nl-test.js            # 第 4 周：意图解析与诚实性回复（端口动态挑，8090-8099 内空闲）
     ├── nl-config-test.js     # 第 4 周：LLM 配置增删改查与降级（隔离端口 8095）
     ├── handleline-guard-test.js # 空帧守卫：只含元数据的帧不落盘（隔离端口 8091）
     ├── voice-test.js         # 第 5 周：语音链路接口契约 + 合成 WAV（隔离端口 8090）
@@ -640,8 +640,9 @@ node test/records-pollution-check.js before|after   # 真实 data/records.ndjson
 
 当前端口分配（改端口时注意别撞车）：`8090` voice ｜ `8091` handleline-guard ｜ `8092` help-persist
 ｜ `8093` feature ｜ `8094` parse ｜ `8095` verify+nl-config ｜ `8096` acceptance
-｜ `8097` help+p0 ｜ `8098` ws+nl ｜ `8099` storage+e2e ｜ `8080` 生产实例。
-`command-ack` 不固定占端口：它每次在 `8090-8099` 内探测一个当前空闲端口起实例，避免与上表任一项撞车。
+｜ `8097` help+p0 ｜ `8099` storage+e2e ｜ `8080` 生产实例。
+`8098` 已释放：`ws` 与 `nl` 不再写死端口，改在 `8090-8099` 内动态挑空闲端口（并发跑不会互抢）。
+`command-ack` 同样不固定占端口：每次在 `8090-8099` 内探测一个当前空闲端口起实例。
 
 ### 硬件在环取证（排查固件行为时用）
 

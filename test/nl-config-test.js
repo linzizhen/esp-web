@@ -1,5 +1,5 @@
 'use strict';
-/* LLM 自定义配置管理专项测试（隔离实例 8098 + 独立 NL_CONFIG_PATH，不碰真实密钥文件）
+/* LLM 自定义配置管理专项测试（隔离实例 8095 + 独立 NL_CONFIG_PATH，不碰真实密钥文件）
  * 覆盖：查看（脱敏）/保存（校验+落盘）/测试连接（成功+失败分类）/删除/推理接入/密钥不泄漏 */
 const http = require('node:http');
 const { spawn } = require('node:child_process');
