@@ -149,6 +149,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── theme-contract-test.js # 前端主题变量契约：app.js 读取的 CSS 变量三套主题都要有（静态，0.1s）
     ├── isolation-contract-test.js # 测试隔离契约：每个自建 server 的测试都必须隔离 DATA_DIR（静态）
     ├── help-history-ui-test.js # 求助历史展示契约：事件名映射完整、元素 id 一致（静态）
+    ├── cam-ack-contract-test.js # 摄像头回执契约：/api/cam 等板端 ack、no_camera 如实上报、前端 errno 翻译与重试按钮（静态）
     ├── serial-forensics.js   # 硬件在环：被动串口取证（复位/崩溃特征，只读）
     ├── backoff-hil.js        # 硬件在环：退避行为回归（需先停服务端）
     ├── firmware-backoff-test.js # 硬件在环：帧率与重启检查（需服务端在跑）
@@ -595,7 +596,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **22 个测试文件、572 项断言**，一条命令：
+全套 **23 个测试文件、600 项断言**，一条命令：
 
 ```bash
 npm test
@@ -619,7 +620,7 @@ node test/run-all.js e2e   # 只跑端到端
 node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在发什么（调试用，不算断言）
 ```
 
-> 分组脚本只跑一部分；要跑全部 22 个文件请用 `npm test`（= `node test/run-all.js`）。
+> 分组脚本只跑一部分；要跑全部 23 个文件请用 `npm test`（= `node test/run-all.js`）。
 
 需真实开发板在线、**不在**编排器内，手动跑：
 

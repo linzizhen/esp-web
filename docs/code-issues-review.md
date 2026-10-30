@@ -23,7 +23,7 @@
 | 8 | P2 命令下发 ≠ 板端已接受（第 5 周发现） | **服务端侧已修复（串口模式生效），固件侧双通道待烧录验证** | `sendCommand()` 只把字节写进串口就算成功，`/api/voice/record` 直接把 `ok` 当 `accepted` 返回；板端 `voice_record.c:571` 的 `if (s_uploading) return false;` 会让 `main.c:1377-1388` 回 `cmd_ack(rid,"busy")`，命令实际被丢弃而服务端仍报 `accepted=true`。现改为按 `request_id` 等板端 ack 再定论（`sendCommandAndWaitAck()`，默认超时 1800 ms），区分 `accepted`/`busy`/`error`/`timeout`/`channel_unavailable`/`mock`；`command-ack-test.js` 95 项断言覆盖。⚠ **但回执上行原本只有串口一条路**：固件侧双通道（`printf` + `ack_task` 走 `http_post`）代码已提交 `f76e0cd`、编译零警告，**尚未烧录**；烧录前纯 WiFi 部署每条命令仍判 `timeout` |
 
 > 报告原文提到的「145 项测试全过」是当时（2026-10-08）的实际数字。当前为
-> **22 个测试文件、572 项断言**（入口 `npm test`）。
+> **23 个测试文件、600 项断言**（入口 `npm test`）。
 
 ---
 
@@ -237,7 +237,54 @@
 2026-10-29 的取证把它的触发条件（链路 RTT）与量级（1.38–9.26 fps 摆动）都定量标定了出来，
 修复方案 A/B 尚未实施（需烧录）。
 
-代码整体质量良好：固件编译零警告，**22 个测试文件、572 项断言全过**。
+代码整体质量良好：固件编译零警告，**23 个测试文件、600 项断言全过**。
+
+---
+
+## 状态更新（2026-10-30）：摄像头回执与单键求助
+
+用户实测反馈两件事：「摄像头打不开」、「任意按键都触发求助」。两件都已定位到根因并修好
+服务端/固件侧代码（**固件尚未烧录**，见每节末尾）。
+
+### A. 摄像头「能开」是谎报——#8 的同型缺陷落在 `/api/cam`
+
+- **现象**：网页点「开启实时画面」后一直显示「正在直播」，画面始终黑屏，等到超时也没有任何原因。
+- **取证**：`POST /api/cam {"action":"start"}` 返回 `ok:true, streaming:true`，而同一时刻板端回执是
+  `{"type":"ack","status":"no_camera","seq":1872}` —— 命令写进了串口就算成功，服务端没等 ack。
+- **根因（硬件连接层面）**：固件串口日志给出确凿证据
+  `I (631640) cam_stream: 摄像头初始化第 3/3 次失败: ESP_ERR_NOT_FOUND (0x106)`。
+  **0x106 = SCCB/I2C 上找不到 sensor（OV2640 没应答）** —— 属排线未插紧 / 模组未接 / 供电缺失，
+  不是 PSRAM 未开启、不是 SCCB 与 IMU 总线冲突、也不是引脚写错（引脚配置见
+  `firmware/s3eye_imu_idf/main/cam_stream.c:18-34`，与 2026-10-15 能正常出图时完全一致）。
+- **服务端修复**：`/api/cam` 改用 `sendCommandAndWaitAck`，自生成 `request_id`，只有
+  `dispatched && accepted && 回执不以 no_camera 开头` 才判成功；`state.camStreaming` 只反映板端确认；
+  新增 `noteCamAck()` 记录摄像头类回执，`GET /api/cam` 透出 `camError` / `boardAck`；
+  新增 `action:"retry"` → `cam_retry`。
+- **前端修复**：新增 `camErrorText()` 把 errno 翻成中文（0x102 PSRAM、0x106 排线/供电、0x108 超时等），
+  板端不可用时标签显示「板端无摄像头」、占位区给出原因与排查步骤、显示「重试初始化摄像头」按钮。
+- **实测对比（同一场景）**：改前 `ok:true, streaming:true`（谎报）→ 改后
+  `ok:false, streaming:false, ack_status:"no_camera", ack_channel:"serial", waited_ms:20, camError:"no_camera"`。
+- **固件侧**：`cam_ack_unavailable()` 把 ack 改成 `no_camera 0x<errno>`，上电初始化改为重试 3 次 × 300ms，
+  新增 `cam_retry` 命令与 `cam_status` 的 `err=0x…`。**代码已提交，尚未烧录** —— 烧录前 ack 里还没有 errno 后缀。
+
+### B. 任意键都触发教学求助
+
+- **现象**：六颗功能键按任意一颗，都会发起/取消求助。
+- **根因**：判据只有「低于阈值」一个条件 ——
+  `int th = idle - 500; if (th < 300) th = 300;` + `bool p = (v < th)`。
+  空闲读数 ≈4095 → 阈值 ≈3595，而四颗键的参考值 `2410 / 1980 / 820 / 380` **全部小于 3595**，
+  所以任意键都被判为「按下」。
+- **修复**：改为**最近邻归类**（`key_adc_index()`，容差 ±150，相邻参考值最小间距 440），
+  只有 `HELP_KEY_ADC`（默认 `380` = K3）触发求助，其余键只打印
+  `按键 K<n>(raw=…) 未绑定动作` 日志便于现场确认。换键只改 `main.c` 里 `HELP_KEY_ADC` 一行。
+- **固件状态**：同上，**代码已提交、尚未烧录**，所以当前板子上仍是旧行为。
+
+### 防回归
+
+新增 `test/cam-ack-contract-test.js`（28 项静态契约）：对提交前的旧代码跑得 1 通过 / 27 失败，
+对修后代码 28/28 绿。断言覆盖 `/api/cam` 不再裸用 `sendCommand`、自生成 `request_id`、
+识别 `no_camera`、透出 `camError`/`boardAck`、`retry` 分支、前端 errno 翻译与重试按钮、
+固件 `cam_ack_unavailable` / `HELP_KEY_ADC` / 「旧的 `bool p = (v < th)` 必须已消失」。
 
 原文「145 项测试」为 2026-10-08 的历史数字；本清单保留原判定与证据供追溯，
 以本节的「当前状态」为准。

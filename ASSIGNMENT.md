@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（22 个测试文件、572 项断言，全部通过）
+## 7. 自检脚本（23 个测试文件、600 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -350,6 +350,7 @@ node test/voice-layout-contract-test.js  # 25 项  第 5 周 WAV 数据布局静
 node test/voice-mic-preflight-test.js    # 24 项  第 5 周识别前麦克风自检（零设备不得说成"权限被拒"）
 node test/voice-asr-test.js   # 50 项  第 5 周转写接口：URL 归一化/失败分类/隐私默认关闭
 node test/command-ack-test.js # 95 项  命令 ack 通道：accepted/busy/timeout/error/channel_unavailable/mock
+node test/cam-ack-contract-test.js  # 28 项  摄像头回执契约：等板端 ack、no_camera 如实上报、前端 errno 翻译与重试
 ```
 
 以下需真实开发板在线，**不在**编排器内，手动跑：
