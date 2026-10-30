@@ -1153,6 +1153,12 @@ function ensureVoiceDir() {
   if (!fs.existsSync(VOICE_DIR)) fs.mkdirSync(VOICE_DIR, { recursive: true });
 }
 
+/* 板端自报的录音时长缓存：audio_id → duration_ms。
+ * 转写前要判断「是否超过智谱 30 秒上限」，而由 WAV 头算出的时长在「录音被截断」
+ * 或「板端自报值与文件不一致」时会偏差；applyVoiceEventToState 是所有事件
+ * （新事件与启动回读）的唯一入口，在这里记一份即可，重启后由历史自然重建。 */
+const VOICE_DUR = new Map();
+
 /** 给前端的状态快照：字段名即契约，历史事件原样带出 */
 function publicVoice() {
   const rel = (p2) => path.relative(ROOT, p2).split(path.sep).join('/');
@@ -1179,7 +1185,10 @@ function publicVoice() {
     audio_source: 'board_mic_i2s',
     audio_source_text: 'ESP32-S3-EYE 板载 MEMS 麦克风（I2S 录音，录音在板端）',
     asr_runs_on: 'browser_web_speech',
-    asr_runs_on_text: '电脑浏览器 Web Speech API（zh-CN，识别在浏览器）',
+    asr_runs_on_text: '电脑浏览器 Web Speech API（zh-CN，本机有麦克风时优先走这条）；本机没有麦克风时降级为服务端转写',
+    asr_fallback_runs_on: 'server_glm_asr',
+    asr_fallback_text: '服务端转写（智谱 GLM-ASR）：把 WAV 直接交给识别接口，不需要本机声卡',
+    asr: asrConfigView(),
     tts_runs_on: 'browser_speech_synthesis',
     tts_runs_on_text: '电脑浏览器 speechSynthesis（播放在浏览器；板端无扬声器）',
     limits: { max_bytes: VOICE_MAX_BYTES },
@@ -1237,6 +1246,8 @@ function applyVoiceEventToState(ev) {
     if (Object.prototype.hasOwnProperty.call(ev, k)) voice[k] = ev[k];
   }
   voice.updated_at = ev.updated_at || ev.at || Date.now();
+  // 记下板端自报时长，供转写前的「超 30 秒」判断使用
+  if (ev.stage === 'recorded' && aid && Number.isFinite(ev.duration_ms)) VOICE_DUR.set(aid, ev.duration_ms);
 }
 
 /** 推进阶段：写内存 → append 落盘 → WS 广播 → 返回最新快照 */
@@ -1787,6 +1798,214 @@ function nlChatCompletionsUrl(endpoint) {
   if (/\/openai$/i.test(base)) return base + '/chat/completions';      // ② Gemini 兼容层 .../v1beta/openai
   if (/\/v\d+[a-z0-9]*$/i.test(base)) return base + '/chat/completions'; // ② 已带 /v1、/v2、/v4、/v1beta…
   return base + '/v1/chat/completions';                                // ① 纯域名补默认版本段
+}
+
+/* ===== 服务端语音转写（智谱 GLM-ASR）=====
+ *
+ * 为什么需要它（2026-10-30 实测，不是拍脑袋）：
+ *   浏览器 Web Speech API **只能听麦克风**，没有任何接口能把一段 WAV 直接喂进去。
+ *   所以原设计只能「扬声器外放这段录音 → 麦克风再听回来」，本质是放给自己听。
+ *   在「电脑没麦克风、也没扬声器；板子只有麦克风」的机器上，这条路物理上走不通
+ *   （实测 12 个录音端点全 NOTPRESENT/UNPLUGGED）。
+ *   这里补一个「把 WAV 直接交给识别器」的服务端出口，识别不再依赖本机声卡。
+ *
+ * 有麦克风的机器仍优先走 Web Speech（课程 §12 原文要求），此接口作为降级路径。
+ *
+ * 配置优先级：环境变量 > config.local.json 的 asr* 字段 > 复用 NL 的 endpoint/apiKey
+ * （同属智谱 open.bigmodel.cn 时无需另配一份密钥）。密钥只落 gitignored 文件或 env，
+ * 前端任何时刻只拿得到 maskKey() 的脱敏值。
+ */
+const ASR_MAX_BYTES = 25 * 1024 * 1024;   // 智谱该接口限制 25 MB
+const ASR_MAX_MS = 30000;                 // 智谱该接口限制 30 秒
+const ASR_DEFAULT_MODEL = 'glm-asr-2512'; // 该接口文档里唯一枚举
+const ASR = { enabled: false, endpoint: null, apiKey: null, model: ASR_DEFAULT_MODEL, timeoutMs: 20000 };
+
+/* 默认**关闭**。这不是保守，是隐私边界：一旦启用，用户按下识别就会把录音发到厂商。
+ * 所以启用必须是一次显式动作（config.local.json 里 asrEnabled: true，或 ASR_ENABLED=1），
+ * 不靠「复用 NL 的 key」偷偷生效 —— 用户还没确认过账号与计费。 */
+function asrEnabledByConfig(v) {
+  if (v === true) return true;
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+function reloadAsrConfig() {
+  const f = readNlFileCfg();
+  ASR.enabled = asrEnabledByConfig(process.env.ASR_ENABLED != null ? process.env.ASR_ENABLED : f.asrEnabled);
+  ASR.endpoint = process.env.ASR_ENDPOINT || f.asrEndpoint || NL.endpoint || null;
+  ASR.apiKey = process.env.ASR_API_KEY || f.asrApiKey || NL.apiKey || null;
+  ASR.model = process.env.ASR_MODEL || f.asrModel || ASR_DEFAULT_MODEL;
+  const t = Number(process.env.ASR_TIMEOUT_MS || f.asrTimeoutMs || 20000);
+  ASR.timeoutMs = Number.isFinite(t) && t > 0 ? t : 20000;
+}
+reloadAsrConfig();
+
+/* 上限可从环境变量注入，供测试用小值验证「超限必须拒绝」这条分支
+ * （真去造一个 25 MB 的 WAV 只会让测试变慢，不会多验证任何逻辑）。 */
+function asrLimits() {
+  const mb = Number(process.env.ASR_MAX_BYTES);
+  const ms = Number(process.env.ASR_MAX_MS);
+  return {
+    maxBytes: Number.isFinite(mb) && mb > 0 ? mb : ASR_MAX_BYTES,
+    maxMs: Number.isFinite(ms) && ms > 0 ? ms : ASR_MAX_MS,
+  };
+}
+
+/* 拼接转写地址。与 nlChatCompletionsUrl 同一套版本段处理，避免 /v4/v1 这类重复：
+ *   ① 已是完整端点 .../audio/transcriptions → 原样
+ *   ② 已带版本段（/api/paas/v4、/v1、/v1beta）→ 只补 /audio/transcriptions
+ *   ③ 纯域名 → 补 /v1/audio/transcriptions */
+function asrTranscriptionsUrl(endpoint) {
+  const base = String(endpoint || '').trim().replace(/\/+$/, '');
+  if (/\/audio\/transcriptions$/i.test(base)) return base;
+  if (/\/openai$/i.test(base)) return base + '/audio/transcriptions';
+  if (/\/v\d+[a-z0-9]*$/i.test(base)) return base + '/audio/transcriptions';
+  return base + '/v1/audio/transcriptions';
+}
+
+/* 给前端看的转写配置（脱敏）。configured=false 时前端应改走文字入口，而不是硬试。 */
+function asrConfigView() {
+  const configured = !!(ASR.endpoint && ASR.apiKey);
+  let host = null;
+  try { host = ASR.endpoint ? new URL(ASR.endpoint).host : null; } catch (_) { /* 非法 URL */ }
+  return {
+    enabled: ASR.enabled,
+    configured,
+    endpoint: ASR.endpoint || null,
+    model: ASR.model,
+    timeoutMs: ASR.timeoutMs,
+    apiKey_masked: maskKey(ASR.apiKey),
+    asr_host: host,
+    max_bytes: asrLimits().maxBytes,
+    max_ms: asrLimits().maxMs,
+    source: (process.env.ASR_ENDPOINT || process.env.ASR_API_KEY) ? 'env' : (configured ? 'file' : 'none'),
+  };
+}
+
+/* 把一段已落盘的 WAV 送去转写。
+ * 返回 { http, body }：http 是给前端的 HTTP 状态码，body 是响应体（ok 字段区分成败）。
+ * 任何失败都必须如实分类，绝不把「没转出来」当成功 —— 这是本项目一以贯之的判据。 */
+async function voiceTranscribe(audioId) {
+  const file = voiceAudioFile(audioId);
+  if (!file || !fs.existsSync(file)) {
+    return { http: 404, body: { ok: false, error: 'audio_not_found', audio_id: audioId, message: `找不到录音 ${audioId}。` } };
+  }
+  const lim = asrLimits();
+  let size = 0;
+  try { size = fs.statSync(file).size; } catch (e) {
+    return { http: 500, body: { ok: false, error: 'read_failed', audio_id: audioId, message: '读取录音失败：' + e.message } };
+  }
+  // 先做输入侧校验（体积/时长/配置），任何一项不过都不上传——省掉无谓的外发
+  if (size > lim.maxBytes) {
+    return { http: 413, body: {
+      ok: false, error: 'asr_audio_too_large', audio_id: audioId, bytes: size, max_bytes: lim.maxBytes,
+      message: `录音 ${size} 字节超过转写上限 ${lim.maxBytes} 字节（${Math.round(lim.maxBytes / 1024 / 1024 * 10) / 10} MB），未上传。请缩短录音时长。`,
+    } };
+  }
+  // 时长优先用板端自报（更准），缺失时退回 WAV 头计算值
+  let durMs = VOICE_DUR.get(audioId);
+  if (!Number.isFinite(durMs)) {
+    const meta = readVoiceAudioMeta(audioId);
+    durMs = meta && Number.isFinite(meta.duration_ms) ? meta.duration_ms : null;
+  }
+  if (Number.isFinite(durMs) && durMs > lim.maxMs) {
+    return { http: 400, body: {
+      ok: false, error: 'asr_audio_too_long', audio_id: audioId, duration_ms: durMs, max_ms: lim.maxMs,
+      message: `录音 ${durMs} ms 超过转写上限 ${lim.maxMs} ms（${Math.round(lim.maxMs / 1000)} 秒），未上传。`,
+    } };
+  }
+  if (!ASR.enabled) {
+    // 关闭状态下绝不外发：连一次请求都不发，录音不出本机
+    return { http: 503, body: {
+      ok: false, error: 'asr_disabled', audio_id: audioId,
+      message: '服务端转写默认关闭（启用会把这段录音发到厂商）。确认账号与费用后，'
+        + '在 config.local.json 里设 "asrEnabled": true（或用环境变量 ASR_ENABLED=1）再重启服务。'
+        + '在此之前请改用文字输入。',
+    } };
+  }
+  if (!ASR.endpoint || !ASR.apiKey) {
+    return { http: 503, body: {
+      ok: false, error: 'asr_not_configured', audio_id: audioId,
+      message: '服务端转写未配置：请在 config.local.json 里配 asrEndpoint/asrApiKey（或复用 NL 的 endpoint/key），'
+        + '也可用环境变量 ASR_ENDPOINT / ASR_API_KEY 注入。未配置时请改用文字输入。',
+    } };
+  }
+
+  const started = Date.now();
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ASR.timeoutMs);
+  let resp, text, upstreamStatus = null;
+  try {
+    const buf = fs.readFileSync(file);
+    const form = new FormData();
+    form.append('model', ASR.model);
+    form.append('file', new Blob([buf], { type: 'audio/wav' }), path.basename(file));
+    resp = await fetch(asrTranscriptionsUrl(ASR.endpoint), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ASR.apiKey}` },
+      body: form,
+      signal: ac.signal,
+    });
+    upstreamStatus = resp.status;
+    text = await resp.text();
+  } catch (e) {
+    clearTimeout(timer);
+    const aborted = e && (e.name === 'AbortError' || /abort/i.test(e.message || ''));
+    const providerMs = Date.now() - started;
+    const code = aborted ? 'asr_timeout' : 'asr_failed';
+    const reason = aborted
+      ? `转写请求超时（${ASR.timeoutMs} ms 内未返回）：请检查网络，或调大 ASR_TIMEOUT_MS。`
+      : `转写请求失败：${e && e.message ? e.message : '未知网络错误'}`;
+    voiceApply('asr_failed', { audio_id: audioId, reason, error: code });
+    return { http: aborted ? 504 : 502, body: { ok: false, error: code, audio_id: audioId, provider_ms: providerMs, reason, message: reason } };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const providerMs = Date.now() - started;
+  let parsed = null;
+  let parseOk = false;
+  try { parsed = JSON.parse(text || '{}'); parseOk = true; } catch (_) { /* 上游不是 JSON */ }
+
+  if (!resp.ok) {
+    // 上游 401/402 这类最常见于「key 不对 / 余额不足」，把状态码带出来便于定位，但绝不回显 key
+    const detail = parsed && parsed.error && (parsed.error.message || parsed.error.code);
+    const reason = `转写服务返回 HTTP ${upstreamStatus}${detail ? '：' + String(detail).slice(0, 200) : ''}`;
+    voiceApply('asr_failed', { audio_id: audioId, reason, error: 'asr_failed' });
+    console.warn(`[asr] ${audioId} 转写失败 HTTP ${upstreamStatus}（provider ${providerMs}ms）`);
+    return { http: 502, body: {
+      ok: false, error: 'asr_failed', audio_id: audioId, upstream_status: upstreamStatus,
+      provider_ms: providerMs, reason, message: reason,
+    } };
+  }
+
+  const transcribed = parsed && typeof parsed.text === 'string' ? parsed.text.trim() : '';
+  // HTTP 200 但响应体不是 JSON：协议层面就不对（多半是打到了错误地址、拿回一张 HTML 错误页），
+  // 与「模型没识别出内容」是两回事，必须分开报，否则排查方向会被带偏。
+  if (!parseOk) {
+    const reason = `转写服务返回的不是 JSON（HTTP ${upstreamStatus}），可能是地址不对或网关拦截：${String(text).slice(0, 120)}`;
+    voiceApply('asr_failed', { audio_id: audioId, reason, error: 'asr_failed' });
+    return { http: 502, body: {
+      ok: false, error: 'asr_failed', audio_id: audioId, provider_ms: providerMs,
+      upstream_status: upstreamStatus, reason, message: reason,
+    } };
+  }
+  if (!transcribed) {
+    const reason = '转写服务返回了空文本（可能录音无声、过短，或模型没识别出内容）。';
+    voiceApply('asr_failed', { audio_id: audioId, reason, error: 'asr_empty_text' });
+    return { http: 502, body: {
+      ok: false, error: 'asr_empty_text', audio_id: audioId, provider_ms: providerMs,
+      upstream_status: upstreamStatus, reason, message: reason,
+    } };
+  }
+
+  voiceApply('transcribed', { audio_id: audioId, transcript: transcribed });
+  console.log(`[asr] ${audioId} 转写完成（provider ${providerMs}ms）：${transcribed}`);
+  return { http: 200, body: {
+    ok: true, audio_id: audioId, text: transcribed,
+    model: (parsed && parsed.model) || ASR.model,
+    provider_ms: providerMs, upstream_status: upstreamStatus,
+  } };
 }
 
 /* 连通性测试：用给定参数发一次最小 chat 请求（不落盘） */
@@ -3502,6 +3721,24 @@ async function handleRequest(req, res) {
     const r = voiceApply(stage, patch);
     console.log(`[voice] 阶段推进 → ${stage}${patch.transcript ? '：' + patch.transcript : ''}${patch.reason ? '（' + patch.reason + '）' : ''}`);
     return json(res, 200, { ok: true, persisted: r.persisted, voice: r.state });
+  }
+
+  // ---- 语音链路：④b 服务端转写（无麦克风机器的识别路径）----
+  //   body: { audio_id }
+  //   把盘上这段 WAV 直接交给识别接口（智谱 GLM-ASR），不依赖本机声卡。
+  //   有麦克风的机器前端仍走 Web Speech；本接口是「没有麦克风」时的降级路径。
+  //   失败一律分类返回（未配置 / 超限 / 上游错 / 超时 / 空文本），绝不假装成功。
+  if (p === '/api/voice/transcribe' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const aid = String(body.audio_id || '').trim();
+    if (!aid) {
+      return json(res, 400, { ok: false, error: 'missing_audio_id', message: '缺少 audio_id 字段。' });
+    }
+    if (!VOICE_ID_RE.test(aid)) {
+      return json(res, 400, { ok: false, error: 'invalid_audio_id', message: `audio_id 格式非法：${aid}` });
+    }
+    const r = await voiceTranscribe(aid);
+    return json(res, r.http, r.body);
   }
 
   // ---- 语音链路：⑦ 远程触发一次录音（等价于按板端 BOOT 键）----

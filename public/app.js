@@ -1900,6 +1900,40 @@ async function voiceProbeMic() {
   }
 }
 
+/* 服务端转写（降级路径）：把这段 WAV 的 audio_id 交给服务端，由服务端调识别接口。
+ *
+ * 为什么需要：Web Speech API 只能听麦克风，没有接口能直接喂一段 WAV。
+ * 本机没有麦克风时（2026-10-30 实测 12 个录音端点全不可用），
+ * 「扬声器外放 → 麦克风听回」这条路物理上走不通，必须换一条不依赖本机声卡的识别路径。
+ * 有麦克风的机器仍然优先走 Web Speech（课程 §12 要求），本函数只在缺设备时被调用。 */
+async function voiceTranscribeServer(audioId) {
+  try {
+    const j = await voiceFetchJson('/api/voice/transcribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio_id: audioId }),
+    }, 30000);
+    const text = j && typeof j.text === 'string' ? j.text.trim() : '';
+    if (j && j.ok === true && text) {
+      return { ok: true, text, model: j.model || '', providerMs: j.provider_ms };
+    }
+    return {
+      ok: false,
+      error: (j && (j.error || j.message)) || 'empty_text',
+      reason: (j && (j.reason || j.message)) || '服务端转写没有返回文本。',
+    };
+  } catch (e) {
+    const isTimeout = e && (e.name === 'AbortError' || e.name === 'TimeoutError');
+    return {
+      ok: false,
+      error: isTimeout ? 'client_timeout' : 'network',
+      reason: isTimeout
+        ? '服务端转写超过 30 秒没有返回。可重试，或直接用下方文字入口输入同一句话。'
+        : `调用服务端转写失败：${(e && e.message) || String(e)}。可重试，或直接用下方文字入口。`,
+    };
+  }
+}
+
 /* 识别：Web Speech API（只认麦克风，故与播放同时进行）。返回 { promise, stopSoft, abort } */
 function voiceStartAsr(durMs) {
   const out = { promise: null, stopSoft: () => {}, abort: () => {} };
@@ -1991,24 +2025,128 @@ function voiceSpeak(text) {
     }
     let done = false;
     let timer = 0;
+    let started = false;
     const finish = (r) => {
       if (done) return;
       done = true;
       if (timer) clearTimeout(timer);
       resolve(r);
     };
-    try { window.speechSynthesis.cancel(); } catch (_) {}
-    const u = new SpeechSynthesisUtterance(t);
-    u.lang = 'zh-CN';
-    u.rate = 1;
-    u.pitch = 1;
-    u.onend = () => finish({ ok: true });
-    u.onerror = (ev) => finish({ ok: false, error: (ev && ev.error) || 'speech_error' });
-    timer = setTimeout(() => finish({ ok: false, error: 'timeout' }), Math.min(60000, 8000 + t.length * 260));
-    try { window.speechSynthesis.speak(u); } catch (e) {
-      finish({ ok: false, error: 'speak_failed' });
-    }
+    /* 系统里一个语音都没装时，speechSynthesis 有的浏览器会静默什么都不做
+     * （既不 onstart 也不 onerror），界面就会永远停在「正在播报…」。
+     * 先看一眼语音列表：getVoices() 首次可能为空（异步加载），最多等 800ms。
+     * 完全没有语音就直接如实报 no_voice，不装作已经播报。 */
+    const speakNow = () => {
+      try { window.speechSynthesis.cancel(); } catch (_) {}
+      const u = new SpeechSynthesisUtterance(t);
+      u.lang = 'zh-CN';
+      u.rate = 1;
+      u.pitch = 1;
+      u.onstart = () => { started = true; };
+      u.onend = () => finish(started ? { ok: true } : { ok: false, error: 'no_output' });
+      u.onerror = (ev) => finish({ ok: false, error: (ev && ev.error) || 'speech_error' });
+      timer = setTimeout(() => finish({ ok: false, error: started ? 'timeout' : 'no_output' }),
+        Math.min(60000, 8000 + t.length * 260));
+      try { window.speechSynthesis.speak(u); } catch (e) {
+        finish({ ok: false, error: 'speak_failed' });
+      }
+    };
+    let voices = [];
+    try { voices = window.speechSynthesis.getVoices() || []; } catch (_) { voices = []; }
+    if (voices.length) { speakNow(); return; }
+    let waited = 0;
+    const onVoices = () => {
+      try { voices = window.speechSynthesis.getVoices() || []; } catch (_) { voices = []; }
+      if (voices.length) {
+        try { window.speechSynthesis.onvoiceschanged = null; } catch (_) {}
+        speakNow();
+      }
+    };
+    try { window.speechSynthesis.onvoiceschanged = onVoices; } catch (_) {}
+    const tick = setInterval(() => {
+      waited += 200;
+      onVoices();
+      if (done || voices.length || waited >= 800) {
+        clearInterval(tick);
+        try { window.speechSynthesis.onvoiceschanged = null; } catch (_) {}
+        if (!done && !voices.length) finish({ ok: false, error: 'no_voice' });
+      }
+    }, 200);
   });
+}
+
+/* ③ 任务 + ④ 播报：两条识别路径（本机 Web Speech / 服务端转写）共用这同一段流程。
+ *
+ * 抽出来的理由：识别来源不同，但「交给 /api/nl」与「播报回复」必须完全一致，
+ * 否则两条路径的失败语义会各自漂移，同一个问题在两个入口给出不同解释。
+ * text 已由上层负责上报 transcribed 阶段。 */
+async function voiceTaskAndSpeak(audioId, text) {
+  // ---- 任务：复用第 4 周 /api/nl（不另造判定规则）----
+  voiceSetSeg('task', 'run', '正在交给 /api/nl…');
+  renderVoiceSegments();
+  voiceNote('识别成功，正在执行任务（采集类请求会等待设备真实结果，可能需要几秒）。');
+  await voicePostState({ stage: 'task_running', audio_id: audioId });
+
+  let nl = null;
+  let nlErr = null;
+  try {
+    nl = await voiceFetchJson('/api/nl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    }, 25000);
+  } catch (e) { nlErr = e; }
+
+  if (!nl || nl.ok === false) {
+    const isTimeout = !!(nlErr && (nlErr.name === 'AbortError' || nlErr.name === 'TimeoutError'));
+    const detail = nlErr
+      ? (isTimeout ? '/api/nl 超过 25 秒没有返回' : `请求 /api/nl 失败：${nlErr.message || nlErr.name}`)
+      : ((nl && (nl.message || nl.error)) || '服务端未返回结果');
+    const reason = isTimeout
+      ? `${detail}（采集类任务可能卡在设备侧）。可等设备恢复后重试，或直接用下方文字入口输入同一句话。`
+      : `${detail}。请稍后点「重新识别这段录音」重试，或直接用下方文字入口输入同一句话。`;
+    voiceSetSeg('task', 'fail', isTimeout ? '任务执行超时' : '任务请求失败');
+    voiceSetSeg('tts', 'wait', '未执行');
+    renderVoiceSegments();
+    /* 服务端失败枚举里能描述「卡住 / 没做完」的只有 timeout 一档，故阶段如实上报 timeout；
+     * 但页面横幅按真实原因分两种措辞，不能让用户看到「超时」却发现其实是被拒绝 / 报错。 */
+    renderVoiceFailure(isTimeout ? 'timeout' : 'task_failed', reason);
+    voiceNote(reason);
+    await voicePostState({ stage: 'timeout', audio_id: audioId, reason });
+    return;
+  }
+
+  const intent = nl.intent || '(未识别意图)';
+  const reply = nl.reply || '(服务端没有给出回复)';
+  VOICE.reply = reply;
+  voiceSetSeg('task', 'done', `intent=${intent} · ${reply}`);
+  renderVoiceSegments();
+  await voicePostState({ stage: 'task_done', audio_id: audioId, intent, reply });
+
+  // ---- 播报：speechSynthesis ----
+  voiceSetSeg('tts', 'run', '正在播报…');
+  renderVoiceSegments();
+  voiceNote('任务完成，正在播报回复。');
+  const spoken = await voiceSpeak(reply);
+  if (spoken.ok) {
+    voiceSetSeg('tts', 'done', '已在本机浏览器播报');
+    renderVoiceSegments();
+    await voicePostState({ stage: 'spoken', audio_id: audioId });
+    voiceNote('链路完成：板端录音 → 识别 → /api/nl 任务 → 浏览器播报。');
+    return;
+  }
+  /* 播报失败也要说清是哪一种「没播出来」：本机没装中文语音 / 没有输出设备 /
+   * 浏览器拒绝自动播放。绝不写成「已播报」——文字回复本来就已经显示在页面上了，
+   * 谎报一次发声只会让人以为设备正常。 */
+  const why = spoken.error;
+  const human = why === 'no_voice'
+    ? '本机没有可用的语音合成声音（系统未安装中文语音），未实际发声'
+    : why === 'no_output'
+      ? '本机的语音合成没有真正发声（可能没有可用的扬声器/输出设备）'
+      : `浏览器没能播报（${why}）`;
+  voiceSetSeg('tts', 'fail', human);
+  renderVoiceSegments();
+  voiceNote(`回复已显示在页面上，但${human}。可点「再播报一次」重试，或直接看页面上的文字回复。`);
 }
 
 /* 主链路：接管一段新录音，依次走完 播放+识别 → /api/nl → 播报，每步推进服务端状态 */
@@ -2063,14 +2201,47 @@ async function voiceStartChain(audioId) {
      * 一个永远解决不了的方向。所以先主动看一眼设备列表，缺设备就直接给准确原因。 */
     const mic = await voiceProbeMic();
     if (!mic.ok) {
-      const reason = mic.reason;
-      voiceSetSeg('asr', 'fail', '未识别（本机没有录音设备）');
-      voiceSetSeg('task', 'wait', '未执行');
-      voiceSetSeg('tts', 'wait', '未执行');
+      /* 没有本机麦克风 → 改走服务端转写。
+       * Web Speech API 只能听麦克风；缺设备时「扬声器外放→麦克风听回」物理上不成立，
+       * 所以这里不再报错退出，而是把 WAV 直接交给服务端的识别接口（GLM-ASR）。 */
+      const sv0 = VOICE.state || {};
+      const asrCfg = sv0.asr || {};
+      /* 服务端转写默认是关闭的（启用意味着把录音发给厂商，必须由人显式开启）。
+       * 关闭时不要试、也不要说「失败了」，直接说清现状与两条出路。 */
+      if (asrCfg.enabled === false) {
+        const reason = '本机没有可用的麦克风，而服务端转写当前处于关闭状态（默认关闭：'
+          + '启用会把这段录音发送到识别服务厂商）。要启用它，在 config.local.json 里加 "asrEnabled": true 并重启服务；'
+          + '在此之前请直接用下方「文字入口」输入同一句话，任务照样能完成。';
+        voiceSetSeg('asr', 'fail', '未识别（无麦克风，服务端转写未启用）');
+        voiceSetSeg('task', 'wait', '未执行');
+        voiceSetSeg('tts', 'wait', '未执行');
+        renderVoiceSegments();
+        renderVoiceFailure('asr_failed', reason);
+        voiceNote(reason);
+        await voicePostState({ stage: 'asr_failed', audio_id: audioId, reason });
+        return;
+      }
+      els.voicePlayer.src = `/api/voice/audio/${encodeURIComponent(audioId)}`;
+      try { els.voicePlayer.currentTime = 0; } catch (_) {}
+      voiceSetSeg('asr', 'run', `本机没有录音设备，改用服务端转写（${asrCfg.model || 'GLM-ASR'}）…`);
       renderVoiceSegments();
-      renderVoiceFailure('asr_failed', reason);
-      voiceNote(reason);
-      await voicePostState({ stage: 'asr_failed', audio_id: audioId, reason });
+      voiceNote('本机没有可用的麦克风，浏览器识别收不到声音，已自动改用服务端转写：把这段 WAV 直接交给识别接口，不需要本机声卡。');
+      const tr = await voiceTranscribeServer(audioId);
+      if (!tr.ok) {
+        const reason = tr.reason;
+        voiceSetSeg('asr', 'fail', '服务端转写未成功');
+        voiceSetSeg('task', 'wait', '未执行');
+        voiceSetSeg('tts', 'wait', '未执行');
+        renderVoiceSegments();
+        renderVoiceFailure('asr_failed', reason);
+        voiceNote(reason);
+        await voicePostState({ stage: 'asr_failed', audio_id: audioId, reason });
+        return;
+      }
+      voiceSetSeg('asr', 'done', `识别文本（服务端转写）：「${tr.text}」`);
+      renderVoiceSegments();
+      await voicePostState({ stage: 'transcribed', audio_id: audioId, transcript: tr.text });
+      await voiceTaskAndSpeak(audioId, tr.text);
       return;
     }
 
@@ -2132,67 +2303,10 @@ async function voiceStartChain(audioId) {
     }
 
     const text = String(speech.text || '').trim();
-    voiceSetSeg('asr', 'done', `识别文本：「${text}」`);
+    voiceSetSeg('asr', 'done', `识别文本（Web Speech）：「${text}」`);
     renderVoiceSegments();
     await voicePostState({ stage: 'transcribed', audio_id: audioId, transcript: text });
-
-    // ---- ④ 任务：复用第 4 周 /api/nl（不另造判定规则）----
-    voiceSetSeg('task', 'run', '正在交给 /api/nl…');
-    renderVoiceSegments();
-    voiceNote('识别成功，正在执行任务（采集类请求会等待设备真实结果，可能需要几秒）。');
-    await voicePostState({ stage: 'task_running', audio_id: audioId });
-
-    let nl = null;
-    let nlErr = null;
-    try {
-      nl = await voiceFetchJson('/api/nl', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      }, 25000);
-    } catch (e) { nlErr = e; }
-
-    if (!nl || nl.ok === false) {
-      const isTimeout = !!(nlErr && (nlErr.name === 'AbortError' || nlErr.name === 'TimeoutError'));
-      const detail = nlErr
-        ? (isTimeout ? '/api/nl 超过 25 秒没有返回' : `请求 /api/nl 失败：${nlErr.message || nlErr.name}`)
-        : ((nl && (nl.message || nl.error)) || '服务端未返回结果');
-      const reason = isTimeout
-        ? `${detail}（采集类任务可能卡在设备侧）。可等设备恢复后重试，或直接用下方文字入口输入同一句话。`
-        : `${detail}。请稍后点「重新识别这段录音」重试，或直接用下方文字入口输入同一句话。`;
-      voiceSetSeg('task', 'fail', isTimeout ? '任务执行超时' : '任务请求失败');
-      voiceSetSeg('tts', 'wait', '未执行');
-      renderVoiceSegments();
-      /* 服务端失败枚举里能描述「卡住 / 没做完」的只有 timeout 一档，故阶段如实上报 timeout；
-       * 但页面横幅按真实原因分两种措辞，不能让用户看到「超时」却发现其实是被拒绝 / 报错。 */
-      renderVoiceFailure(isTimeout ? 'timeout' : 'task_failed', reason);
-      voiceNote(reason);
-      await voicePostState({ stage: 'timeout', audio_id: audioId, reason });
-      return;
-    }
-
-    const intent = nl.intent || '(未识别意图)';
-    const reply = nl.reply || '(服务端没有给出回复)';
-    VOICE.reply = reply;
-    voiceSetSeg('task', 'done', `intent=${intent} · ${reply}`);
-    renderVoiceSegments();
-    await voicePostState({ stage: 'task_done', audio_id: audioId, intent, reply });
-
-    // ---- ⑤ 播报：speechSynthesis ----
-    voiceSetSeg('tts', 'run', '正在播报…');
-    renderVoiceSegments();
-    voiceNote('任务完成，正在播报回复。');
-    const spoken = await voiceSpeak(reply);
-    if (spoken.ok) {
-      voiceSetSeg('tts', 'done', '已在本机浏览器播报');
-      renderVoiceSegments();
-      await voicePostState({ stage: 'spoken', audio_id: audioId });
-      voiceNote('链路完成：板端录音 → 浏览器识别 → /api/nl 任务 → 浏览器播报。');
-    } else {
-      voiceSetSeg('tts', 'fail', `播报失败（${spoken.error}）`);
-      renderVoiceSegments();
-      voiceNote('回复已显示在页面上，但浏览器没能播报（' + spoken.error + '）。可点「再播报一次」重试。');
-    }
+    await voiceTaskAndSpeak(audioId, text);
   } catch (e) {
     voiceNote('链路异常：' + ((e && e.message) || String(e)) + '。可使用下方文字入口完成任务。');
     renderVoiceSegments();
