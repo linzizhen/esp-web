@@ -27,8 +27,15 @@
 #include <stdint.h>
 
 /* 初始化摄像头。imu_i2c_port 传 IMU 用的 I2C 端口号（复用其总线）。
- * 返回 true 表示摄像头已就绪。 */
+ * 返回 true 表示摄像头已就绪。内部会上电重试 3 次。 */
 bool cam_stream_init(int imu_i2c_port);
+
+/* 运行时重试初始化（已就绪时直接返回 true）。 */
+bool cam_stream_retry_init(void);
+
+/* 最后一次 esp_camera_init 的 errno，0 表示成功。
+ * 用来把「为什么起不来」回给服务端/网页，而不是只说一句 no_camera。 */
+int cam_stream_init_err(void);
 
 /* 反初始化（释放帧缓冲）。 */
 void cam_stream_deinit(void);

@@ -48,6 +48,20 @@ static uint32_t      s_last_len  = 0;
 static int           s_framesize = CAM_DEF_FRAMESIZE;
 static int           s_quality   = CAM_DEF_QUALITY;
 
+/* 初始化失败的 errno 与重试参数。
+ * ★ 2026-10-30 加：板子 10-30 上电后摄像头一直起不来（服务端收到
+ *   status="no_camera"），但原来失败只打一行 ESP_LOGE 就 return false，
+ *   错误码既没上报也没重试，网页端只能看到"摄像头不可用"而不知道为什么。
+ *   现在：① 上电时重试 3 次；② 把最后一次 esp_camera_init() 的 errno 存下来，
+ *   经 cmd_ack 回给服务端（例如 "no_camera 0x105"）；③ 支持运行时再重试一次。
+ *   errno 对照（esp_err.h）：0x101 ESP_FAIL / 0x102 NO_MEM / 0x103 INVALID_ARG /
+ *   0x104 INVALID_STATE / 0x105 INVALID_SIZE / 0x106 NOT_FOUND /
+ *   0x107 NOT_SUPPORTED / 0x108 TIMEOUT；esp32-camera 自己的错误在 0x2000 以上。 */
+#define CAM_INIT_RETRIES   3
+#define CAM_INIT_RETRY_MS  300
+static int s_init_err  = 0;      /* 最后一次 esp_camera_init 的 errno，0=成功 */
+static int s_i2c_port  = -1;     /* 记住 IMU 的 I2C 端口，供运行时重试用 */
+
 /* 分辨率名称表 —— 必须与组件 driver/include/sensor.h 里的 framesize_t 枚举
  * 逐项对齐。★ 该枚举与网上很多旧资料不同：它在 3 处插入了 QCIF(176x144)、
  * 在 7 处插入了 320X320，导致 QVGA/CIF/VGA 的索引整体后移。
@@ -126,10 +140,24 @@ bool cam_stream_init(int imu_i2c_port)
     c.fb_location  = CAMERA_FB_IN_PSRAM; /* 板载 8MB Octal PSRAM */
     c.grab_mode    = CAMERA_GRAB_LATEST; /* 总取最新帧，避免越抓越旧 */
 
-    esp_err_t err = esp_camera_init(&c);
+    s_i2c_port = imu_i2c_port;
+
+    /* 重试：SCCB 与 IMU 共用总线，上电瞬间 IMU 刚初始化完，偶尔会撞上
+     * 总线还没稳定。实测板子上电后一直 no_camera，加重试至少能排除
+     * "一次性抖动"，并把真实 errno 留给服务端/网页显示。 */
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= CAM_INIT_RETRIES; attempt++) {
+        err = esp_camera_init(&c);
+        if (err == ESP_OK) break;
+        ESP_LOGW(TAG, "摄像头初始化第 %d/%d 次失败: %s (0x%x)",
+                 attempt, CAM_INIT_RETRIES, esp_err_to_name(err), err);
+        if (attempt < CAM_INIT_RETRIES) vTaskDelay(pdMS_TO_TICKS(CAM_INIT_RETRY_MS));
+    }
+    s_init_err = (int)err;
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "摄像头初始化失败: %s (0x%x)。"
-                      "检查 PSRAM 是否开启、SCCB 是否与 IMU 共用总线",
+                      "检查 PSRAM 是否开启、SCCB 是否与 IMU 共用总线、"
+                      "以及排线是否插好；errno 会随 no_camera 回执上报",
                  esp_err_to_name(err), err);
         return false;
     }
@@ -138,6 +166,18 @@ bool cam_stream_init(int imu_i2c_port)
              cam_stream_framesize_name(s_framesize), s_quality, imu_i2c_port);
     return true;
 }
+
+/* 运行时重试初始化（网页点"重试初始化摄像头"时调用）。
+ * 摄像头是焊死的，但上电一次失败后重试仍可能成功（PSRAM/总线抖动）。 */
+bool cam_stream_retry_init(void)
+{
+    if (s_ready) return true;
+    if (s_i2c_port < 0) { ESP_LOGW(TAG, "重试摄像头初始化失败：I2C 端口未知（IMU 未初始化）"); return false; }
+    ESP_LOGI(TAG, "按要求重试初始化摄像头…");
+    return cam_stream_init(s_i2c_port);
+}
+
+int cam_stream_init_err(void) { return s_init_err; }
 
 void cam_stream_deinit(void)
 {

@@ -734,6 +734,41 @@ static void on_button_press(int raw)
 static adc_oneshot_unit_handle_t s_adc = NULL;
 static int s_btn_idle = 0;
 
+/* 6 颗功能键共用一路 ADC（GPIO1 电阻分压），按下不同键得到不同读数。
+ * esp-bsp 参考值见文件头：2410 / 1980 / 820 / 380（无按键时上拉接近满量程）。
+ *
+ * ★ 2026-10-30 修复「按任意键都触发求助」：
+ *   原判据是「读数 < 空闲-500，且下限 300」→ 空闲≈4095 时阈值≈3595，
+ *   四个参考值（2410/1980/820/380）全部满足，于是任何一颗键都被当成求助键。
+ *   现改为「最近邻归类到参考值 + 只认 HELP_KEY_ADC 那一颗」。
+ *   相邻参考值最小间距 440，容差 150 有足够余量，不会误判到邻键。
+ *
+ * 想换一颗键当求助键：把 HELP_KEY_ADC 改成下面表里另一个参考值即可。
+ * 现场怎么确认哪颗键是哪个值：按键时串口会打印「按键 Kx(raw=NNN)」，
+ * 对着按一遍就建立对应关系（未绑定的键只打日志、不触发任何动作）。 */
+static const int s_key_adc[] = { 2410, 1980, 820, 380 };   /* K0..K3 */
+#define KEY_ADC_N       ((int)(sizeof(s_key_adc) / sizeof(s_key_adc[0])))
+#define KEY_ADC_TOL     150
+#define HELP_KEY_ADC    380      /* ← 求助键（K3）。改成 2410/1980/820 即换键 */
+
+/* 把 ADC 读数归类到最近的一颗键；读数离所有参考值都超过容差则返回 -1（可能没按/按了两颗）*/
+static int key_adc_index(int v)
+{
+    int best = -1, bestd = KEY_ADC_TOL + 1;
+    for (int i = 0; i < KEY_ADC_N; i++) {
+        int d = v > s_key_adc[i] ? v - s_key_adc[i] : s_key_adc[i] - v;
+        if (d < bestd) { bestd = d; best = i; }
+    }
+    return best;
+}
+
+/* 求助键在下标表里的位置（找不到就退回 0，避免日志打印出负数） */
+static int help_key_index(void)
+{
+    for (int i = 0; i < KEY_ADC_N; i++) if (s_key_adc[i] == HELP_KEY_ADC) return i;
+    return 0;
+}
+
 static void btn_init(void)
 {
     adc_oneshot_unit_init_cfg_t u = { .unit_id = ADC_UNIT_1 };
@@ -762,9 +797,11 @@ static void btn_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     s_btn_idle = idle;
-    int th = idle - 500;
-    if (th < 300) th = 300;                       /* 兜底：基准异常时仍能触发 */
-    ESP_LOGI(TAG, "按键 ADC 校准：空闲=%d，按下判定阈值<%d（按下不同键读数更低）", idle, th);
+    ESP_LOGI(TAG, "按键 ADC 校准：空闲=%d", idle);
+    ESP_LOGI(TAG, "按键映射：K0=%d K1=%d K2=%d K3=%d，容差±%d；"
+                  "只有 K%d(raw=%d) 触发求助，其余键仅打印日志",
+             s_key_adc[0], s_key_adc[1], s_key_adc[2], s_key_adc[3], KEY_ADC_TOL,
+             help_key_index(), HELP_KEY_ADC);
 
     bool debounced = false, cand = false;
     int same = 0;
@@ -775,19 +812,28 @@ static void btn_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
-        bool p = (v < th);
+        /* 任意一颗在表内的键都算「按下」（用于去抖），动作再按具体是哪颗键分派 */
+        int idx = key_adc_index(v);
+        bool p = (idx >= 0);
         if (p == cand) { if (same < 4) same++; }
         else { cand = p; same = 1; }
 
         if (same >= 3 && cand != debounced) {
             debounced = cand;
-            if (debounced) on_button_press(v);
+            if (debounced) {
+                if (s_key_adc[idx] == HELP_KEY_ADC) {
+                    on_button_press(v);
+                } else {
+                    ESP_LOGI(TAG, "按键 K%d(raw=%d) 未绑定动作（求助键是 K%d raw=%d）",
+                             idx, v, help_key_index(), HELP_KEY_ADC);
+                }
+            }
         }
-        /* 每 2 秒打印一次原始读数，便于现场校准阈值 */
+        /* 每 2 秒打印一次原始读数，便于现场校准 */
         int64_t now = esp_timer_get_time() / 1000;
         if (now - last_dbg > 2000) {
             last_dbg = now;
-            ESP_LOGD(TAG, "按键 ADC 原始值=%d（空闲基准 %d）", v, s_btn_idle);
+            ESP_LOGD(TAG, "按键 ADC 原始值=%d（空闲基准 %d，归类 K%d）", v, s_btn_idle, idx);
         }
         vTaskDelay(pdMS_TO_TICKS(25));
     }
@@ -1364,6 +1410,17 @@ static void cam_task(void *arg)
     }
 }
 
+/* 摄像头不可用时统一回执：带上 esp_camera_init 的 errno。
+ * ★ 2026-10-30：原来只回一句 "no_camera"，服务端与网页都无法区分
+ *   「没接摄像头 / PSRAM 没开 / SCCB 冲突 / 初始化超时」。
+ *   现在 append 0x%x，服务端会原样显示给用户。 */
+static void cam_ack_unavailable(const char *rid)
+{
+    char st[64];
+    snprintf(st, sizeof(st), "no_camera 0x%x", cam_stream_init_err());
+    cmd_ack(rid, st);
+}
+
 static void handle_command(const char *line)
 {
     char cmd[32] = {0};
@@ -1404,7 +1461,7 @@ static void handle_command(const char *line)
         cmd_ack(rid, "idle");
     } else if (strcmp(cmd, "cam_on") == 0) {
         /* 开始推流 */
-        if (!s_cam_ok) { cmd_ack(rid, "no_camera"); }
+        if (!s_cam_ok) { cam_ack_unavailable(rid); }
         else { s_cam_on = true; cmd_ack(rid, "cam_on"); ESP_LOGI(TAG, "摄像头推流已开启"); }
     } else if (strcmp(cmd, "cam_off") == 0) {
         s_cam_on = false;
@@ -1413,7 +1470,7 @@ static void handle_command(const char *line)
     } else if (strcmp(cmd, "cam_shot") == 0) {
         /* 抓拍一帧（单张快照）。可带 framesize/quality 临时切到高分辨率，
          * 拍完自动恢复推流参数 —— 直播用低分辨率省带宽，抓拍用高分辨率看细节。 */
-        if (!s_cam_ok) { cmd_ack(rid, "no_camera"); }
+        if (!s_cam_ok) { cam_ack_unavailable(rid); }
         else {
             int fs = -1, q = -1;
             json_int(line, "framesize", &fs);
@@ -1435,16 +1492,28 @@ static void handle_command(const char *line)
         snprintf(st, sizeof(st), "%s q%d fps%d",
                  cam_stream_framesize_name(cam_stream_get_framesize()),
                  cam_stream_get_quality(), s_cam_fps);
-        cmd_ack(rid, ok ? st : "no_camera");
+        if (ok) { cmd_ack(rid, st); } else { cam_ack_unavailable(rid); }
+    } else if (strcmp(cmd, "cam_retry") == 0) {
+        /* 网页点「重试初始化摄像头」时调用：上电失败后不是永久不可用，
+         * 可能只是 PSRAM/总线抖动，重试一次常常就好了。 */
+        bool ok = cam_stream_retry_init();
+        s_cam_ok = ok;
+        if (ok) {
+            cmd_ack(rid, "cam_init_ok");
+            ESP_LOGI(TAG, "摄像头重试初始化成功");
+        } else {
+            cam_ack_unavailable(rid);
+            ESP_LOGW(TAG, "摄像头重试初始化仍失败（errno 0x%x）", cam_stream_init_err());
+        }
     } else if (strcmp(cmd, "cam_status") == 0) {
         uint32_t f = 0, fl = 0, last = 0;
         cam_stream_get_stats(&f, &fl, &last);
-        char st[96];
-        snprintf(st, sizeof(st), "ready=%d on=%d %s q%d sent=%lu drop=%lu lastlen=%lu",
+        char st[112];
+        snprintf(st, sizeof(st), "ready=%d on=%d %s q%d sent=%lu drop=%lu lastlen=%lu err=0x%x",
                  s_cam_ok ? 1 : 0, s_cam_on ? 1 : 0,
                  cam_stream_framesize_name(cam_stream_get_framesize()),
                  cam_stream_get_quality(), (unsigned long)f, (unsigned long)fl,
-                 (unsigned long)last);
+                 (unsigned long)last, cam_stream_init_err());
         cmd_ack(rid, st);
     } else if (strcmp(cmd, "wifi_status") == 0) {
         /* 现场诊断：一条命令问清 WiFi 当前到底什么状态，不用重烧固件 */
