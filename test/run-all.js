@@ -62,6 +62,7 @@ const SUITES = [
   { name: 'nl-config',    file: 'nl-config-test.js',   kind: 'integration' },
   { name: 'voice',        file: 'voice-test.js',       kind: 'integration' },
   { name: 'voice-layout', file: 'voice-layout-contract-test.js', kind: 'unit' },
+  { name: 'voice-mic',    file: 'voice-mic-preflight-test.js', kind: 'unit' },
   { name: 'command-ack',  file: 'command-ack-test.js', kind: 'integration' },
   { name: 'e2e',          file: 'e2e-test.js',         kind: 'e2e', needsServer: false },
 ];

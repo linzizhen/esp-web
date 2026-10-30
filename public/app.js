@@ -1575,9 +1575,16 @@ const VOICE_STAGE_TEXT = {
   timeout: '链路超时（可改用文字输入）',
 };
 
-/* Web Speech API 的错误码 → 能看懂的中文原因（每条都指向下一步该怎么做） */
+/* Web Speech API 的错误码 → 能看懂的中文原因（每条都指向下一步该怎么做）
+ *
+ * ★ not-allowed 有两种完全不同的成因，2026-10-30 真机踩过：
+ *   ① 站点权限被拒 —— 去地址栏允许即可；
+ *   ② 本机压根没有录音设备 —— 去地址栏允许一万次也没用。
+ *   当时那句文案只写了 ①，实测本机 12 个录音端点全为 NOTPRESENT/UNPLUGGED、
+ *   隐私策略 Allow、无企业策略、站点例外为空、走的是 127.0.0.1（安全上下文），
+ *   四条权限类成因全排除，唯一断点就是「零麦克风」。故两种成因必须都写出来。 */
 const VOICE_ASR_ERROR_TEXT = {
-  'not-allowed': '浏览器拒绝了麦克风权限：识别靠麦克风收听播放出来的录音，必须允许麦克风。请在地址栏重新允许麦克风后点「重新识别这段录音」。',
+  'not-allowed': '浏览器没拿到麦克风：可能是本机没有可用的录音设备（没插麦克风/耳麦），也可能是站点麦克风权限被拒。请先确认电脑接了麦克风；若已接好，再到地址栏的站点设置里允许麦克风，然后点「重新识别这段录音」。两者都不便时，直接用下方文字输入，任务照样能完成。',
   'service-not-allowed': '浏览器策略禁止了语音识别服务（可能需要 https / localhost，或企业策略限制）。请改用下方「文字入口」输入同一句话。',
   'audio-capture': '浏览器找不到可用的麦克风，收不到声音，无法识别。请接上麦克风并允许权限，或改用文字输入。',
   'no-speech': '没有识别到语音内容：可能声音太小、环境太吵，或这段录音太短。请调大音量后点「重新识别这段录音」，或改用文字输入。',
@@ -1674,7 +1681,10 @@ const VOICE_FAIL_KIND = {
   },
   asr_failed: {
     title: '识别失败（可改用文字输入）',
-    desc: (reason) => `${reason || '浏览器没能识别出这段录音的内容。'} 处理建议：确认扬声器能听见、麦克风已授权后点「重新识别这段录音」；仍然失败就直接用下方「文字入口」输入同一句话，任务照样能完成。`,
+    /* 2026-10-30 修正：原文只说「确认麦克风已授权」，但真实成因有一半是「本机根本没有
+     * 录音设备」（实测本机 12 个录音端点全 NOTPRESENT/UNPLUGGED），照那句话做永远修不好。
+     * 现在把两种成因分开写，并各自给出真正能做的动作。 */
+    desc: (reason) => `${reason || '浏览器没能识别出这段录音的内容。'} 处理建议：先确认本机接了麦克风（没接就插一个耳麦，识别靠麦克风听扬声器放出来的录音）；已接好的话再到地址栏的站点设置里允许麦克风，然后点「重新识别这段录音」。两者都不便时，直接用下方「文字入口」输入同一句话，任务照样能完成。`,
   },
   timeout: {
     title: '链路超时（可改用文字入口）',
@@ -1854,6 +1864,42 @@ async function voicePostState(body) {
   } catch (_) { return false; }
 }
 
+/* 录音设备判定（纯函数，只依赖入参 —— 便于静态契约测试直接求值验证）。
+ *
+ * 为什么需要它：Web Speech API 在「没有麦克风」和「权限被拒」两种情况下报的都是
+ * not-allowed，页面无法事后区分。所以必须在启动识别**之前**主动看一眼设备列表。
+ * Chrome 在未授权时会隐藏 device.label，但 kind 一定会给，故只能按 kind 判定。 */
+function voiceMicVerdict(devices) {
+  const list = Array.isArray(devices) ? devices : [];
+  const inputs = list.filter((d) => d && d.kind === 'audioinput');
+  if (inputs.length > 0) {
+    return { ok: true, count: inputs.length };
+  }
+  return {
+    ok: false,
+    count: 0,
+    error: 'no_input_device',
+    reason: '本机没有可用的录音设备（麦克风）：识别靠麦克风收听扬声器播放出来的录音，'
+      + '没有麦克风就收不到任何声音。请插上麦克风或耳麦后点「重新识别这段录音」；'
+      + '不方便接设备时，直接用下方文字输入同一句话，任务照样能完成。',
+  };
+}
+
+/* 识别前的设备自检。拿不到设备列表（旧浏览器 / 无 mediaDevices）时**不阻断**，
+ * 交回 Web Speech API 自己报错 —— 宁可少一层判断，也不要在能用的机器上误拦。 */
+async function voiceProbeMic() {
+  try {
+    const md = navigator.mediaDevices;
+    if (!md || typeof md.enumerateDevices !== 'function') {
+      return { ok: true, skipped: 'no_media_devices' };
+    }
+    const devices = await md.enumerateDevices();
+    return voiceMicVerdict(devices);
+  } catch (e) {
+    return { ok: true, skipped: 'enumerate_failed', detail: (e && e.message) || String(e) };
+  }
+}
+
 /* 识别：Web Speech API（只认麦克风，故与播放同时进行）。返回 { promise, stopSoft, abort } */
 function voiceStartAsr(durMs) {
   const out = { promise: null, stopSoft: () => {}, abort: () => {} };
@@ -2008,6 +2054,23 @@ async function voiceStartChain(audioId) {
       renderVoiceFailure('silent', reason);
       voiceNote('这段录音没有可识别的语音：' + peak + '。请靠近板载麦克风重录，或使用下方文字入口。');
       await voicePostState({ stage: 'silent', audio_id: audioId, reason });
+      return;
+    }
+
+    // ---- ②b 麦克风自检：本机没有录音设备时，先说清「缺设备」而不是「去允许权限」----
+    /* 2026-10-30 实测：本机 12 个录音端点全为 NOTPRESENT/UNPLUGGED，
+     * 但 Web Speech API 只报 not-allowed，页面于是把人引向「去地址栏允许权限」——
+     * 一个永远解决不了的方向。所以先主动看一眼设备列表，缺设备就直接给准确原因。 */
+    const mic = await voiceProbeMic();
+    if (!mic.ok) {
+      const reason = mic.reason;
+      voiceSetSeg('asr', 'fail', '未识别（本机没有录音设备）');
+      voiceSetSeg('task', 'wait', '未执行');
+      voiceSetSeg('tts', 'wait', '未执行');
+      renderVoiceSegments();
+      renderVoiceFailure('asr_failed', reason);
+      voiceNote(reason);
+      await voicePostState({ stage: 'asr_failed', audio_id: audioId, reason });
       return;
     }
 
