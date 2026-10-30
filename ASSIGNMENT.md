@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（21 个测试文件、522 项断言，全部通过）
+## 7. 自检脚本（22 个测试文件、572 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -348,6 +348,7 @@ node test/handleline-guard-test.js  # 23 项  空帧守卫：只含元数据的�
 node test/voice-test.js       # 104 项 第 5 周语音链路接口契约（8090）
 node test/voice-layout-contract-test.js  # 25 项  第 5 周 WAV 数据布局静态契约
 node test/voice-mic-preflight-test.js    # 24 项  第 5 周识别前麦克风自检（零设备不得说成"权限被拒"）
+node test/voice-asr-test.js   # 50 项  第 5 周转写接口：URL 归一化/失败分类/隐私默认关闭
 node test/command-ack-test.js # 95 项  命令 ack 通道：accepted/busy/timeout/error/channel_unavailable/mock
 ```
 
@@ -765,6 +766,15 @@ BOOT 键 → 板载 MEMS 麦克风 I2S 直采 → WAV(16kHz/16bit/单声道)
 服务端 `/api/voice/state` 如实返回 `audio_source=board_mic_i2s`、`asr_runs_on=browser_web_speech`，
 测试对这两项各有一条断言。
 
+★ 补充（2026-10-30）：Web Speech API **只接受麦克风实时拾音**，没有接口能把 WAV 直接喂给它。
+所以它的隐含前提是「这台电脑有麦克风，且能把扬声器播放的录音收进来」。本机实测**零麦克风、零扬声器**
+（12 个录音端点全 `NOTPRESENT`/`UNPLUGGED`），因此补了一条**默认关闭**的降级路径：
+`POST /api/voice/transcribe` 把已落盘的 WAV 交给服务端识别（智谱 `glm-asr-2512`）。
+它不是替换课程要求的 Web Speech，而是「无麦克风时链路还能走完」的备用路；
+▲ **默认关闭**，未在 `config.local.json` 里显式写 `"asrEnabled": true` 之前，关闭状态下连一条请求都不外发
+（录音不出本机，`test/voice-asr-test.js` 用假 ASR 服务的零命中来证明这一点）。
+④ 播报在无扬声器时改为屏幕大字 + 复制，并明确标注「未实际发声」。详见 `docs/week5-voice.md` §五「修复四」。
+
 ### 12.3 链路状态机
 
 `idle → recorded → transcribed → task_running → task_done → spoken`，
@@ -781,6 +791,7 @@ node test/voice-hil.js --speak            # 真机：录音 → 上传 → 独�
 node test/probe-voice-stop.js 5 2         # 真机探针：5 轮 start → 2s → stop 时长稳定性
 node test/voice-test.js                   # 104 项接口契约（隔离实例 + 合成 WAV）
 node test/voice-layout-contract-test.js   # 25 项数据布局静态契约
+node test/voice-asr-test.js               # 50 项服务端转写契约（含「未启用零外发」）
 ```
 
 `voice-hil.js` **自己重新下载 WAV 并解码算 RMS**，不信服务端自报 —— 服务端说「录到声音」不算证据。

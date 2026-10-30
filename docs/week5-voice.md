@@ -12,11 +12,16 @@
 | 环节 | 运行位置 | 技术 | 为什么不能换位置 |
 |------|---------|------|-----------------|
 | 录音 | **板端** | 板载 MEMS 麦克风 + I2S | 板子才有麦克风 |
-| 语音识别 | **浏览器** | Web Speech API | 板端没有算力跑 ASR，也没有联网 ASR 的授权额度 |
+| 语音识别 | **浏览器**（有麦克风时）<br>**服务端**（无麦克风时，可选降级） | Web Speech API<br>智谱 GLM-ASR（`glm-asr-2512`） | 板端没有算力跑 ASR，也没有联网 ASR 的授权额度 |
 | 文字落盘 | **服务端** | `data/voice/events.ndjson`（只追加） | 服务端是唯一长期存储 |
-| 语音播报 | **浏览器** | `speechSynthesis` | ★ 本板 `BSP_CAPS_AUDIO_SPEAKER = 0`，**物理上没有扬声器** |
+| 语音播报 | **浏览器** | `speechSynthesis`；无扬声器时改用**屏幕大字 + 复制** | ★ 本板 `BSP_CAPS_AUDIO_SPEAKER = 0`，**物理上没有扬声器** |
 
 ★ 关键判据：**播报不可能在板端完成**。任何"板端播报"的实现都是假的，必须在文档和验收里写清楚。
+
+★ 第二个判据（2026-10-30 补充）：Web Speech API **只接受麦克风实时拾音**，没有接口能把一段 WAV 直接喂给它。
+所以它的前提是"这台电脑有麦克风、且能把扬声器的声音收进来"。电脑没有麦克风时，必须有第二条路 ——
+本仓库实现为**服务端转写**（`POST /api/voice/transcribe`，默认**关闭**，见 §五「修复四」）。
+这条降级路径**不是课程要求**，属于本机环境（零麦克风、零扬声器）驱动出的补充能力。
 
 ---
 
@@ -89,6 +94,7 @@ idle → recorded → transcribed → task_running → task_done → spoken
 | GET | `/api/voice/audio/:id` | 回放 WAV |
 | GET | `/api/voice/audio/:id/download` | 下载取证 |
 | POST | `/api/voice/record` | 远程触发一次录音（等价按 BOOT 键） |
+| POST | `/api/voice/transcribe` | **可选降级**：把已落盘的 WAV 交给服务端转写（`{"audio_id":"voice-…"}`）。默认关闭，未开启时返回 503 `asr_disabled` 且**一条请求都不外发** |
 
 ### 失败分支（全部有测试覆盖）
 
@@ -101,6 +107,14 @@ idle → recorded → transcribed → task_running → task_done → spoken
 | 非法 stage | 400 + `invalid_stage` | — |
 | 缺 stage | 400 | — |
 | `asr_failed` 未给 reason | 200 + 补中文原因 | 「浏览器未能识别出语音内容」 |
+| 转写：非法/穿越 audio_id | 400 `invalid_audio_id` | 校验先于调用上游 |
+| 转写：不存在的 audio_id | 404 `audio_not_found` | — |
+| 转写：> 25 MB / > 30 秒 | 413 `asr_audio_too_large` / 400 `asr_audio_too_long` | 智谱接口自身的限制 |
+| 转写：未启用 | 503 `asr_disabled` | **假 ASR 服务零命中**（录音没有离开本机） |
+| 转写：启用但没配 endpoint/key | 503 `asr_not_configured` | 提示要配什么 |
+| 转写：上游 401/500/非 JSON | 502 `asr_failed` | 带 `upstream_status` 与原文片段 |
+| 转写：上游返回空白文本 | 502 `asr_empty_text` | 不假装识别成功 |
+| 转写：上游超时 | 504 `asr_timeout` | 按 `ASR_TIMEOUT_MS` 生效 |
 
 ---
 
@@ -410,6 +424,78 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 
 ---
 
+### 修复四：第②步整条路都走不通时，给一条不经过电脑声卡的路（2026-10-30）
+
+#### 现象
+
+修完「修复三」后，文案准确了，但第②步仍然过不去 —— 因为这台电脑**既没有麦克风，也没有扬声器**：
+
+| 环节 | 需要什么 | 本机实际情况 |
+|------|---------|-------------|
+| ② Web Speech 识别 | 麦克风（听扬声器播放出来的录音） | 12 个录音端点全 `NOTPRESENT` / `UNPLUGGED`，**零 ACTIVE** |
+| ④ `speechSynthesis` 播报 | 扬声器 | 只有 `DS27NB`、`Senary Audio` 两个输出端点，实际不发声（笔记本无声卡输出） |
+
+Web Speech API 的设计前提是"麦克风实时拾音"，**没有任何接口能把一段 WAV 直接喂给它** ——
+所以"扬声器外放 → 麦克风听回"这一步在无麦/无声的机器上物理上不可能完成。这不是文案问题，是路径问题。
+
+#### 修复：服务端转写作为降级路径（默认关闭）
+
+1. 新增 `POST /api/voice/transcribe`：把**已经落盘的 WAV** 直接交给识别服务（智谱 `glm-asr-2512`，
+   `POST https://open.bigmodel.cn/api/paas/v4/audio/transcriptions`，`multipart/form-data`），
+   不再经过电脑声卡。复用第 4 周那份 API Key 与 base URL，不需要新账号。
+2. 前端改成双路径：**有麦克风** → 先试 Web Speech（保持课程要求的形态）；**没有麦克风** → 走服务端转写。
+   两条路的名字都会显示在页面上（`Web Speech` / `服务端转写`），不让人猜到底走了哪条。
+3. ④ 播报改为**屏幕大字 + 复制按钮**；没有输出设备时明确标注「本机没有扬声器，未实际发声」，
+   **绝不写"已播报"**。
+4. ★ **默认关闭**：`asrEnabled` 缺省为 `false`。关闭时 `/api/voice/transcribe` 返回 503
+   `asr_disabled`，**连一条请求都不发出去** —— 录音不出本机。要启用必须在
+   `config.local.json` 里显式写 `"asrEnabled": true`（或环境变量 `ASR_ENABLED=1`）后重启服务。
+
+为什么默认关闭而不是默认开启：启用意味着**把用户的录音发送到第三方服务器**，这是不可逆的外发。
+在用户确认账号与费用之前，「代码就绪但默认不动」才是正确状态。
+
+#### 配置
+
+```jsonc
+// config.local.json（不入库，含密钥）
+{
+  "asrEnabled": true,                       // ★ 显式开启，缺省 false
+  "asrEndpoint": "https://open.bigmodel.cn/api/paas/v4",  // 可省略，默认复用 nlEndpoint
+  "asrApiKey": "……",                        // 可省略，默认复用 nlApiKey
+  "asrModel": "glm-asr-2512",               // 该接口文档里唯一枚举
+  "asrTimeoutMs": 20000
+}
+```
+
+也可用环境变量 `ASR_ENABLED` / `ASR_ENDPOINT` / `ASR_API_KEY` / `ASR_MODEL` / `ASR_TIMEOUT_MS` /
+`ASR_MAX_BYTES` / `ASR_MAX_MS` 覆盖（测试就是用这几个变量把上限压到 1 KB、超时压到 700 ms）。
+
+#### 防回归
+
+`test/voice-asr-test.js`（50 项）：自带**假 ASR 服务**（`http.createServer` + 随机端口），
+断言的不只是"成功路径"和"失败分类"，还包括隐私边界：
+
+- 未开启 `asrEnabled` → 503 `asr_disabled`，且**假 ASR 服务的命中计数一次都不增加**
+  —— 这条是"录音没有离开本机"的可执行证明，不是靠注释承诺。
+- 上游 401 / 500 / 返回 HTML（非 JSON）/ 返回空白文本 / 永不响应（超时）→ 分别归到
+  `asr_failed`（带 `upstream_status`）/ `asr_empty_text` / `asr_timeout`，都能让人看出"是上游的问题，不是识别出了空话"。
+- 密钥不外泄：`/api/voice`、`/api/voice/state`、转写响应里都不出现完整 key（只有掩码）。
+- 体积与时长上限（1 KB / 30 秒）在上游调用**之前**就拦住。
+
+#### 与课程要求的偏差（如实记录）
+
+课程第 5 周要求的识别形态是**浏览器 Web Speech API**。本仓库**保留**了这条路径（有麦克风时优先走它），
+服务端转写是**补充的降级路径**，不是替换。偏差的原因是本机硬件缺失，不是图省事：
+在本机这种"零麦克风、零扬声器"的环境里，只保留 Web Speech 等于整条链路永远停在②。
+
+#### 仍未解决的部分
+
+**本机仍然没有麦克风、没有扬声器。** 服务端转写路径本身可用（有 50 项测试），
+但**真实转写尚未跑过** —— 用户要求先确认账号与费用再启用，因此至今没有任何录音被外发。
+④ 播报在本机永远是"屏幕文字 + 明确说没发声"，不是真的出声。
+
+---
+
 ## 六、文件改动清单
 
 | 文件 | 改动 |
@@ -417,16 +503,17 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 | `firmware/s3eye_imu_idf/main/voice_record.c` | 新增，录音 + 去交错 + 上传 + LED + BOOT 键 |
 | `firmware/s3eye_imu_idf/main/voice_record.h` | 新增，对外接口 |
 | `firmware/s3eye_imu_idf/main/main.c` | 接入 `voice_record` / `voice_status` 远程命令，启动 `voice_record_init()`；收尾新增 `cmd_ack()` 双通道（`printf` + `ack_task` 走 `http_post`）——**已提交 `f76e0cd` 但未烧录** |
-| `server.js` | `/api/voice*` 七个接口 + 阶段状态机 + WAV 校验 + 事件落盘；收尾新增 `sendCommandAndWaitAck()` 等板端 ack |
+| `server.js` | `/api/voice*` 七个接口 + 阶段状态机 + WAV 校验 + 事件落盘；收尾新增 `sendCommandAndWaitAck()` 等板端 ack；2026-10-30 新增 `POST /api/voice/transcribe`（服务端转写，**默认关闭**） |
 | `public/app.js` | 语音页：录音回放、Web Speech 识别、`speechSynthesis` 播报 |
 | `public/index.html` | 语音页 DOM（样式全部复用既有类，未新增 CSS） |
 | `test/voice-test.js` | 新增，104 项接口契约 |
 | `test/voice-hil.js` | 新增，真机端到端（需硬件），含板端回执核对与 45 秒等待预算 |
 | `test/voice-layout-contract-test.js` | 新增，25 项数据布局静态契约 |
 | `test/voice-mic-preflight-test.js` | 新增，24 项识别前麦克风自检契约（2026-10-30） |
+| `test/voice-asr-test.js` | 新增，50 项服务端转写契约（URL 归一化 / 失败分类 / **未启用时零外发**）（2026-10-30） |
 | `test/command-ack-test.js` | 收尾新增，95 项命令 ack 通道契约（accepted/busy/timeout/channel_unavailable/mock） |
 | `test/probe-voice-stop.js` | 新增，真机稳定性探针（需硬件） |
-| `test/run-all.js` | 登记 `voice` / `voice-layout` / `command-ack` 套件，并修正「N 项通过」格式的结果计数 |
+| `test/run-all.js` | 登记 `voice` / `voice-layout` / `voice-mic` / `voice-asr` / `command-ack` 套件，并修正「N 项通过」格式的结果计数 |
 
 ---
 
@@ -442,6 +529,7 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 | ✅ 命令 ack 通道（`command-ack-test.js`，注入真实上行 ack） | ❌ 真机 `busy` 场景（固件 `s_uploading` 期间请求录音） |
 | ✅ 页面交互（浏览器打开就能点） | ❌ BOOT 键是否好使 |
 | ✅ 服务端等 ack 的六种结局（隔离实例注入） | ❌ 纯 WiFi 下的回执上行（固件双通道已改代码但**未烧录**，烧录前纯 WiFi 仍判 timeout） |
+| ✅ 转写接口的失败分类与「未启用零外发」（`voice-asr-test.js`） | ❌ 真实转写（需启用 `asrEnabled` 并产生费用，用户尚未确认；至今零外发） |
 
 真机项必须补验，**不能拿"模拟通过"当实物通过**。
 
@@ -452,6 +540,7 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 | 按键触发 + 本地确认 | 任何"一个动作 + 一个反馈"的交互 |
 | 上传 + 落盘 + 回放 | 任何媒体取证链路 |
 | 浏览器识别 + 播报 | 任何"板端采集、端侧理解"的场景 |
+| 服务端转写降级 + 隐私默认关闭 | 任何"用户录音/照片外发"的功能：默认不发，显式开，关闭时测试要能证明零外发 |
 | 阶段状态机 + 失败可见 | 任何多步骤异步流程 |
 
 ★ 迁移时保留的判据：**没有证据就不许报成功**。这条比代码本身更重要。

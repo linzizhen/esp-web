@@ -50,7 +50,7 @@ NL 功能的测试断言若与 NL 代码分开提交，中间态会红。
 ### 3. 功能完成，合回 develop
 
 ```bash
-npm test                                  # 全量 21 个文件 522 项断言，必须全绿
+npm test                                  # 全量 22 个文件 572 项断言，必须全绿
 git checkout develop
 git merge --no-ff feature/llm-多轮对话     # --no-ff 保留分支拓扑，便于回溯
 git push origin develop
@@ -209,7 +209,7 @@ git blame <file>
 
 - 长期分支：`master`（稳定版）、`develop`（集成）
 - `develop` 领先 `master` 32 个提交，尚未合并发布
-- 测试：`npm test` → 21 个测试文件、522 项断言
+- 测试：`npm test` → 22 个测试文件、572 项断言
 - 只读审计：`npm run audit`
 
 **分支现状说明**：截至 2026-10-26，`develop` 上的 32 个提交都是**直接提交**，
