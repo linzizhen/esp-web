@@ -130,6 +130,7 @@ node test/probe-voice-stop.js 5 2
 ```powershell
 node test/voice-test.js          # 104 项：隔离实例 + 合成 WAV
 node test/voice-layout-contract-test.js   # 25 项：数据布局静态契约
+node test/voice-mic-preflight-test.js     # 24 项：识别前麦克风自检契约
 ```
 
 ---
@@ -358,6 +359,57 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 
 ---
 
+### 修复三：第②步把「本机没麦克风」说成「请到地址栏允许权限」（2026-10-30）
+
+#### 现象
+
+页面第②步报红，横幅写「浏览器拒绝了麦克风权限：…必须在地址栏重新允许麦克风后点「重新识别这段录音」」。
+按这句话去操作永远不会成功。
+
+#### 取证（一步步排除，而不是照着报错文案猜）
+
+| 可能成因 | 实测结果 | 判定 |
+|---|---|---|
+| 站点权限被拒 | Chrome/Edge `Preferences` 里 `media_stream_mic` 例外**为空** | 用户从未做过允许/拒绝决定，排除 |
+| 企业策略禁止 | `HKLM/HKCU\SOFTWARE\Policies\Google\Chrome` 均不存在 | 排除 |
+| 系统隐私策略拦截 | `ConsentStore\microphone` 全局 `Allow`、`NonPackaged = Allow` | 排除 |
+| 非安全上下文（http + 局域网 IP） | Edge 历史 `127.0.0.1:8080` 命中 88 次、`localhost` 63 次 | 走的是安全上下文，排除 |
+| **本机没有录音设备** | `MMDevices\Audio\Capture` 下 12 个录音端点状态**全是 `NOTPRESENT`/`UNPLUGGED`，没有一个 `ACTIVE`**；输出侧才有 `ACTIVE` | **★ 根因** |
+
+旁证：`data/voice/events.ndjson` 里 `recorded` 到 `asr_failed` 只隔 **87 ms** —— 根本没进拾音阶段就失败了，
+符合「设备不存在时 Web Speech API 立刻回 `not-allowed`」的表现。板端录音（312.5 KB / 10 秒）与上传全都正常。
+
+#### 为什么这是代码缺陷而不是硬件问题
+
+硬件缺麦克风是客观限制，改不了；但**把「没有设备」解释成「请去允许权限」是一个永远走不通的指路**，
+用户按提示折腾也解决不了。Web Speech API 对这两种情况报的是同一个 `not-allowed`，页面此前完全被动接收，
+既没有预检设备，也无法区分成因 —— 这才是要修的东西。
+
+#### 修复
+
+1. 新增纯函数 `voiceMicVerdict(devices)`：按 `kind === 'audioinput'` 数录音设备（Chrome 未授权时隐藏 `label`，
+   但 `kind` 一定会给，所以只能按 `kind` 判），零设备时返回 `error: 'no_input_device'` + 准确中文原因。
+2. 新增 `voiceProbeMic()`：识别**之前**调 `navigator.mediaDevices.enumerateDevices()` 自检；
+   拿不到设备列表（旧浏览器 / 抛错）时**不阻断**，交回 Web Speech API 自己报错 —— 宁可少一层判断，
+   也不要在本来能用的机器上误拦。
+3. `voiceStartChain()` 在第②步之前插入自检：零设备就**直接返回、不播放录音**，把
+   `stage: 'asr_failed'` + 准确 reason 上报服务端，四段状态里第②段写明「未识别（本机没有录音设备）」。
+4. 改文案：`VOICE_ASR_ERROR_TEXT['not-allowed']` 与 `VOICE_FAIL_KIND.asr_failed.desc` 都改为
+   **两种成因并列**（没接设备 → 插耳麦；已接设备 → 允许权限），并都保留「文字输入」兜底。
+
+#### 防回归
+
+`test/voice-mic-preflight-test.js`（24 项）：静态契约 + 把 `voiceMicVerdict` 抠出来直接求值跑三组入参
+（只有输出设备 / 有设备但 label 为空 / `null`·`undefined`·`[]` 不抛异常），再守「自检确实在识别之前」
+「零设备分支确实上报 `stage: 'asr_failed'` 且带 reason」「两句文案都同时覆盖两种成因」。
+
+#### 仍未解决的部分（如实标注）
+
+**本机仍然没有麦克风。** 这次修复只让失败原因变准确、把用户导向可执行的动作，并没有让第②步在这台机器上跑通。
+要走完整条链路，必须插一个麦克风/耳麦（或改用文字入口，任务照样能完成）。
+
+---
+
 ## 六、文件改动清单
 
 | 文件 | 改动 |
@@ -371,6 +423,7 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 | `test/voice-test.js` | 新增，104 项接口契约 |
 | `test/voice-hil.js` | 新增，真机端到端（需硬件），含板端回执核对与 45 秒等待预算 |
 | `test/voice-layout-contract-test.js` | 新增，25 项数据布局静态契约 |
+| `test/voice-mic-preflight-test.js` | 新增，24 项识别前麦克风自检契约（2026-10-30） |
 | `test/command-ack-test.js` | 收尾新增，95 项命令 ack 通道契约（accepted/busy/timeout/channel_unavailable/mock） |
 | `test/probe-voice-stop.js` | 新增，真机稳定性探针（需硬件） |
 | `test/run-all.js` | 登记 `voice` / `voice-layout` / `command-ack` 套件，并修正「N 项通过」格式的结果计数 |
@@ -385,6 +438,7 @@ want -= want % (2 * VOICE_I2S_SLOTS);   /* 防止一帧被劈成两半导致去�
 |--------|---------|
 | ✅ 接口契约（`voice-test.js`） | ❌ 板子真的能录到声音 |
 | ✅ 数据布局（`voice-layout-contract-test.js`） | ❌ 麦克风接线是否正确 |
+| ✅ 麦克风自检分支（`voice-mic-preflight-test.js`，无设备/有设备两路） | ❌ 真机麦克风是否真能拾到扬声器声音 |
 | ✅ 命令 ack 通道（`command-ack-test.js`，注入真实上行 ack） | ❌ 真机 `busy` 场景（固件 `s_uploading` 期间请求录音） |
 | ✅ 页面交互（浏览器打开就能点） | ❌ BOOT 键是否好使 |
 | ✅ 服务端等 ack 的六种结局（隔离实例注入） | ❌ 纯 WiFi 下的回执上行（固件双通道已改代码但**未烧录**，烧录前纯 WiFi 仍判 timeout） |

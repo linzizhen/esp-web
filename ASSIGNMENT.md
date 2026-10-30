@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（20 个测试文件、498 项断言，全部通过）
+## 7. 自检脚本（21 个测试文件、522 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -347,6 +347,7 @@ node test/nl-config-test.js   # 44 项  第 4 周 LLM 配置增删改查与降�
 node test/handleline-guard-test.js  # 23 项  空帧守卫：只含元数据的帧不落盘（8091）
 node test/voice-test.js       # 104 项 第 5 周语音链路接口契约（8090）
 node test/voice-layout-contract-test.js  # 25 项  第 5 周 WAV 数据布局静态契约
+node test/voice-mic-preflight-test.js    # 24 项  第 5 周识别前麦克风自检（零设备不得说成"权限被拒"）
 node test/command-ack-test.js # 95 项  命令 ack 通道：accepted/busy/timeout/error/channel_unavailable/mock
 ```
 

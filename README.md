@@ -169,6 +169,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── handleline-guard-test.js # 空帧守卫：只含元数据的帧不落盘（隔离端口 8091）
     ├── voice-test.js         # 第 5 周：语音链路接口契约 + 合成 WAV（隔离端口 8090）
     ├── voice-layout-contract-test.js # 第 5 周：WAV 数据布局静态契约（去交错）
+    ├── voice-mic-preflight-test.js   # 第 5 周：识别前麦克风自检（无录音设备须如实说明，不得说成"权限被拒"）
     ├── command-ack-test.js   # 第 5 周：命令下发与板端 ack 的区分（accepted/busy/timeout/channel_unavailable/mock，端口 8090-8099 内自选空闲）
     ├── voice-hil.js          # 第 5 周：真机端到端，录音 → 上传 → 独立复核电平（需硬件）
     ├── probe-voice-stop.js   # 第 5 周：真机探针，连续多轮 start/stop 稳定性（需硬件）
@@ -593,7 +594,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **20 个测试文件、498 项断言**，一条命令：
+全套 **21 个测试文件、522 项断言**，一条命令：
 
 ```bash
 npm test
@@ -617,7 +618,7 @@ node test/run-all.js e2e   # 只跑端到端
 node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在发什么（调试用，不算断言）
 ```
 
-> 分组脚本只跑一部分；要跑全部 20 个文件请用 `npm test`（= `node test/run-all.js`）。
+> 分组脚本只跑一部分；要跑全部 21 个文件请用 `npm test`（= `node test/run-all.js`）。
 
 需真实开发板在线、**不在**编排器内，手动跑：
 
