@@ -49,6 +49,7 @@ const els = {
   camView: $('camView'), camPlaceholder: $('camPlaceholder'), camTag: $('camTag'),
   camStats: $('camStats'), camNote: $('camNote'),
   btnCamStart: $('btnCamStart'), btnCamStop: $('btnCamStop'), btnCamShot: $('btnCamShot'),
+  btnCamRetry: $('btnCamRetry'),
   camShot: $('camShot'), camShotTag: $('camShotTag'), camShotPlaceholder: $('camShotPlaceholder'),
   camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
@@ -1144,11 +1145,35 @@ async function helpAction(action) {
 
 // ---------------------------------------------------------------- 摄像头（OV2640）
 const CAM = { streaming: false, hasFrame: false, frames: 0, seq: 0, size: null, bytes: 0, viewers: 0,
-              hasSnapshot: false, snapshotAt: 0, snapshotSize: null, snapshotBytes: 0, timer: null };
+              hasSnapshot: false, snapshotAt: 0, snapshotSize: null, snapshotBytes: 0, timer: null,
+              /* 板端自报「摄像头不可用」时的原文（例如 'no_camera 0x105'）。
+               * 有值就说明不是网络问题，而是 esp_camera_init 没成功。 */
+              camError: null, boardAck: null };
+
+/* 把固件回执翻成人话。errno 对照见
+ * firmware/s3eye_imu_idf/main/cam_stream.c 文件头注释。 */
+function camErrorText(raw) {
+  if (!raw) return '';
+  const m = /0x([0-9a-f]+)/i.exec(raw);
+  const code = m ? parseInt(m[1], 16) : null;
+  const known = {
+    0x101: 'ESP_FAIL（通用失败）',
+    0x102: 'ESP_ERR_NO_MEM（内存不足，常见原因是 PSRAM 未开启）',
+    0x103: 'ESP_ERR_INVALID_ARG（参数不被接受）',
+    0x104: 'ESP_ERR_INVALID_STATE（状态非法，通常是此前初始化已失败）',
+    0x105: 'ESP_ERR_INVALID_SIZE（帧缓冲尺寸不符，检查 JPEG 缓冲配置）',
+    0x106: 'ESP_ERR_NOT_FOUND（找不到设备，SCCB 上没有应答 → 查排线/供电）',
+    0x107: 'ESP_ERR_NOT_SUPPORTED（sensor 不支持该配置）',
+    0x108: 'ESP_ERR_TIMEOUT（超时，SCCB 无应答或总线被占）',
+  };
+  const why = code != null && known[code] ? known[code] : null;
+  return why ? `${raw} —— ${why}` : raw;
+}
 
 async function camControl(action) {
   if (!els.camNote) return;
-  els.camNote.textContent = action === 'start' ? '正在下发「开启画面」命令…' : '正在下发「停止」命令…';
+  els.camNote.textContent = action === 'retry' ? '正在让板端重试初始化摄像头…'
+    : action === 'start' ? '正在下发「开启画面」命令…' : '正在下发「停止」命令…';
   try {
     /* 参数由固件默认值决定，前端不传 —— 用户点一次即可，无需理解取舍。 */
     const d = await (await fetch('/api/cam', {
@@ -1156,11 +1181,22 @@ async function camControl(action) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action }),
     })).json();
-    els.camNote.textContent = d.ok
-      ? (action === 'start'
-          ? `命令已送达板端，等待第一帧…（320x240 · 画质 ${CAM_LIVE_QUALITY} · 目标 ${CAM_LIVE_FPS} 帧/秒）`
-          : '已下发停止命令。')
-      : '⚠ ' + (d.note || '命令通道不可用，板端不会开始推流。');
+    /* 现在服务端会等板端回执（不再把「写进串口」当成功），
+     * 所以这里可以直接按板子的真实态度说话。 */
+    const ack = d.ack_status || null;
+    if (d.ok) {
+      els.camNote.textContent = action === 'start'
+        ? `板端已确认开启，等待第一帧…（320x240 · 画质 ${CAM_LIVE_QUALITY} · 目标 ${CAM_LIVE_FPS} 帧/秒）`
+        : action === 'retry'
+          ? '板端重试初始化成功（回执 ' + (ack || 'cam_init_ok') + '），现在可以点「开启实时画面」。'
+          : '板端已确认停止推流。';
+    } else if (ack && /^no_camera/i.test(ack)) {
+      els.camNote.textContent = '⚠ 板端报告摄像头不可用：' + camErrorText(ack) +
+        '。这不是网络问题 —— 请检查摄像头排线是否插紧、PSRAM 是否开启、SCCB 是否与 IMU 共用总线，' +
+        '然后再点「重试初始化摄像头」。';
+    } else {
+      els.camNote.textContent = '⚠ ' + (d.note || '命令未送达板端（串口未打开、板端也未在轮询）。');
+    }
     await loadCam();
   } catch (e) {
     els.camNote.textContent = '下发失败：' + e.message;
@@ -1181,6 +1217,8 @@ async function loadCam() {
     CAM.snapshotAt    = d.snapshotAt || 0;
     CAM.snapshotSize  = d.snapshotSize || null;
     CAM.snapshotBytes = d.snapshotBytes || 0;
+    CAM.camError      = d.camError || null;
+    CAM.boardAck      = d.boardAck || null;
     renderCam();
     resolveShotPending();
   } catch (_) { /* 网络抖动忽略 */ }
@@ -1220,12 +1258,15 @@ function resolveShotPending() {
 function renderCam() {
   if (!els.camTag) return;
   const live = CAM.streaming && CAM.hasFrame;
+  /* 板端自己说摄像头不可用（esp_camera_init 失败）时，这三种状态词都是谎话，
+   * 必须直接说「板端无摄像头」并给出 errno。 */
+  const broken = !!CAM.camError;
 
-  els.camTag.textContent = live ? '实时' : (CAM.streaming ? '等待首帧' : '未开启');
-  els.camTag.className   = 'tag' + (live ? ' tag-ok' : (CAM.streaming ? ' tag-warn' : ''));
+  els.camTag.textContent = broken ? '板端无摄像头' : (live ? '实时' : (CAM.streaming ? '等待首帧' : '未开启'));
+  els.camTag.className   = 'tag' + (broken ? ' tag-err' : (live ? ' tag-ok' : (CAM.streaming ? ' tag-warn' : '')));
 
   if (els.camView) {
-    if (live) {
+    if (live && !broken) {
       // MJPEG：浏览器原生支持 multipart/x-mixed-replace，一个 <img> 就能看直播
       if (els.camView.getAttribute('src') !== '/api/cam.mjpg') els.camView.setAttribute('src', '/api/cam.mjpg');
       els.camView.classList.remove('hidden');
@@ -1233,11 +1274,24 @@ function renderCam() {
     } else {
       if (els.camView.getAttribute('src')) els.camView.removeAttribute('src');  // 断开 MJPEG 连接
       els.camView.classList.add('hidden');
-      if (els.camPlaceholder) els.camPlaceholder.classList.remove('hidden');
+      if (els.camPlaceholder) {
+        els.camPlaceholder.classList.remove('hidden');
+        if (broken) {
+          els.camPlaceholder.textContent =
+            '摄像头没能初始化：' + camErrorText(CAM.camError) +
+            '。请检查排线是否插紧、PSRAM 是否开启、SCCB 是否与 IMU 共用总线，然后点「重试初始化摄像头」。';
+        } else {
+          els.camPlaceholder.textContent =
+            '点下方「开启实时画面」，开发板开始推送 OV2640 采集的 JPEG 帧';
+        }
+      }
     }
   }
 
-  if (els.btnCamStart) els.btnCamStart.disabled = CAM.streaming;
+  // 「重试初始化摄像头」只在板端报告不可用时出现
+  if (els.btnCamRetry) els.btnCamRetry.classList.toggle('hidden', !broken);
+
+  if (els.btnCamStart) els.btnCamStart.disabled = CAM.streaming || broken;
   if (els.btnCamStop)  els.btnCamStop.disabled  = !CAM.streaming;
 
   // 抓拍快照：与直播流分开展示（带时间戳参数，避免浏览器缓存旧图）
@@ -1278,6 +1332,7 @@ function renderCam() {
 
 if (els.btnCamStart) els.btnCamStart.onclick = () => camControl('start');
 if (els.btnCamStop)  els.btnCamStop.onclick  = () => camControl('stop');
+if (els.btnCamRetry) els.btnCamRetry.onclick = () => camControl('retry');
 if (els.btnCamShot) els.btnCamShot.onclick = async () => {
   if (camShotPending) return;                 // 防重复点击
   camShotBaseline = CAM.snapshotAt || 0;

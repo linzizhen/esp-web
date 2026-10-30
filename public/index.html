@@ -286,6 +286,8 @@
             <button id="btnCamStart" class="btn btn-primary">开启实时画面</button>
             <button id="btnCamStop"  class="btn btn-ghost" disabled>停止</button>
             <button id="btnCamShot"  class="btn btn-ghost">抓拍一帧</button>
+            <!-- 板端报告摄像头不可用时才显示：让用户知道是硬件/初始化问题，而不是网络问题 -->
+            <button id="btnCamRetry" class="btn btn-ghost hidden">重试初始化摄像头</button>
           </div>
           <!-- 摄像头参数固定为实测最优点，不再让用户选择。
                实测（2026-10-15，WiFi 上行）：分辨率/画质/帧率争夺同一条链路带宽
@@ -607,6 +609,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=34"></script>
+<script src="/app.js?v=35"></script>
 </body>
 </html>

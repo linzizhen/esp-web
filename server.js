@@ -2674,7 +2674,35 @@ const cam = {
   snapshotAt: 0,
   snapshotSize: null,
   snapshotBytes: 0,
+  /* 板端对摄像头命令的真实回执（2026-10-30 新增）。
+   * 存在理由：此前 /api/cam 只看「命令有没有写进串口」，板子明明回
+   * status:"no_camera"（esp_camera_init 上电失败），网页却显示「正在直播」，
+   * 用户只能看黑屏干等。现在把板端回的 ack 记下来并原样透出。 */
+  lastAck: null,     // { status, at, request_id }
+  error: null,       // 例如 'no_camera 0x105'；板端确认可用后清空
 };
+
+/* 记录摄像头类回执。只有摄像头相关的 status 才进这里，
+ * 避免把采集/语音的 ack 混进摄像头状态。 */
+function noteCamAck(status, requestId) {
+  if (!status || typeof status !== 'string') return;
+  const s = status.trim();
+  const isCam = /^(cam_on|cam_off|cam_init_ok|no_camera|shot)\b/i.test(s) ||
+    /^QVGA|^CIF|^VGA|^SVGA|^XGA|^HD|^SXGA|^UXGA/i.test(s);   // cam_set 成功时回的是分辨率名
+  if (!isCam) return;
+  cam.lastAck = { status: s, at: Date.now(), request_id: requestId || null };
+  if (/^no_camera/i.test(s)) {
+    cam.error = s;                 // 保留 errno 原文，供页面显示
+    state.camStreaming = false;    // 板端没有摄像头，就不可能正在直播
+  } else if (/^cam_on\b/i.test(s)) {
+    cam.error = null;
+    state.camStreaming = true;
+  } else if (/^cam_off\b/i.test(s)) {
+    state.camStreaming = false;
+  } else if (/^cam_init_ok\b/i.test(s)) {
+    cam.error = null;              // 重试成功
+  }
+}
 
 /* 从 JPEG 字节流里解析真实宽高（SOF0/1/2 段）。
  * 为什么要这么做：实测板端 set_framesize(QVGA) 后 sensor->status 仍报 320x240，
@@ -2804,6 +2832,10 @@ function handleLine(line, source) {
            * 在这里读会踩 TDZ（ReferenceError）。故就地取值。 */
           settlePendingAck(obj.request_id, obj.status, obj.seq,
             (source && source.transport) || state.transport || 'serial');
+          /* 摄像头类回执单独记一份：/api/cam 要能回答「板端到底能不能出图」。
+           * 与上面的等待槽互不影响 —— 等待槽只管「命令有没有被接受」，
+           * 这里管的是「摄像头到底能不能用」。 */
+          noteCamAck(obj.status, obj.request_id);
           return;
         }
         // 教学求助事件（第 3 周）：板端按键/取消，单独处理，不当作传感数据
@@ -3500,6 +3532,11 @@ async function handleRequest(req, res) {
       bytes: cam.latest ? cam.latest.length : 0,
       viewers: cam.clients.size,
       streaming: !!state.camStreaming,
+      /* 板端真实态度（2026-10-30）：camError 有值就说明板子自己说了不能用
+       * （例如 esp_camera_init 上电失败回 'no_camera 0x105'）。前端据此
+       * 显示原因 + 「重试初始化摄像头」按钮，而不是让用户对着黑屏等。 */
+      camError: cam.error || null,
+      boardAck: cam.lastAck || null,
       // 手动抓拍快照
       hasSnapshot: cam.snapshot != null,
       snapshotAt: cam.snapshotAt || null,
@@ -3524,7 +3561,8 @@ async function handleRequest(req, res) {
   if (p === '/api/cam' && req.method === 'POST') {
     const body = await readJsonBody(req);
 
-    const action = (body.action === 'stop' || body.action === 'set' || body.action === 'shot')
+    const action = (body.action === 'stop' || body.action === 'set' || body.action === 'shot' ||
+                    body.action === 'retry')
       ? body.action : 'start';
     let cmdObj;
     if (action === 'set' || action === 'shot') {
@@ -3532,19 +3570,44 @@ async function handleRequest(req, res) {
       if (body.framesize != null) cmdObj.framesize = Number(body.framesize);
       if (body.quality   != null) cmdObj.quality   = Number(body.quality);
       if (action === 'set' && body.fps != null) cmdObj.fps = Number(body.fps);
+    } else if (action === 'retry') {
+      cmdObj = { cmd: 'cam_retry' };
     } else {
       cmdObj = { cmd: action === 'start' ? 'cam_on' : 'cam_off' };
     }
 
-    const ok = sendCommand(cmdObj, state.deviceId || null);
-    if (ok && (action === 'start' || action === 'stop')) state.camStreaming = (action === 'start');
+    /* ★ 2026-10-30 修「下发 ≠ 已接受」在摄像头上的同型残留。
+     * 原来用 sendCommand()：只要写进串口就 ok=true，并把 state.camStreaming
+     * 置 true。实测板端同时回 status:"no_camera"（摄像头初始化失败），
+     * 网页却显示「正在直播」，用户只能看黑屏等到超时。
+     * 现在等板端回执，把真实结局透出去。 */
+    cmdObj.request_id = newRequestId();
+    const r = await sendCommandAndWaitAck(cmdObj, state.deviceId || null);
+    const ackStatus = r.ack_status || null;
+    const boardRejected = !!ackStatus && /^no_camera/i.test(ackStatus);
+    const ok = !!r.dispatched && !!r.accepted && !boardRejected;
+
+    // streaming 只反映「板端确认可用且已开启」，不再由服务端自己假设
+    if (action === 'start') state.camStreaming = ok;
+    else if (action === 'stop') state.camStreaming = ok ? false : state.camStreaming;
+
     pushStatus('cam');
     return json(res, 200, {
       ok,
       action,
       streaming: !!state.camStreaming,
       sent: cmdObj,
-      note: ok ? null : (config.mockDevice ? '模拟模式：未走真实通道' : '命令通道不可用（串口未打开、板端也未在轮询）'),
+      /* 板端真实回执原文（可能是 'cam_on' / 'no_camera 0x105' / 'QVGA q12 fps10'） */
+      ack_status: ackStatus,
+      ack_channel: r.ack_channel || null,
+      outcome: r.outcome || null,
+      channel: r.channel || null,
+      waited_ms: r.waited_ms != null ? r.waited_ms : null,
+      camError: cam.error || null,
+      note: ok ? null
+        : boardRejected ? `板端报告摄像头不可用（${ackStatus}）：esp_camera_init 未成功，检查排线 / PSRAM / SCCB 与 IMU 共用总线后点「重试初始化摄像头」`
+        : (r.message || (config.mockDevice ? '模拟模式：未走真实通道'
+          : '命令通道不可用（串口未打开、板端也未在轮询）')),
     });
   }
 

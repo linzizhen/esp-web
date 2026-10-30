@@ -387,6 +387,8 @@ body {
 .tag-ok { background: var(--ok-wash); color: var(--ok); }
 .tag-warn { background: var(--warn-wash); color: var(--warn); }
 .tag-sim { background: var(--bad-wash); color: var(--bad); }
+/* 板端自报不可用（如摄像头初始化失败）——与「待开启」要一眼分得开 */
+.tag-err { background: var(--bad-wash); color: var(--bad); border: 1px solid var(--bad-line); }
 
 .hint {
   margin: var(--s3) 0 0; font-size: 12px; line-height: 1.75; color: var(--dim);
