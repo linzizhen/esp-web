@@ -36,6 +36,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* 长按阈值：按住 ≥ 2 秒才开始录音（2026-11-02 用户需求）。
+ *
+ * 原来的语义是「按下瞬间就 toggle」——手一抖、或戴在身上碰到键就开始录，
+ * 结束还要再按一次才发现录了段噪音。改为长按后：
+ *   · 按住 ≥ VOICE_LONGPRESS_MS  → 开始录音（松手后继续录）
+ *   · 不足阈值就松开             → 什么都不做，只打一行日志
+ *   · 录音进行中任意按一次       → 立即结束并上传（这一条不等 2 秒）
+ * 网页按钮与远程命令 voice_record 仍是「点一次即切换」，语义不变。 */
+#define VOICE_LONGPRESS_MS 2000
+
 /* LED 指示档位：main.c 的 ui_task 据此驱动已有 led_ 接口。
  * 串口日志只有坐在电脑旁的人能看到；用户按键瞬间必须先看 LED。 */
 typedef enum {
@@ -50,8 +60,16 @@ typedef enum {
  * 任一环节失败都会 ESP_LOGE 并降级，其它功能（上报/求助/摄像头）不受影响。 */
 void voice_record_init(void);
 
-/* 按键语义：非录音中 → 开始；录音中 → 结束并上传。返回是否被接受。 */
+/* 按键语义：非录音中 → 开始；录音中 → 结束并上传。返回是否被接受。
+ * ★ 仅供「网页按钮 / 远程命令」这类明确的一次性动作使用。
+ *   实体按键走「长按」语义，用下面三个细分接口，不要用这个 toggle。 */
 bool voice_record_toggle(void);
+
+/* 只开始录音（长按到达阈值时调用）。已在录音 / 正在上传时返回 false。 */
+bool voice_record_start(void);
+
+/* 只结束录音并上传（录音中按键时调用）。没在录音返回 false。 */
+bool voice_record_stop(void);
 
 /* 当前应显示的 LED 档位（线程安全，只读）。 */
 voice_led_t voice_record_led(void);

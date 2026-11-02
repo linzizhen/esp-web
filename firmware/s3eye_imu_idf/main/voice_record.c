@@ -531,14 +531,27 @@ static void voice_task(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
-/* 按键任务：BOOT 键（GPIO0，按下=低）轮询 + 去抖 + 边沿触发           */
+/* 按键任务：BOOT 键（GPIO0，按下=低）轮询 + 去抖 + 长按判定          */
 /* ------------------------------------------------------------------ */
+/* ★ 2026-11-02 语义变更（用户需求）：长按 2 秒才开始录音。
+ *
+ * 原实现是「按下瞬间 voice_record_toggle()」，等于手一抖就开始录 —— 戴在身上
+ * 走路碰到键、放桌上被线扯到，都会录一段噪音，还要再按一次才发现。
+ * 现在：
+ *   · 按下时若【正在录音】→ 立即结束并上传（这一条不等阈值，按下即停）；
+ *   · 否则开始计时，按住到 VOICE_LONGPRESS_MS 才调 voice_record_start()；
+ *   · 不到阈值就松开 → 只打一行「短按…不录音」，不做任何动作。
+ *
+ * 计时必须放在「按住期间」，不能在按下那一瞬间判断 —— 按下那一刻耗时是 0 ms，
+ * 写成立刻判断的话永远触发不了（这是长按类实现最常见的错法）。 */
 static void voice_btn_task(void *arg)
 {
     (void)arg;
     bool stable = false;    /* 去抖后的状态：true = 按下 */
     bool cand   = false;
     int  same   = 0;
+    int64_t down_us  = 0;   /* 本次按下的时刻 */
+    bool    handled  = false; /* 本次按下是否已被消费（停止录音 / 长按已触发） */
 
     while (1) {
         int level = gpio_get_level(VOICE_BTN_GPIO);
@@ -555,10 +568,35 @@ static void voice_btn_task(void *arg)
             stable = cand;
             s_btn_down = stable;
             if (stable) {
+                down_us = esp_timer_get_time();
+                handled = false;
                 ESP_LOGI(TAG, "BOOT 键按下（GPIO%d）", (int)VOICE_BTN_GPIO);
-                voice_record_toggle();
+                /* 录音中：按下即结束，不参与长按计时 */
+                if (voice_record_is_recording()) {
+                    handled = true;
+                    voice_record_stop();
+                }
             } else {
+                if (!handled && !voice_record_is_recording()) {
+                    int64_t ms = (esp_timer_get_time() - down_us) / 1000;
+                    if (ms < VOICE_LONGPRESS_MS) {
+                        ESP_LOGI(TAG, "BOOT 键短按 %lldms，不录音（请按住 %dms 以上开始）",
+                                 (long long)ms, VOICE_LONGPRESS_MS);
+                    }
+                }
                 ESP_LOGI(TAG, "BOOT 键松开");
+            }
+        }
+
+        /* 按住期间到阈值 → 开始录音（只触发一次） */
+        if (stable && !handled) {
+            int64_t ms = (esp_timer_get_time() - down_us) / 1000;
+            if (ms >= VOICE_LONGPRESS_MS) {
+                handled = true;
+                if (voice_record_start()) {
+                    ESP_LOGI(TAG, "长按 %lldms ≥ %dms：开始录音（再按一次结束）",
+                             (long long)ms, VOICE_LONGPRESS_MS);
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(25));
@@ -589,6 +627,36 @@ bool voice_record_toggle(void)
         return false;
     }
     ESP_LOGI(TAG, "按键：开始录音");
+    return true;
+}
+
+/* 只开始：长按到达阈值时用。语义与 toggle 的「开始」半边完全一致，
+ * 分开只是为了不让实体按键在按下瞬间就切换状态。 */
+bool voice_record_start(void)
+{
+    if (s_uploading) {
+        ESP_LOGW(TAG, "正在上传上次录音，本次长按忽略");
+        return false;
+    }
+    if (s_recording) return false;      /* 已经在录，长按不再叠加 */
+    if (!s_q) {
+        ESP_LOGE(TAG, "语音模块未初始化（s_q 为空）");
+        return false;
+    }
+    vc_msg_t m = VC_START;
+    if (xQueueSend(s_q, &m, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "语音任务忙，本次长按忽略");
+        return false;
+    }
+    return true;
+}
+
+/* 只结束：录音中按键时用（不等长按阈值）。 */
+bool voice_record_stop(void)
+{
+    if (!s_recording) return false;
+    s_stop_req = true;
+    ESP_LOGI(TAG, "按键：结束录音并上传");
     return true;
 }
 

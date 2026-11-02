@@ -806,6 +806,12 @@ static void btn_task(void *arg)
     bool debounced = false, cand = false;
     int same = 0;
     int64_t last_dbg = 0;
+    /* ★ 2026-11-02：这几颗 ADC 键除求助键外，都支持「长按 2 秒开始录音」。
+     *   按下瞬间不能动作（否则碰到就录），要在按住期间计时到 VOICE_LONGPRESS_MS；
+     *   录音进行中则相反——按下立即结束，不等阈值。 */
+    int     pressed_idx = -1;   /* 本次按下归类到的键下标，-1 = 无 */
+    int64_t down_us     = 0;    /* 本次按下的时刻 */
+    bool    handled     = false;/* 本次按下是否已被消费（求助 / 停止 / 长按已触发） */
     while (1) {
         int v = 0;
         if (adc_oneshot_read(s_adc, BTN_ADC_CH, &v) != ESP_OK) {
@@ -821,11 +827,44 @@ static void btn_task(void *arg)
         if (same >= 3 && cand != debounced) {
             debounced = cand;
             if (debounced) {
+                pressed_idx = idx;
+                down_us = esp_timer_get_time();
+                handled = false;
                 if (s_key_adc[idx] == HELP_KEY_ADC) {
                     on_button_press(v);
+                    handled = true;             /* 求助键不参与录音 */
+                } else if (voice_record_is_recording()) {
+                    /* 录音中：按下立即结束，不等 2 秒 */
+                    handled = true;
+                    ESP_LOGI(TAG, "按键 K%d(raw=%d)：结束录音", idx, v);
+                    voice_record_stop();
                 } else {
-                    ESP_LOGI(TAG, "按键 K%d(raw=%d) 未绑定动作（求助键是 K%d raw=%d）",
-                             idx, v, help_key_index(), HELP_KEY_ADC);
+                    ESP_LOGI(TAG, "按键 K%d(raw=%d)：按住 %dms 开始录音（求助键是 K%d raw=%d）",
+                             idx, v, VOICE_LONGPRESS_MS, help_key_index(), HELP_KEY_ADC);
+                }
+            } else {
+                if (!handled && pressed_idx >= 0
+                    && s_key_adc[pressed_idx] != HELP_KEY_ADC
+                    && !voice_record_is_recording()) {
+                    int64_t ms = (esp_timer_get_time() - down_us) / 1000;
+                    if (ms < VOICE_LONGPRESS_MS) {
+                        ESP_LOGI(TAG, "按键 K%d 短按 %lldms，不录音（请按住 %dms 以上）",
+                                 pressed_idx, (long long)ms, VOICE_LONGPRESS_MS);
+                    }
+                }
+                pressed_idx = -1;
+            }
+        }
+
+        /* 按住期间到阈值 → 开始录音（只触发一次） */
+        if (debounced && !handled && pressed_idx >= 0
+            && s_key_adc[pressed_idx] != HELP_KEY_ADC) {
+            int64_t ms = (esp_timer_get_time() - down_us) / 1000;
+            if (ms >= VOICE_LONGPRESS_MS) {
+                handled = true;
+                if (voice_record_start()) {
+                    ESP_LOGI(TAG, "按键 K%d 长按 %lldms ≥ %dms：开始录音（再按一次结束）",
+                             pressed_idx, (long long)ms, VOICE_LONGPRESS_MS);
                 }
             }
         }
