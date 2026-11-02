@@ -144,6 +144,7 @@ node test/probe-voice-stop.js 5 2
 ```powershell
 node test/voice-test.js          # 104 项：隔离实例 + 合成 WAV
 node test/voice-layout-contract-test.js   # 25 项：数据布局静态契约
+node test/voice-longpress-test.js         # 26 项：长按 2 秒录音的按键语义契约
 node test/voice-mic-preflight-test.js     # 24 项：识别前麦克风自检契约
 ```
 
@@ -509,11 +510,12 @@ Web Speech API 的设计前提是"麦克风实时拾音"，**没有任何接口�
 | `test/voice-test.js` | 新增，104 项接口契约 |
 | `test/voice-hil.js` | 新增，真机端到端（需硬件），含板端回执核对与 45 秒等待预算 |
 | `test/voice-layout-contract-test.js` | 新增，25 项数据布局静态契约 |
+| `test/voice-longpress-test.js` | 新增，26 项按键语义契约：**按下不录、短按松手不录、录音中按键立即停**（2026-11-02） |
 | `test/voice-mic-preflight-test.js` | 新增，24 项识别前麦克风自检契约（2026-10-30） |
 | `test/voice-asr-test.js` | 新增，50 项服务端转写契约（URL 归一化 / 失败分类 / **未启用时零外发**）（2026-10-30） |
 | `test/command-ack-test.js` | 收尾新增，95 项命令 ack 通道契约（accepted/busy/timeout/channel_unavailable/mock） |
 | `test/probe-voice-stop.js` | 新增，真机稳定性探针（需硬件） |
-| `test/run-all.js` | 登记 `voice` / `voice-layout` / `voice-mic` / `voice-asr` / `command-ack` 套件，并修正「N 项通过」格式的结果计数 |
+| `test/run-all.js` | 登记 `voice` / `voice-layout` / `voice-longpress` / `voice-mic` / `voice-asr` / `command-ack` 套件，并修正「N 项通过」格式的结果计数 |
 
 ---
 

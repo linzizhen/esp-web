@@ -170,6 +170,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── handleline-guard-test.js # 空帧守卫：只含元数据的帧不落盘（隔离端口 8091）
     ├── voice-test.js         # 第 5 周：语音链路接口契约 + 合成 WAV（隔离端口 8090）
     ├── voice-layout-contract-test.js # 第 5 周：WAV 数据布局静态契约（去交错）
+    ├── voice-longpress-test.js # 第 5 周：长按 2 秒录音的静态契约（按下不录、短按松手不录、录音中按键即停）
     ├── voice-mic-preflight-test.js   # 第 5 周：识别前麦克风自检（无录音设备须如实说明，不得说成"权限被拒"）
     ├── voice-asr-test.js     # 第 5 周：服务端转写接口（URL 归一化/失败分类/未启用时零外发）
     ├── command-ack-test.js   # 第 5 周：命令下发与板端 ack 的区分（accepted/busy/timeout/channel_unavailable/mock，端口 8090-8099 内自选空闲）
@@ -596,7 +597,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **23 个测试文件、600 项断言**，一条命令：
+全套 **24 个测试文件、626 项断言**，一条命令：
 
 ```bash
 npm test
