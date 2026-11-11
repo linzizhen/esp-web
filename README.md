@@ -597,7 +597,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **24 个测试文件、626 项断言**，一条命令：
+全套 **24 个测试文件、634 项断言**，一条命令：
 
 ```bash
 npm test
