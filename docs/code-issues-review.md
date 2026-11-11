@@ -23,7 +23,7 @@
 | 8 | P2 命令下发 ≠ 板端已接受（第 5 周发现） | **服务端侧已修复（串口模式生效），固件侧双通道待烧录验证** | `sendCommand()` 只把字节写进串口就算成功，`/api/voice/record` 直接把 `ok` 当 `accepted` 返回；板端 `voice_record.c:571` 的 `if (s_uploading) return false;` 会让 `main.c:1377-1388` 回 `cmd_ack(rid,"busy")`，命令实际被丢弃而服务端仍报 `accepted=true`。现改为按 `request_id` 等板端 ack 再定论（`sendCommandAndWaitAck()`，默认超时 1800 ms），区分 `accepted`/`busy`/`error`/`timeout`/`channel_unavailable`/`mock`；`command-ack-test.js` 95 项断言覆盖。⚠ **但回执上行原本只有串口一条路**：固件侧双通道（`printf` + `ack_task` 走 `http_post`）代码已提交 `f76e0cd`、编译零警告，**尚未烧录**；烧录前纯 WiFi 部署每条命令仍判 `timeout` |
 
 > 报告原文提到的「145 项测试全过」是当时（2026-10-08）的实际数字。当前为
-> **24 个测试文件、626 项断言**（入口 `npm test`）。
+> **24 个测试文件、634 项断言**（入口 `npm test`）。
 
 ---
 
@@ -237,7 +237,7 @@
 2026-10-29 的取证把它的触发条件（链路 RTT）与量级（1.38–9.26 fps 摆动）都定量标定了出来，
 修复方案 A/B 尚未实施（需烧录）。
 
-代码整体质量良好：固件编译零警告，**24 个测试文件、626 项断言全过**。
+代码整体质量良好：固件编译零警告，**24 个测试文件、634 项断言全过**。
 
 ---
 
@@ -256,11 +256,22 @@
   **0x106 = SCCB/I2C 上找不到 sensor（OV2640 没应答）** —— 属排线未插紧 / 模组未接 / 供电缺失，
   不是 PSRAM 未开启、不是 SCCB 与 IMU 总线冲突、也不是引脚写错（引脚配置见
   `firmware/s3eye_imu_idf/main/cam_stream.c:18-34`，与 2026-10-15 能正常出图时完全一致）。
+
+  > **更正（2026-11-11）**：上面这句把 0x106 说成 `ESP_ERR_NOT_FOUND` 是**错的**。
+  > 按 `esp-idf-v5.4.4/components/esp_common/include/esp_err.h:25-32`，
+  > `ESP_ERR_NOT_FOUND` 是 **0x105**，**0x106 是 `ESP_ERR_NOT_SUPPORTED`**；
+  > 板端日志原文也是 `Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)`。
+  > 含义差别很关键：0x106 表示「探测不到任何一颗已知型号的 sensor」，既可能是排线/供电
+  > 导致读不到 ID，也可能是模组型号不被固件支持；而 0x105 才是明确的「地址上有应答但这个
+  > 资源不存在」。因此当时「0x106 ⇒ 排线」的推论方向对但不唯一，具体要靠 SCCB 扫描区分。
+  > 前端 `camErrorText()` 的整张 errno 表也因此整体错位一格，已于 2026-11-11 全部改正
+  > （`public/app.js:1155-1171`），并由 `test/cam-ack-contract-test.js` 逐码断言锁住。
 - **服务端修复**：`/api/cam` 改用 `sendCommandAndWaitAck`，自生成 `request_id`，只有
   `dispatched && accepted && 回执不以 no_camera 开头` 才判成功；`state.camStreaming` 只反映板端确认；
   新增 `noteCamAck()` 记录摄像头类回执，`GET /api/cam` 透出 `camError` / `boardAck`；
   新增 `action:"retry"` → `cam_retry`。
-- **前端修复**：新增 `camErrorText()` 把 errno 翻成中文（0x102 PSRAM、0x106 排线/供电、0x108 超时等），
+- **前端修复**：新增 `camErrorText()` 把 errno 翻成中文（0x101 NO_MEM/PSRAM、0x105 NOT_FOUND 排线/供电、
+  0x106 NOT_SUPPORTED 型号探测不到、0x107 TIMEOUT 等，2026-11-11 已按 esp_err.h 校正），
   板端不可用时标签显示「板端无摄像头」、占位区给出原因与排查步骤、显示「重试初始化摄像头」按钮。
 - **实测对比（同一场景）**：改前 `ok:true, streaming:true`（谎报）→ 改后
   `ok:false, streaming:false, ack_status:"no_camera", ack_channel:"serial", waited_ms:20, camError:"no_camera"`。
@@ -281,7 +292,7 @@
 
 ### 防回归
 
-新增 `test/cam-ack-contract-test.js`（28 项静态契约）：对提交前的旧代码跑得 1 通过 / 27 失败，
+新增 `test/cam-ack-contract-test.js`（现 36 项静态契约；2026-10-30 首版为 28 项，对提交前的旧代码跑得 1 通过 / 27 失败），
 对修后代码 28/28 绿。断言覆盖 `/api/cam` 不再裸用 `sendCommand`、自生成 `request_id`、
 识别 `no_camera`、透出 `camError`/`boardAck`、`retry` 分支、前端 errno 翻译与重试按钮、
 固件 `cam_ack_unavailable` / `HELP_KEY_ADC` / 「旧的 `bool p = (v < th)` 必须已消失」。

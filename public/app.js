@@ -1151,20 +1151,24 @@ const CAM = { streaming: false, hasFrame: false, frames: 0, seq: 0, size: null, 
               camError: null, boardAck: null };
 
 /* 把固件回执翻成人话。errno 对照见
- * firmware/s3eye_imu_idf/main/cam_stream.c 文件头注释。 */
+ * firmware/s3eye_imu_idf/main/cam_stream.c 文件头注释。
+ * ★ 2026-11-11 修正：这张表原来整体错位一格（0x101 写成 ESP_FAIL、
+ *   0x106 写成 NOT_FOUND），导致 0x106（NOT_SUPPORTED）被说成「找不到设备
+ *   → 查排线」，把排查方向带偏。真值以 esp_err.h 为准：
+ *   esp-idf-v5.4.4/components/esp_common/include/esp_err.h L25-L32。 */
 function camErrorText(raw) {
   if (!raw) return '';
   const m = /0x([0-9a-f]+)/i.exec(raw);
   const code = m ? parseInt(m[1], 16) : null;
   const known = {
-    0x101: 'ESP_FAIL（通用失败）',
-    0x102: 'ESP_ERR_NO_MEM（内存不足，常见原因是 PSRAM 未开启）',
-    0x103: 'ESP_ERR_INVALID_ARG（参数不被接受）',
-    0x104: 'ESP_ERR_INVALID_STATE（状态非法，通常是此前初始化已失败）',
-    0x105: 'ESP_ERR_INVALID_SIZE（帧缓冲尺寸不符，检查 JPEG 缓冲配置）',
-    0x106: 'ESP_ERR_NOT_FOUND（找不到设备，SCCB 上没有应答 → 查排线/供电）',
-    0x107: 'ESP_ERR_NOT_SUPPORTED（sensor 不支持该配置）',
-    0x108: 'ESP_ERR_TIMEOUT（超时，SCCB 无应答或总线被占）',
+    0x101: 'ESP_ERR_NO_MEM（内存不足，常见原因是 PSRAM 未开启）',
+    0x102: 'ESP_ERR_INVALID_ARG（参数不被接受）',
+    0x103: 'ESP_ERR_INVALID_STATE（状态非法，通常是此前初始化已失败）',
+    0x104: 'ESP_ERR_INVALID_SIZE（帧缓冲尺寸不符，检查 JPEG 缓冲配置）',
+    0x105: 'ESP_ERR_NOT_FOUND（sensor 没有应答，查排线/供电）',
+    0x106: 'ESP_ERR_NOT_SUPPORTED（探测不到已知型号：排线接触不良，或模组型号不被固件支持）',
+    0x107: 'ESP_ERR_TIMEOUT（超时，SCCB 无应答或总线被占）',
+    0x108: 'ESP_ERR_INVALID_RESPONSE（SCCB 读回的型号值不合法，多为接触不良）',
   };
   const why = code != null && known[code] ? known[code] : null;
   return why ? `${raw} —— ${why}` : raw;

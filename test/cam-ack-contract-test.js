@@ -102,6 +102,42 @@ check('camErrorText 覆盖 ESP_ERR_NOT_FOUND / TIMEOUT 等关键码',
   /0x106/.test(APP) && /0x108/.test(APP) && /0x102/.test(APP),
   '至少 NO_MEM / NOT_FOUND / TIMEOUT 三种要能对上');
 
+/* ---- 前端 errno 对照表必须逐条与 esp_err.h 一致（2026-11-11 实测发现整表错位）
+ *
+ * 现场证据：板端日志原文 `Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)`，
+ * 而页面当时写的是「0x106 —— ESP_ERR_NOT_FOUND（找不到设备，SCCB 上没有应答）」
+ * —— 把「sensor 不应答或型号不被支持」误报成「没插好」，把排查方向直接带偏
+ * （用户当时还专门来确认是不是排线问题）。
+ *
+ * 权威来源：esp-idf-v5.4.4/components/esp_common/include/esp_err.h L25-L32
+ *   ESP_ERR_NO_MEM 0x101 / INVALID_ARG 0x102 / INVALID_STATE 0x103 /
+ *   INVALID_SIZE 0x104 / NOT_FOUND 0x105 / NOT_SUPPORTED 0x106 /
+ *   TIMEOUT 0x107 / INVALID_RESPONSE 0x108
+ * 注意 0x101 不是 ESP_FAIL（ESP_FAIL 是 -1，不带 0x 前缀）。 */
+const ESP_ERR_EXPECT = [
+  [0x101, 'ESP_ERR_NO_MEM'],
+  [0x102, 'ESP_ERR_INVALID_ARG'],
+  [0x103, 'ESP_ERR_INVALID_STATE'],
+  [0x104, 'ESP_ERR_INVALID_SIZE'],
+  [0x105, 'ESP_ERR_NOT_FOUND'],
+  [0x106, 'ESP_ERR_NOT_SUPPORTED'],
+  [0x107, 'ESP_ERR_TIMEOUT'],
+  [0x108, 'ESP_ERR_INVALID_RESPONSE'],
+];
+function errnoTable(src) {
+  const s = src.indexOf('const known = {');
+  if (s < 0) return '';
+  const e = src.indexOf('};', s);
+  return e < 0 ? '' : src.slice(s, e);
+}
+const ERRNO_TABLE = errnoTable(APP);
+for (const [code, name] of ESP_ERR_EXPECT) {
+  const hex = '0x' + code.toString(16);
+  const re = new RegExp(hex + ":\\s*'" + name);
+  check(`errno ${hex} 必须是 ${name}`, re.test(ERRNO_TABLE),
+    re.test(ERRNO_TABLE) ? '' : `${hex} 与 esp_err.h 不符，页面会把原因说错`);
+}
+
 check('前端记录 CAM.camError 与 CAM.boardAck',
   /CAM\.camError\s*=\s*d\.camError/.test(APP) && /CAM\.boardAck\s*=\s*d\.boardAck/.test(APP));
 

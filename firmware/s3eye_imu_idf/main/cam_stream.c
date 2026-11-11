@@ -54,9 +54,10 @@ static int           s_quality   = CAM_DEF_QUALITY;
  *   错误码既没上报也没重试，网页端只能看到"摄像头不可用"而不知道为什么。
  *   现在：① 上电时重试 3 次；② 把最后一次 esp_camera_init() 的 errno 存下来，
  *   经 cmd_ack 回给服务端（例如 "no_camera 0x105"）；③ 支持运行时再重试一次。
- *   errno 对照（esp_err.h）：0x101 ESP_FAIL / 0x102 NO_MEM / 0x103 INVALID_ARG /
- *   0x104 INVALID_STATE / 0x105 INVALID_SIZE / 0x106 NOT_FOUND /
- *   0x107 NOT_SUPPORTED / 0x108 TIMEOUT；esp32-camera 自己的错误在 0x2000 以上。 */
+ *   errno 对照（esp_err.h，2026-11-11 逐条核对 L25-L32；此前这行整体错位一格）：
+ *   0x101 NO_MEM / 0x102 INVALID_ARG / 0x103 INVALID_STATE / 0x104 INVALID_SIZE /
+ *   0x105 NOT_FOUND / 0x106 NOT_SUPPORTED / 0x107 TIMEOUT / 0x108 INVALID_RESPONSE；
+ *   注意 0x101 不是 ESP_FAIL（ESP_FAIL 是 -1）。esp32-camera 自己的错误在 0x2000 以上。 */
 #define CAM_INIT_RETRIES   3
 #define CAM_INIT_RETRY_MS  300
 static int s_init_err  = 0;      /* 最后一次 esp_camera_init 的 errno，0=成功 */
