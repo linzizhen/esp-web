@@ -391,8 +391,17 @@ async function uploadWav(port, wav, durationMs) {
       const hitsBefore = stub.hits.length;
       const upC = await uploadWav(PORT3, makeWav(800));
       r = await httpReq(PORT3, 'POST', '/api/voice/transcribe', { audio_id: upC.id });
-      ok(r.status === 503 && r.json && r.json.error === 'asr_disabled',
-        '未开启 asrEnabled → 503 asr_disabled（不假装成功）', `${r.status} ${r.json && r.json.error}`);
+      /* 云端关闭时的正确行为有两种，都算合格：
+       *   ① 本机没有离线识别器 → 503 asr_disabled；
+       *   ② 本机有离线识别器（Windows System.Speech）→ 200，engine=local_windows_asr，
+       *      且 uploaded=false —— 录音只在本机转文字，绝不外发。
+       * 真正的隐私判据是「假 ASR 服务一次都没被调用」（下一项断言），不是状态码。 */
+      const localOnly = r.status === 200 && r.json && r.json.engine === 'local_windows_asr'
+        && r.json.uploaded !== true && stub.hits.length === hitsBefore;
+      const hardDisabled = r.status === 503 && r.json && r.json.error === 'asr_disabled';
+      ok(localOnly || hardDisabled,
+        '未开启 asrEnabled → 不假装云端成功（503 asr_disabled 或 200 本机离线识别且 uploaded=false）',
+        `${r.status} ${r.json && (r.json.engine || r.json.error)}`);
       ok(stub.hits.length === hitsBefore,
         '未开启时假 ASR 服务一次请求都没收到（录音没有离开本机）',
         `命中 ${stub.hits.length - hitsBefore} 次`);

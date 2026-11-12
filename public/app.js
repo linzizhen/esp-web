@@ -2376,7 +2376,7 @@ async function voiceStartChain(audioId) {
       const asrCfg = sv0.asr || {};
       /* 服务端转写默认是关闭的（启用意味着把录音发给厂商，必须由人显式开启）。
        * 关闭时不要试、也不要说「失败了」，直接说清现状与两条出路。 */
-      if (asrCfg.enabled === false) {
+      if (asrCfg.enabled === false && !asrCfg.local_available) {
         const reason = '本机没有可用的麦克风，而服务端转写当前处于关闭状态（默认关闭：'
           + '启用会把这段录音发送到识别服务厂商）。要启用它，在 config.local.json 里加 "asrEnabled": true 并重启服务；'
           + '在此之前请直接用下方「文字入口」输入同一句话，任务照样能完成。';
@@ -2391,9 +2391,11 @@ async function voiceStartChain(audioId) {
       }
       els.voicePlayer.src = `/api/voice/audio/${encodeURIComponent(audioId)}`;
       try { els.voicePlayer.currentTime = 0; } catch (_) {}
-      voiceSetSeg('asr', 'run', `本机没有录音设备，改用服务端转写（${asrCfg.model || 'GLM-ASR'}）…`);
+      voiceSetSeg('asr', 'run', `本机没有录音设备，改用${asrCfg.local_available ? '本机离线识别（Windows 自带，录音不上传）' : '服务端转写（' + (asrCfg.model || 'GLM-ASR') + '）'}…`);
       renderVoiceSegments();
-      voiceNote('本机没有可用的麦克风，浏览器识别收不到声音，已自动改用服务端转写：把这段 WAV 直接交给识别接口，不需要本机声卡。');
+      voiceNote(asrCfg.local_available
+        ? '本机没有可用的麦克风，浏览器识别收不到声音，已自动改用本机离线识别：WAV 直接在本机转成文字，不联网、不上传。'
+        : '本机没有可用的麦克风，浏览器识别收不到声音，已自动改用服务端转写：把这段 WAV 直接交给识别接口，不需要本机声卡。');
       const tr = await voiceTranscribeServer(audioId);
       if (!tr.ok) {
         const reason = tr.reason;
@@ -2406,7 +2408,7 @@ async function voiceStartChain(audioId) {
         await voicePostState({ stage: 'asr_failed', audio_id: audioId, reason });
         return;
       }
-      voiceSetSeg('asr', 'done', `识别文本（服务端转写）：「${tr.text}」`);
+      voiceSetSeg('asr', 'done', `识别文本（${asrCfg.local_available ? '本机离线识别' : '服务端转写'}）：「${tr.text}」`);
       renderVoiceSegments();
       await voicePostState({ stage: 'transcribed', audio_id: audioId, transcript: tr.text });
       await voiceTaskAndSpeak(audioId, tr.text);

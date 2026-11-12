@@ -18,6 +18,10 @@ const path = require('node:path');
 const { WebSocketServer } = require('ws');
 const { SerialPort } = require('serialport');
 const { createVoiceRx } = require('./voice-serial-rx.js');
+const { createLocalAsr } = require('./voice-local-asr.js');
+/* 本机离线识别（Windows 自带 System.Speech）：不联网、不上传，录音不出这台电脑。
+ * 与云端 GLM-ASR 是两条独立通道：云端仍受 asrEnabled 开关约束，默认关闭。 */
+const LOCAL_ASR = createLocalAsr({ timeoutMs: 25000 });
 
 /* ------------------------------------------------------------------ */
 /* 配置                                                                */
@@ -1869,8 +1873,9 @@ function asrConfigView() {
   const configured = !!(ASR.endpoint && ASR.apiKey);
   let host = null;
   try { host = ASR.endpoint ? new URL(ASR.endpoint).host : null; } catch (_) { /* 非法 URL */ }
-  return {
-    enabled: ASR.enabled,
+  return {    enabled: ASR.enabled,
+    local_available: !!(LOCAL_ASR && LOCAL_ASR.probed && LOCAL_ASR.probed.ok),
+    local_engine: 'windows_system_speech',
     configured,
     endpoint: ASR.endpoint || null,
     model: ASR.model,
@@ -1914,6 +1919,24 @@ async function voiceTranscribe(audioId) {
       ok: false, error: 'asr_audio_too_long', audio_id: audioId, duration_ms: durMs, max_ms: lim.maxMs,
       message: `录音 ${durMs} ms 超过转写上限 ${lim.maxMs} ms（${Math.round(lim.maxMs / 1000)} 秒），未上传。`,
     } };
+  }
+  if (!ASR.enabled) {
+    /* 云端默认关闭，但本机离线识别不需要联网也不需要账号 —— 先试它。 */
+    const lr = await LOCAL_ASR.transcribe(file);
+    if (lr && lr.ok) {
+      const text = String(lr.text || '').trim();
+      if (text) {
+        return { http: 200, body: {
+          ok: true, audio_id: audioId, engine: 'local_windows_asr',
+          model: lr.recognizer || null, confidence: (lr.confidence != null ? lr.confidence : null),
+          text: text, transcript: text, uploaded: false,
+        } };
+      }
+      return { http: 200, body: {
+        ok: false, error: 'no_speech', audio_id: audioId, engine: 'local_windows_asr',
+        message: '本机离线识别没听出内容（桌面识别器对远场与噪声比较敏感）。请靠近板载麦克风、放慢语速重录，或改用文字输入。',
+      } };
+    }
   }
   if (!ASR.enabled) {
     // 关闭状态下绝不外发：连一次请求都不发，录音不出本机
@@ -2844,6 +2867,24 @@ function ingestVoiceWav(buf, opts) {
     transport: o.transport || null,
   });
   console.log(`[voice] 收到 WAV ${audioId} ← ${deviceId || '(未标注设备)'} ${buf.length} 字节 / ${durationMs == null ? '?' : durationMs}ms（${o.transport || 'http'}，${wav.sample_rate || '?'}Hz ${wav.channels || '?'}ch ${wav.bits || '?'}bit，峰值 ${lv.peak_dbfs == null ? '?' : lv.peak_dbfs} dBFS）`);
+  /* 自动转写：录音一到就尽量把文字准备好，用户不必再点一次「重新识别」。
+   * 只在本机做（离线识别）；云端转写仍受 asrEnabled 约束，绝不在这里偷偷外发。 */
+  if (!ASR.enabled && LOCAL_ASR) {
+    LOCAL_ASR.transcribe(file).then((lr) => {
+      if (!lr || !lr.ok) {
+        appendVoiceEvent({ ev: 'local_asr_error', audio_id: audioId, at: Date.now(), detail: (lr && (lr.error || lr.message)) || 'unknown' });
+        return;
+      }
+      const text = String(lr.text || '').trim();
+      if (!text) {
+        appendVoiceEvent({ ev: 'local_asr_empty', audio_id: audioId, at: Date.now(), detail: '本机离线识别未听出内容' });
+        return;
+      }
+      voiceApply('transcribed', { audio_id: audioId, transcript: text, asr_engine: 'local_windows_asr' });
+      appendVoiceEvent({ ev: 'transcribed_local', audio_id: audioId, at: Date.now(), detail: text });
+      console.log('[voice] 本机离线识别 ' + audioId + ' → 「' + text + '」');
+    }).catch((e) => { console.warn('[voice] 本机离线识别异常：', e && e.message); });
+  }
   return {
     ok: true,
     audio_id: audioId,
@@ -4435,6 +4476,9 @@ server.listen(config.httpPort, config.host, () => {
   console.log('==========================================================');
   loadHelpHistory();   // 回读历史求助事件（重启不丢证据）
   loadVoiceHistory();  // 回读历史语音事件（重启不丢语音链路证据）
+  LOCAL_ASR.available().then((a) => {
+    console.log('[voice] 本机离线识别（Windows System.Speech）：' + (a ? '可用' : '不可用'));
+  });
   if (config.autoDetect || config.portPath) startScanning();
 });
 
