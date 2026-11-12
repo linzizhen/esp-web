@@ -594,3 +594,49 @@ POST /api/voice/record {"action":"start"} → ack_status=recording  waited_ms=27
 - 只覆盖「板子连着电脑」的场景；板子脱离 USB 后没有回传通道（WiFi 恢复后自动回到 HTTP）。
 - 服务端 30 秒收不到 `voice_end` 就整段作废，不会留下半截 WAV。
 - 单次录音上限仍受 `VOICE_MAX_RECORD_MS = 10000`（10 秒）与 `VOICE_MAX_BYTES = 1 MB` 约束。
+---
+
+## 附：2026-11-12 新增 —— 本机离线识别（不联网、不上传）
+
+「板子录了音，页面上却看不到文字」的根因不是识别坏了，而是原来只有两条路：
+浏览器 Web Speech（只能听**麦克风**，这台电脑没有录音设备）与云端 GLM-ASR
+（要把 WAV 发给厂商，默认关闭）。两条都走不通，于是只能显示「未识别」。
+
+现在补了第三条：**Windows 自带的 System.Speech 中文桌面识别器**（本机实测
+MS-2052-80-DESK / zh-CN）。录音在本机转文字，不联网、不上传、不需要账号与费用。
+
+### 实现
+
+- oice-local-asr.js：createLocalAsr() 暴露 vailable() 与 	ranscribe(wavPath)；
+  内部 execFile 调 scripts/asr-local.ps1，结果写成 UTF-8 JSON 文件再读回
+  （避免 PowerShell 控制台按 GBK 输出把中文弄成乱码 —— 这是踩过的坑）。
+- scripts/asr-local.ps1：**必须存成带 BOM 的 UTF-8**，否则 Windows PowerShell 5.1
+  会把中文当 ANSI 解析、直接语法报错（字符串缺少终止符）。
+- server.js：
+  - ingestVoiceWav() 落盘后**自动**跑一次本机识别，成功就 oiceApply('transcribed')
+    并记 	ranscribed_local 事件 —— 用户不用再点「重新识别」；
+  - POST /api/voice/transcribe 在云端关闭时先走本机引擎（返回 engine:"local_windows_asr"、
+    uploaded:false），本机也没有识别器才回落到原来的 503 sr_disabled；
+  - srConfigView() 增加 local_available / local_engine；
+  - 启动时探测一次，日志打印「本机离线识别（Windows System.Speech）：可用/不可用」。
+- 前端 public/app.js：无麦克风时若 sr.local_available 为真，直接走本机识别，
+  文案与识别段标签也随之区分「本机离线识别 / 服务端转写」。
+
+### 真机/接口实测
+
+`
+POST /api/voice/transcribe {"audio_id":"voice-20261112-151900-001-ab12"}
+→ {"ok":true,"engine":"local_windows_asr","model":"MS-2052-80-DESK",
+   "confidence":0.152,"text":"请把空调温度调到","uploaded":false}
+静音 WAV → {"ok":true,"text":"","reason":"no_speech"}   ← 听不出就如实返回空，不瞎猜
+`
+
+### 边界（必须知道）
+
+- 桌面识别器模型较老：安静环境、离板子近、语速正常时可用；远场/嘈杂/口音重时
+  识别率明显下降，也**不会**把整句都认全（实测尾字常被吞）。听不出就返回空文本，
+  页面显示「没听出内容」，绝不编造。
+- 只在 Windows 上可用；没有安装中文识别器的机器上 local_available=false，
+  自动回落到原来的提示。
+- 云端 GLM-ASR 仍是可选升级项（config.local.json 里 srEnabled: true），
+  开与不开都不会让本机这条失效。
