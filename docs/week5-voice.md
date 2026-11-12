@@ -546,3 +546,51 @@ Web Speech API 的设计前提是"麦克风实时拾音"，**没有任何接口�
 | 阶段状态机 + 失败可见 | 任何多步骤异步流程 |
 
 ★ 迁移时保留的判据：**没有证据就不许报成功**。这条比代码本身更重要。
+
+---
+
+## 附：2026-11-12 新增 —— 录音 WAV 走 USB 串口回传
+
+板子只连电脑、连不上 AP 时的可用链路。原来 WAV 只能靠 WiFi POST 到
+ + "/api/voice/audio" + @，板端 WiFi 不通就一个字节都传不回来，页面只能显示「未上传」。
+
+### 协议（服务端按 type 判别，与传感器帧共用同一条串口行协议）
+
+``json
+{"type":"voice_begin","device":"S3EYE-GROUP01","bytes":131116,"duration_ms":4096,
+ "sample_rate":16000,"bits":16,"channels":1,"peak":1234,"via":"serial"}
+{"type":"voice_chunk","seq":0,"data":"UklGR..."}      // 每块 1536 字节 → base64 2048 字符
+{"type":"voice_end","device":"S3EYE-GROUP01","chunks":86}
+``
+
+- 固件：`voice_upload()` 在 `wifi_wait(0)` 为假时转入 `voice_upload_serial()`；
+  自带 base64 编码器（`b64_encode`），每块后 `vTaskDelay(1ms)` 让 USB CDC 缓冲排空。
+- 服务端：`voice-serial-rx.js` 只负责拼字节（`no_begin` / `too_large` /
+  `overflow` / `too_many_chunks` / `timeout` 一律丢弃），拼完交给
+  `ingestVoiceWav()` —— 与 HTTP 上传共用同一段落盘 + 电平分析 + 事件链路，
+  录音标 `transport=serial` 并记 `received_via_serial` 事件。
+
+### 为什么不用裸二进制
+
+裸二进制要在串口数据主路径上做二进制分帧，会把「按换行切行」的解析器改坏，
+排错成本高。base64 体积膨胀 33%（4 秒录音约 131 KB → 175 KB 文本），
+但 USB-Serial/JTAG 是虚拟串口，实际吞吐远高于 115200 波特率的表观值，
+真机 4 秒录音数秒内传完，完全够用。
+
+### 真机验证（2026-11-12，WiFi 未连接）
+
+`rssi=0`、`upload_ok=0`、`upload_skip=247`（确认没走 WiFi）：
+
+`
+POST /api/voice/record {"action":"start"} → ack_status=recording  waited_ms=27
+4 秒后 {"action":"stop"}                  → ack_status=uploading  waited_ms=41
+约 4 秒后服务端收到 voice-20261112-144255-831-70d2
+  131116 字节 / 4096 ms / 16 kHz 单声道 / peak −0.1 dBFS / rms −24.6 dBFS / silent_hint=false
+  事件：recorded（transport=serial）→ received_via_serial
+`
+
+### 边界
+
+- 只覆盖「板子连着电脑」的场景；板子脱离 USB 后没有回传通道（WiFi 恢复后自动回到 HTTP）。
+- 服务端 30 秒收不到 `voice_end` 就整段作废，不会留下半截 WAV。
+- 单次录音上限仍受 `VOICE_MAX_RECORD_MS = 10000`（10 秒）与 `VOICE_MAX_BYTES = 1 MB` 约束。

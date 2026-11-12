@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（27 个测试文件、681 项断言，全部通过）
+## 7. 自检脚本（28 个测试文件、704 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -355,6 +355,7 @@ node test/cam-ack-contract-test.js  # 36 项  摄像头回执契约：等板端 
 node test/voice-link-contract-test.js  # 22 项  链路自检面板静态契约（板端在线/上传通道/板端 WiFi/最近一次录音）
 node test/voice-stale-test.js  #  9 项  旧语音快照超过 10 分钟按历史渲染，不再冒充当前状态
 node test/firmware-wifi-skip-test.js  # 16 项  固件静态契约：WiFi 未连不刷屏、upload_skip 上报、断线指数退避
+node test/voice-serial-upload-test.js # 23 项  录音 WAV 走 USB 串口回传：组装器二进制往返 + 服务端/固件契约
 ```
 
 以下需真实开发板在线，**不在**编排器内，手动跑：
