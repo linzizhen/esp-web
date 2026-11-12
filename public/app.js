@@ -86,6 +86,10 @@ const els = {
   voiceLinkTag: $('voiceLinkTag'), voiceLinkBoard: $('voiceLinkBoard'),
   voiceLinkUpload: $('voiceLinkUpload'), voiceLinkWifi: $('voiceLinkWifi'),
   voiceLinkLast: $('voiceLinkLast'),
+  // 决策卡（一眼看懂：现在在不在录音 / 板端在做什么）
+  vxTag: $('vxTag'), vxState: $('vxState'), vxHint: $('vxHint'),
+  vxTimer: $('vxTimer'), vxDot: $('vxDot'), vxSteps: $('vxSteps'),
+  vxText: $('vxText'), vxTextMeta: $('vxTextMeta'), vxCopy: $('vxCopy'),
 
   // 主题切换（浅色 / 深色）
   btnTheme: $('btnTheme'),
@@ -114,7 +118,7 @@ const S = {
   history: new Map(),   // field -> [{t, v}]
   order: [],            // 字段出现顺序
   // 语音链路自检用：板端上报的上行健康度（录音 WAV 靠 WiFi 上传，这里能看出通不通）
-  link: { upload_ok: null, upload_fail: null, upload_skip: null, rssi: null },
+  link: { upload_ok: null, upload_fail: null, upload_skip: null, rssi: null, rec: null, up: null },
 };
 
 let ws = null;
@@ -317,6 +321,7 @@ function renderStatus() {
   els.deviceId.textContent = S.deviceId || '—';
   renderDeviceCheck();
   renderVoiceLink();   // 板端在线 / 上传通道 / 板端 WiFi 随连接状态一起刷新
+  renderVoiceHero();   // 决策卡随连接状态刷新（离线时要说清楚「插 USB」）
 
   els.mDeviceId.textContent = S.deviceId || '—';
   els.mMac.textContent = S.deviceMac || '—';
@@ -1739,11 +1744,11 @@ function voiceAgoText(ts) {
 function captureLink(fields) {
   if (!fields || typeof fields !== 'object') return;
   let touched = false;
-  for (const k of ['upload_ok', 'upload_fail', 'upload_skip', 'rssi']) {
+  for (const k of ['upload_ok', 'upload_fail', 'upload_skip', 'rssi', 'rec', 'up']) {
     const v = fields[k];
     if (v !== undefined && v !== null && Number.isFinite(Number(v))) { S.link[k] = Number(v); touched = true; }
   }
-  if (touched) renderVoiceLink();
+  if (touched) { renderVoiceLink(); renderVoiceHero(); }
 }
 
 /** 渲染链路自检四项：板端 / 上传通道 / 板端 WiFi / 最近一次录音 */
@@ -1792,8 +1797,127 @@ function renderVoiceLink() {
   if (els.voiceLinkTag) { els.voiceLinkTag.textContent = tag; els.voiceLinkTag.className = cls; }
 }
 
-/** 带超时的 JSON 请求：超时由 AbortController 触发，抛出的错误 name === 'AbortError' */async function voiceFetchJson(url, opts, timeoutMs) {
-  const ac = new AbortController();
+/* ================= 决策卡：一眼看懂「现在在不在录音、有没有文字」 =================
+ * 数据来源有两条，都是真实上报，前端不编造：
+ *   · rec / up   —— 板端每帧上报（约 10Hz），实时反映「正在录音 / 正在回传」；
+ *   · stage      —— 服务端语音快照（recorded → transcribed → …），反映链路进展。
+ * 以前这两件事全靠用户猜：页面只有一张「四段链路」，录音中没有任何变化，
+ * 用户根本不知道该不该说话。 */
+let vxRecStart = 0;
+let vxTimerId = null;
+
+function voiceHeroStopTimer() {
+  if (vxTimerId) { clearInterval(vxTimerId); vxTimerId = null; }
+  vxRecStart = 0;
+  if (els.vxTimer) els.vxTimer.textContent = '';
+}
+
+function voiceHeroStartTimer() {
+  if (vxTimerId) return;
+  vxRecStart = Date.now();
+  const tick = () => {
+    if (!els.vxTimer) return;
+    const s = (Date.now() - vxRecStart) / 1000;
+    els.vxTimer.textContent = s.toFixed(1) + 's';
+  };
+  tick();
+  vxTimerId = setInterval(tick, 100);
+}
+
+function voiceHeroSteps(rec, up, st) {
+  if (!els.vxSteps) return;
+  const done = { record: false, upload: false, asr: false, text: false };
+  const run = { record: false, upload: false, asr: false, text: false };
+  if (rec) { run.record = true; }
+  else if (up) { done.record = true; run.upload = true; }
+  else if (st === 'recorded') { done.record = true; done.upload = true; run.asr = true; }
+  else if (st === 'transcribed' || st === 'task_running' || st === 'task_done' || st === 'spoken') {
+    done.record = done.upload = done.asr = true; run.text = st !== 'spoken';
+  } else if (st === 'asr_failed' || st === 'silent' || st === 'timeout') { done.record = true; done.upload = true; }
+  els.vxSteps.querySelectorAll('[data-step]').forEach((el) => {
+    const k = el.getAttribute('data-step');
+    el.classList.toggle('is-done', !!done[k]);
+    el.classList.toggle('is-run', !!run[k]);
+  });
+}
+
+/** 顶部决策卡 + 大字文字卡 */
+function renderVoiceHero() {
+  if (!els.vxState) return;
+  const conn = !!S.connected;
+  const rec = S.link.rec === 1;
+  const up = S.link.up === 1;
+  const sv = VOICE.state || {};
+  const st = sv.stage || 'idle';
+  const stale = voiceSnapshotIsStale(sv) && st !== 'idle';
+
+  let tag = '待机', tagCls = 'tag', state = '', hint = '', dot = '';
+
+  if (!conn) {
+    tag = '板端离线'; tagCls = 'tag tag-warn';
+    state = '没检测到开发板';
+    hint = '用 USB 线把开发板接到这台电脑，页面会自动连上，不用重启服务端。';
+  } else if (rec) {
+    tag = '正在录音'; tagCls = 'tag tag-rec';
+    state = '正在录音（板端指示灯常亮）';
+    hint = '现在对着开发板说话；说完再按一次 PLAY 键结束，会自动回传并识别成文字。';
+    dot = 'is-rec';
+  } else if (up) {
+    tag = '回传中'; tagCls = 'tag tag-busy';
+    state = '录音已结束，正在把 WAV 传回电脑';
+    hint = '板端指示灯快闪；传完会自动识别，不需要点任何按钮。';
+    dot = 'is-busy';
+  } else if (st === 'recorded' && !stale) {
+    tag = '已收到录音'; tagCls = 'tag tag-busy';
+    state = '录音已到电脑，正在识别成文字';
+    hint = '本机离线识别一般 1~3 秒出结果。';
+    dot = 'is-busy';
+  } else if (!stale && (st === 'transcribed' || st === 'task_running' || st === 'task_done' || st === 'spoken')) {
+    tag = '已识别'; tagCls = 'tag tag-ok';
+    state = '已识别出文字，见下方「识别出的文字」';
+    hint = sv.transcript ? '如果不是你说的内容，靠近一点、说慢一点再录一次。' : '这段录音没听出内容，可以再录一次。';
+    dot = 'is-ok';
+  } else if (!stale && (st === 'asr_failed' || st === 'silent')) {
+    tag = '没听清'; tagCls = 'tag tag-warn';
+    state = st === 'silent' ? '这段录音里没有声音' : '这次没识别出文字';
+    hint = '靠近开发板、说话声音大一点，再长按 PLAY 键 2 秒重录。';
+  } else if (!stale && st === 'timeout') {
+    tag = '超时'; tagCls = 'tag tag-warn';
+    state = '这次链路超时了';
+    hint = '可以直接重录一次；如果反复超时，看下面「链路自检」里的板端 WiFi 与上传计数。';
+  } else {
+    tag = '待机';
+    state = '待机 · 等你按键';
+    hint = '长按开发板上的 PLAY 键 2 秒开始录音，说完再按一次结束。';
+    if (stale) hint = '下面是上一段录音的历史记录，不是现在；要录音请长按 PLAY 键 2 秒。';
+  }
+
+  if (els.vxTag) { els.vxTag.textContent = tag; els.vxTag.className = tagCls; }
+  els.vxState.textContent = state;
+  els.vxHint.textContent = hint;
+  if (els.vxDot) els.vxDot.className = 'vx-dot' + (dot ? ' ' + dot : '');
+  if (rec) voiceHeroStartTimer(); else voiceHeroStopTimer();
+  voiceHeroSteps(rec, up, stale ? 'idle' : st);
+
+  /* 大字文字卡 */
+  const hasText = !!(sv.transcript && String(sv.transcript).trim());
+  if (els.vxText) {
+    els.vxText.textContent = hasText ? sv.transcript : (rec ? '正在录音，说完再按一次 PLAY 键。' : '还没有识别到文字。');
+    els.vxText.className = 'vx-text' + (hasText ? '' : ' vx-empty');
+  }
+  if (els.vxTextMeta) {
+    if (hasText) {
+      const eng = sv.asr_engine === 'local_windows_asr' ? '本机离线识别' : (sv.asr_engine || '识别');
+      els.vxTextMeta.textContent = eng + (sv.received_at ? ' · ' + fmtClock(sv.received_at) : '');
+      els.vxTextMeta.className = 'tag tag-ok';
+    } else {
+      els.vxTextMeta.textContent = rec ? '录音中' : '等待录音';
+      els.vxTextMeta.className = 'tag';
+    }
+  }
+}
+
+/** 带超时的 JSON 请求：超时由 AbortController 触发，抛出的错误 name === 'AbortError' */async function voiceFetchJson(url, opts, timeoutMs) {  const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs || 8000);
   try {
     const r = await fetch(url, Object.assign({}, opts || {}, { signal: ac.signal }));
@@ -1979,6 +2103,7 @@ function voiceApplySnapshot(sv, doSegs) {
 
   renderVoiceFacts(sv);
   renderVoiceLink();   // 「最近一次录音」取自服务端快照，随每次快照刷新
+  renderVoiceHero();   // 顶部决策卡：现在在不在录音 / 有没有文字
 
   // 音频来源与运行位置一律以服务端快照为准（前端不自己编造）
   if (els.voiceSrcAudio && sv.audio_source_text) els.voiceSrcAudio.textContent = sv.audio_source_text;
@@ -2551,6 +2676,26 @@ if (els.btnVoiceSpeak) {
       voiceSetSeg('tts', 'fail', `播报失败（${sp.error}）`);
       renderVoiceSegments();
       voiceNote('播报失败（' + sp.error + '）：请确认系统有可用的语音合成引擎或已选中中文语音。');
+    }
+  };
+}
+
+if (els.vxCopy) {
+  els.vxCopy.onclick = async () => {
+    const sv = VOICE.state || {};
+    const txt = (sv.transcript || '').trim();
+    if (!txt) { voiceNote('还没有识别出的文字可复制。'); return; }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(txt);
+      else {
+        const ta = document.createElement('textarea');
+        ta.value = txt; document.body.appendChild(ta); ta.select();
+        document.execCommand('copy'); ta.remove();
+      }
+      els.vxCopy.textContent = '已复制';
+      setTimeout(() => { els.vxCopy.textContent = '复制文字'; }, 1500);
+    } catch (e) {
+      voiceNote('复制失败，请手动选中文字复制：' + (e && e.message ? e.message : e));
     }
   };
 }

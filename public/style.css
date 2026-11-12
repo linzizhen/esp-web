@@ -880,3 +880,51 @@ select.inp { cursor: pointer; font-family: var(--sans); }
     transition-duration: .001ms !important;
   }
 }
+/* ============ 语音页「现在在做什么」决策卡（2026-11-12） ============
+   目的：录音有没有开始、板端在不在动作、文字出来没有，三件事必须在
+   页面第一屏用颜色 + 一句话讲清楚，不能让人去猜四段链路的内部状态。 */
+.vx-hero { border-left: 4px solid var(--accent); }
+.vx-row { display: flex; align-items: center; gap: 14px; }
+.vx-dot {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--line-2); flex: 0 0 auto;
+}
+.vx-dot.is-rec { background: var(--bad); animation: vxPulse 1.1s ease-in-out infinite; }
+.vx-dot.is-busy { background: var(--warn); animation: vxPulse .55s ease-in-out infinite; }
+.vx-dot.is-ok { background: var(--ok); }
+.vx-main { flex: 1 1 auto; min-width: 0; }
+.vx-state { font-size: 20px; font-weight: 600; color: var(--ink); line-height: 1.35; }
+.vx-hint { font-size: 13px; color: var(--ink-2); margin-top: 4px; line-height: 1.5; }
+.vx-timer {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 22px; color: var(--accent-ink); min-width: 64px; text-align: right;
+}
+.vx-steps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.vx-step {
+  font-size: 12px; padding: 4px 10px; border-radius: 999px;
+  background: var(--surface-3); color: var(--dim);
+  border: 1px solid var(--line);
+}
+.vx-step.is-run { background: var(--accent-wash); color: var(--accent-ink); border-color: var(--accent-line); font-weight: 600; }
+.vx-step.is-done { background: var(--ok-wash); color: var(--ok); border-color: var(--ok-line); }
+
+.vx-text {
+  font-size: 26px; line-height: 1.5; color: var(--ink);
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 12px; padding: 18px; min-height: 84px;
+  word-break: break-word;
+}
+.vx-text.vx-empty { font-size: 16px; color: var(--dim); display: flex; align-items: center; }
+
+.tag.tag-rec { background: var(--bad-wash); color: var(--bad); border-color: var(--bad-line); }
+.tag.tag-busy { background: var(--warn-wash); color: var(--warn); border-color: var(--warn-line); }
+
+@keyframes vxPulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) {
+  .vx-dot.is-rec, .vx-dot.is-busy { animation: none; }
+}
+@media (max-width: 640px) {
+  .vx-state { font-size: 17px; }
+  .vx-text { font-size: 20px; padding: 14px; }
+  .vx-timer { font-size: 18px; min-width: 52px; }
+}

@@ -505,6 +505,40 @@
     <section class="page" data-page="voice">
       <div class="grid">
 
+        <!-- ① 一眼看懂：现在到底在不在录音 -->
+        <section class="card vx-hero" style="grid-column: 1 / -1" aria-labelledby="vxTitle">
+          <div class="card-head">
+            <h2 id="vxTitle">现在在做什么</h2>
+            <span id="vxTag" class="tag">待机</span>
+          </div>
+          <div class="vx-row">
+            <span id="vxDot" class="vx-dot" aria-hidden="true"></span>
+            <div class="vx-main">
+              <div id="vxState" class="vx-state" role="status" aria-live="polite">待机 · 等你按键</div>
+              <div id="vxHint" class="vx-hint">长按开发板上的 PLAY 键 2 秒开始录音，说完再按一次结束。</div>
+            </div>
+            <div id="vxTimer" class="vx-timer" aria-live="off"></div>
+          </div>
+          <div id="vxSteps" class="vx-steps">
+            <span class="vx-step" data-step="record">① 录音</span>
+            <span class="vx-step" data-step="upload">② 回传</span>
+            <span class="vx-step" data-step="asr">③ 识别</span>
+            <span class="vx-step" data-step="text">④ 出文字</span>
+          </div>
+        </section>
+
+        <!-- ② 识别出的文字：大字显示，一眼能读到 -->
+        <section class="card" style="grid-column: 1 / -1" aria-labelledby="vxTextTitle">
+          <div class="card-head">
+            <h2 id="vxTextTitle">识别出的文字</h2>
+            <span id="vxTextMeta" class="tag">等待录音</span>
+          </div>
+          <div id="vxText" class="vx-text vx-empty" role="status" aria-live="polite">还没有识别到文字。</div>
+          <div class="collect-actions">
+            <button id="vxCopy" class="btn btn-ghost" type="button">复制文字</button>
+          </div>
+        </section>
+
         <!-- 链路自检：一眼看出「录音为什么没到页面」 -->
         <section class="card" style="grid-column: 1 / -1">
           <div class="card-head">
@@ -627,6 +661,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=39"></script>
+<script src="/app.js?v=40"></script>
 </body>
 </html>
