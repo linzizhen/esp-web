@@ -144,6 +144,7 @@ static char s_ip[16] = "0.0.0.0";
 
 /* ---------------------- 统计 ---------------------- */
 static uint32_t s_seq = 0, s_ok = 0, s_fail = 0;
+static uint32_t s_skip = 0;             /* WiFi 未连接而跳过上传的帧数（build_frame 要上报，故前置声明） */
 static char     s_mac[13] = "000000000000";
 
 /* ===================== I2C / QMA7981 ===================== */
@@ -269,6 +270,25 @@ static const char *wifi_reason_str(uint8_t r)
     }
 }
 
+/* 断线重连退避：事件处理函数里既不能阻塞，也不能立刻 esp_wifi_connect()。
+ * 实测（2026-11-12，热点不在时）：立刻重连会形成约 10Hz 的死循环，每次失败打一条
+ * 「WiFi 断开」外加 esp_wifi 内部的 "Haven't to connect to a suitable AP now!"，
+ * 半天就刷出 13449 行无效日志（valid 只有 12804），可观带宽全被重复日志吃掉。
+ * 改为 esp_timer 延时重连：间隔从 2 秒起翻倍、封顶 30 秒；日志 30 秒最多一条。 */
+#define WIFI_RECONNECT_MIN_MS 2000
+#define WIFI_RECONNECT_MAX_MS 30000
+#define WIFI_DISC_LOG_MS      30000
+
+static esp_timer_handle_t s_reconnect_timer = NULL;
+static uint32_t s_reconnect_delay_ms = 0;
+static int64_t  s_last_disc_log_us  = 0;
+
+static void wifi_reconnect_cb(void *arg)
+{
+    (void)arg;
+    esp_wifi_connect();
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -277,14 +297,33 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT);
         if (s_wifi_paused) return;          /* 诊断扫描中：不要重连 */
         wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
-        ESP_LOGW(TAG, "WiFi 断开（reason=%u：%s），重连中…",
-                 (unsigned)e->reason, wifi_reason_str(e->reason));
-        esp_wifi_connect();
+
+        const int64_t now_us = esp_timer_get_time();
+        if (s_last_disc_log_us == 0
+            || now_us - s_last_disc_log_us >= (int64_t)WIFI_DISC_LOG_MS * 1000) {
+            s_last_disc_log_us = now_us;
+            ESP_LOGW(TAG, "WiFi 断开（reason=%u：%s），稍后重试连接（退避 %u ms）",
+                     (unsigned)e->reason, wifi_reason_str(e->reason),
+                     (unsigned)(s_reconnect_delay_ms ? s_reconnect_delay_ms : WIFI_RECONNECT_MIN_MS));
+        }
+
+        s_reconnect_delay_ms = (s_reconnect_delay_ms == 0)
+                             ? WIFI_RECONNECT_MIN_MS
+                             : (s_reconnect_delay_ms * 2 > WIFI_RECONNECT_MAX_MS
+                                ? WIFI_RECONNECT_MAX_MS
+                                : s_reconnect_delay_ms * 2);
+        if (s_reconnect_timer) {
+            esp_timer_stop(s_reconnect_timer);   /* 未启动时返回错误码，忽略即可 */
+            esp_timer_start_once(s_reconnect_timer, (uint64_t)s_reconnect_delay_ms * 1000);
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&e->ip_info.ip));
         ESP_LOGI(TAG, "WiFi 已连接，IP=%s", s_ip);
         xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
+        s_reconnect_delay_ms = 0;                 /* 连上就复位退避 */
+        s_last_disc_log_us = 0;
+        if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
     }
 }
 
@@ -326,6 +365,11 @@ static void wifi_scan_log(void)
 static void wifi_init(void)
 {
     s_wifi_eg = xEventGroupCreate();
+    const esp_timer_create_args_t rt_args = {
+        .callback = &wifi_reconnect_cb,
+        .name     = "wifi_reconnect",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&rt_args, &s_reconnect_timer));
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -334,6 +378,12 @@ static void wifi_init(void)
      * 能看到 DISCOVER 是否发出、有没有收到 OFFER。定位完可关掉。 */
     esp_log_level_set("dhcpc", ESP_LOG_DEBUG);
     esp_log_level_set("esp_netif_lwip", ESP_LOG_DEBUG);
+    /* ★ 压掉 WiFi 驱动内部的重试噪音。
+     * 热点不在时，libnet80211（预编译库，源码改不了）会自己按 ~10Hz 反复重试，
+     * 每次都打一条 "wifi:Haven't to connect to a suitable AP now!"，
+     * 半天刷出 13000+ 行无效日志、吃满串口带宽。这条信息对我们没用 ——
+     * 真正的诊断信息由 S3EYE 标签的「WiFi 断开（reason=…）」提供，已限频。 */
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -1048,9 +1098,11 @@ static int build_frame(char *body, size_t cap, const char *request_id)
      *   scr       当前画面状态：0=空闲 1=求助已发送 2=对方已收到 3=已取消 */
     n += snprintf(body + n, cap - n,
                   ",\"rssi\":%d,\"heap\":%lu,\"upload_ok\":%lu,\"upload_fail\":%lu"
+                  ",\"upload_skip\":%lu"
                   ",\"lcd_ok\":%d,\"scr\":%d}",
                   rssi, (unsigned long)esp_get_free_heap_size(),
                   (unsigned long)s_ok, (unsigned long)s_fail,
+                  (unsigned long)s_skip,
                   s_lcd_ok ? 1 : 0, s_scr);
     return n;
 }
@@ -1063,10 +1115,12 @@ static int build_frame(char *body, size_t cap, const char *request_id)
 static uint32_t s_consec_fail = 0;
 static int64_t  s_next_try_us  = 0;
 static int64_t  s_backoff_log_us = 0;   /* 上次输出「仍在退避」日志的时刻 */
+static int64_t  s_wifi_off_log_us = 0;  /* 上次输出「WiFi 未连接」日志的时刻 */
 
 #define UPLOAD_FAIL_BACKOFF_AFTER 5       /* 连续失败几次后进入退避 */
 #define UPLOAD_BACKOFF_MS         10000   /* 退避期间每 10 秒重试一次 */
 #define UPLOAD_BACKOFF_LOG_MS     30000   /* 退避期间每 30 秒报一次「仍在退避」 */
+#define WIFI_OFF_LOG_MS           30000   /* WiFi 未连接时每 30 秒报一次，避免每帧刷屏 */
 
 /* 构建并双通道发送一帧（USB 串口 + WiFi） */
 static void send_frame(const char *request_id)
@@ -1078,7 +1132,20 @@ static void send_frame(const char *request_id)
         return;
     }
     printf("%s\n", body);                 /* 通道 1：USB 串口（始终输出） */
-    if (!wifi_wait(0)) return;            /* 通道 2：WiFi 未连接则跳过 */
+    if (!wifi_wait(0)) {
+        /* WiFi 没连上：本帧不做上传尝试。这里必须记账并限频提示 ——
+         * 原实现直接 return，导致 upload_fail 永远是 0，页面上完全看不出
+         * 「WAV 从来没传上去」，只能靠人猜。 */
+        s_skip++;
+        const int64_t now_off = esp_timer_get_time();
+        if (s_wifi_off_log_us == 0
+            || now_off - s_wifi_off_log_us >= (int64_t)WIFI_OFF_LOG_MS * 1000) {
+            s_wifi_off_log_us = now_off;
+            ESP_LOGW(TAG, "WiFi 未连接，本帧未尝试上传（累计跳过 %lu 帧，成功=%lu 失败=%lu）",
+                     (unsigned long)s_skip, (unsigned long)s_ok, (unsigned long)s_fail);
+        }
+        return;                           /* 通道 2：WiFi 未连接则跳过 */
+    }
 
     int64_t now = esp_timer_get_time();
     if (now < s_next_try_us) return;      /* 退避中，本帧不尝试 WiFi */
