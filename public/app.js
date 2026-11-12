@@ -114,7 +114,7 @@ const S = {
   history: new Map(),   // field -> [{t, v}]
   order: [],            // 字段出现顺序
   // 语音链路自检用：板端上报的上行健康度（录音 WAV 靠 WiFi 上传，这里能看出通不通）
-  link: { upload_ok: null, upload_fail: null, rssi: null },
+  link: { upload_ok: null, upload_fail: null, upload_skip: null, rssi: null },
 };
 
 let ws = null;
@@ -1707,6 +1707,29 @@ function voiceBytesLabel(b) {
   return n >= 1024 ? `${(n / 1024).toFixed(1)} KB（${n} B）` : `${n} B`;
 }
 
+/* 旧快照判定：服务端只保留「最后一条」语音快照，隔了几天再打开页面，
+ * 它会照原样把当时的失败状态画出来 —— 用户就会以为刚刚又失败了（2026-11-12
+ * 实际发生：页面弹出 13 天前那条 asr_failed）。规则：超过 10 分钟一律按历史渲染，
+ * 不弹失败横幅、不占四段链路的当前状态。 */
+const VOICE_STALE_MS = 10 * 60 * 1000;
+
+function voiceSnapshotIsStale(sv) {
+  if (!sv || !sv.received_at) return false;
+  const age = Date.now() - Number(sv.received_at);
+  return Number.isFinite(age) && age > VOICE_STALE_MS;
+}
+
+function voiceAgoText(ts) {
+  const ms = Date.now() - Number(ts);
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return '刚刚';
+  if (m < 60) return `${m} 分钟前`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} 小时前`;
+  return `${Math.floor(h / 24)} 天前`;
+}
+
 /* 链路自检：把「录音为什么没到页面」直接摊开说清楚。
  *
  * 真实成因（2026-11-12 实测）：录音在板端完成后**不是走 USB 串口**，而是板端用 WiFi
@@ -1716,7 +1739,7 @@ function voiceBytesLabel(b) {
 function captureLink(fields) {
   if (!fields || typeof fields !== 'object') return;
   let touched = false;
-  for (const k of ['upload_ok', 'upload_fail', 'rssi']) {
+  for (const k of ['upload_ok', 'upload_fail', 'upload_skip', 'rssi']) {
     const v = fields[k];
     if (v !== undefined && v !== null && Number.isFinite(Number(v))) { S.link[k] = Number(v); touched = true; }
   }
@@ -1728,7 +1751,7 @@ function renderVoiceLink() {
   if (!els.voiceLinkBoard) return;
   const online = !!S.connected;
   const transport = S.transport === 'wifi' ? 'WiFi' : S.transport === 'serial' ? '串口' : '';
-  const ok = S.link.upload_ok, bad = S.link.upload_fail, rssi = S.link.rssi;
+  const ok = S.link.upload_ok, bad = S.link.upload_fail, rssi = S.link.rssi, skipped = S.link.upload_skip;
 
   els.voiceLinkBoard.textContent = online
     ? ('在线' + (transport ? ' · ' + transport : '') + (S.live ? '' : '（暂无数据）'))
@@ -1737,7 +1760,11 @@ function renderVoiceLink() {
   let upload = '未知（还没有板端数据）';
   if (ok !== null || bad !== null) {
     const n1 = ok || 0, n2 = bad || 0;
-    if (n1 + n2 === 0) upload = '尚未上传过（板端 WiFi 未连时 WAV 传不上来）';
+    if (n1 + n2 === 0) {
+      upload = (skipped || 0) > 0
+        ? `尚未上传过（板端 WiFi 未连，已跳过 ${skipped} 帧）`
+        : '尚未上传过（板端 WiFi 未连时 WAV 传不上来）';
+    }
     else if (n1 > 0 && n2 === 0) upload = `正常 · 成功 ${n1} 次`;
     else if (n1 === 0) upload = `异常 · 失败 ${n2} 次`;
     else upload = `成功 ${n1} 次 / 失败 ${n2} 次`;
@@ -1751,7 +1778,8 @@ function renderVoiceLink() {
   const sv = VOICE.state;
   if (sv && sv.has_audio && sv.audio_id) {
     els.voiceLinkLast.textContent = `${voiceDurLabel(sv.duration_ms)} · ${voiceBytesLabel(sv.bytes)}`
-      + (sv.received_at ? ' · ' + fmtTime(sv.received_at) : '');
+      + (sv.received_at ? ' · ' + fmtTime(sv.received_at) : '')
+      + (voiceSnapshotIsStale(sv) ? `（历史 · ${voiceAgoText(sv.received_at)}）` : '');
   } else {
     els.voiceLinkLast.textContent = '还没收到过录音';
   }
@@ -1867,6 +1895,17 @@ function voiceApplyStageToSegments(sv) {
   renderVoiceFailure(null);
   if (!st || st === 'idle') { renderVoiceSegments(); return; }
   const durTxt = `${voiceDurLabel(sv.duration_ms)} · ${voiceBytesLabel(sv.bytes)} · 板载麦克风`;
+
+  // 历史快照：只做记录展示，绝不按当前链路推进（否则会弹几天前的失败横幅）
+  if (voiceSnapshotIsStale(sv)) {
+    voiceSetSeg('record', 'done', `${durTxt} · ${voiceAgoText(sv.received_at)}（历史）`);
+    voiceSetSeg('asr', 'wait', '历史记录：不按当前链路推进');
+    voiceSetSeg('task', 'wait', '—');
+    voiceSetSeg('tts', 'wait', '—');
+    renderVoiceSegments();
+    voiceNote(`上面是 ${voiceAgoText(sv.received_at)} 的历史录音，不代表当前状态；当前请以上方「链路自检」为准。`);
+    return;
+  }
   const trTxt = sv.transcript ? `识别文本：「${sv.transcript}」` : '识别成功';
   const taskTxt = sv.reply ? `intent=${sv.intent || '—'} · ${sv.reply}` : '任务完成';
   const reason = sv.reason || '';
@@ -1924,13 +1963,19 @@ function voiceApplySnapshot(sv, doSegs) {
   if (!sv) return;
   VOICE.state = sv;
   const st = sv.stage || 'idle';
+  const stale = voiceSnapshotIsStale(sv) && st !== 'idle';
   if (els.voiceStageTag) {
-    els.voiceStageTag.textContent = sv.stage_text || VOICE_STAGE_TEXT[st] || st;
-    els.voiceStageTag.className = 'tag'
-      + (st === 'spoken' ? ' tag-ok' : (st === 'asr_failed' || st === 'silent' || st === 'timeout') ? ' tag-warn' : '');
+    if (stale) {
+      els.voiceStageTag.textContent = `历史记录 · ${voiceAgoText(sv.received_at)}（不是当前状态）`;
+      els.voiceStageTag.className = 'tag';
+    } else {
+      els.voiceStageTag.textContent = sv.stage_text || VOICE_STAGE_TEXT[st] || st;
+      els.voiceStageTag.className = 'tag'
+        + (st === 'spoken' ? ' tag-ok' : (st === 'asr_failed' || st === 'silent' || st === 'timeout') ? ' tag-warn' : '');
+    }
   }
   // 导航红点：有新录音待处理时提示（与求助红点同一套样式）
-  if (els.voiceBadge) els.voiceBadge.classList.toggle('hidden', st !== 'recorded');
+  if (els.voiceBadge) els.voiceBadge.classList.toggle('hidden', stale || st !== 'recorded');
 
   renderVoiceFacts(sv);
   renderVoiceLink();   // 「最近一次录音」取自服务端快照，随每次快照刷新

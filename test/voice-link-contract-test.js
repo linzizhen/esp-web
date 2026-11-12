@@ -62,9 +62,9 @@ for (const id of readIds) {
 
 /* ---------- 4) 数据来源：S.link 采集 upload_ok / upload_fail / rssi ---------- */
 check('S 里有 link 状态位', /link:\s*\{/.test(app));
-check('captureLink() 采集 upload_ok / upload_fail / rssi 并写回 S.link',
-  /'upload_ok',\s*'upload_fail',\s*'rssi'/.test(app) && /S\.link\[k\]\s*=/.test(app),
-  '需在 captureLink 里按这三个键写入 S.link');
+check('captureLink() 采集 upload_ok / upload_fail / upload_skip / rssi 并写回 S.link',
+  /'upload_ok',\s*'upload_fail',\s*'upload_skip',\s*'rssi'/.test(app) && /S\.link\[k\]\s*=/.test(app),
+  '需在 captureLink 里按这四个键写入 S.link');
 check('采样帧与 hello 快照都会调用 captureLink()',
   (app.match(/captureLink\(/g) || []).length >= 3,
   `实际出现 ${(app.match(/captureLink\(/g) || []).length} 次（定义 1 次 + 调用 2 处）`);
