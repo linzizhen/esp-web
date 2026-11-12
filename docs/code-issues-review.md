@@ -23,7 +23,7 @@
 | 8 | P2 命令下发 ≠ 板端已接受（第 5 周发现） | **服务端侧已修复（串口模式生效），固件侧双通道待烧录验证** | `sendCommand()` 只把字节写进串口就算成功，`/api/voice/record` 直接把 `ok` 当 `accepted` 返回；板端 `voice_record.c:571` 的 `if (s_uploading) return false;` 会让 `main.c:1377-1388` 回 `cmd_ack(rid,"busy")`，命令实际被丢弃而服务端仍报 `accepted=true`。现改为按 `request_id` 等板端 ack 再定论（`sendCommandAndWaitAck()`，默认超时 1800 ms），区分 `accepted`/`busy`/`error`/`timeout`/`channel_unavailable`/`mock`；`command-ack-test.js` 95 项断言覆盖。⚠ **但回执上行原本只有串口一条路**：固件侧双通道（`printf` + `ack_task` 走 `http_post`）代码已提交 `f76e0cd`、编译零警告，**尚未烧录**；烧录前纯 WiFi 部署每条命令仍判 `timeout` |
 
 > 报告原文提到的「145 项测试全过」是当时（2026-10-08）的实际数字。当前为
-> **24 个测试文件、634 项断言**（入口 `npm test`）。
+> **27 个测试文件、681 项断言**（入口 `npm test`）。
 
 ---
 
@@ -237,7 +237,7 @@
 2026-10-29 的取证把它的触发条件（链路 RTT）与量级（1.38–9.26 fps 摆动）都定量标定了出来，
 修复方案 A/B 尚未实施（需烧录）。
 
-代码整体质量良好：固件编译零警告，**24 个测试文件、634 项断言全过**。
+代码整体质量良好：固件编译零警告，**27 个测试文件、681 项断言全过**。
 
 ---
 
@@ -299,3 +299,21 @@
 
 原文「145 项测试」为 2026-10-08 的历史数字；本清单保留原判定与证据供追溯，
 以本节的「当前状态」为准。
+
+---
+
+## 更正与新增（2026-11-12）：WiFi 日志刷屏、upload_skip 与旧快照冒充当前
+
+1. **固件 WiFi 未连接时每帧刷日志（已修）**：实测 `invalid 13449 / valid 12804`，几乎每帧一条
+   `wifi:Haven't to connect to a suitable AP now!`。两个来源：① 断线事件里立刻 `esp_wifi_connect()`，
+   失败立即再断，形成约 10Hz 死循环；② `libnet80211`（预编译库，源码改不了）自身也按 ~10Hz 重试并打印。
+   修复：断线改 `esp_timer` 指数退避（2 秒起、封顶 30 秒）、断线日志 30 秒最多一条、
+   `esp_log_level_set("wifi", ESP_LOG_ERROR)` 压掉库内噪音（诊断信息由 S3EYE 标签提供）。
+   实测 20 秒窗口：195 帧、invalid 仅 +2、帧率约 9.75 fps。
+2. **`upload_fail` 恒为 0（已修）**：`send_frame` 在 `wifi_wait(0)` 为假时直接 return，既不传也不记账。
+   新增 `s_skip` 并上报 `upload_skip` 字段，页面显示「尚未上传过（板端 WiFi 未连，已跳过 N 帧）」。
+3. **旧语音快照冒充当前状态（已修）**：服务端只保留最后一条快照，刷新页面会把 13 天前的
+   `asr_failed` 画成"当前失败"。前端新增 10 分钟陈旧判定，改为「历史记录 · N 天前（不是当前状态）」，
+   不再弹失败横幅、不再点亮导航红点。
+4. **事件文件"乱码"是显示问题（非缺陷，未改）**：`data/voice/events.ndjson` 用 PowerShell `Get-Content`
+   查看显示为乱码，但文件本身是正确 UTF-8（read 工具与 `/api/voice/state` 均正常），故不做修改。

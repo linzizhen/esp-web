@@ -174,6 +174,9 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── voice-mic-preflight-test.js   # 第 5 周：识别前麦克风自检（无录音设备须如实说明，不得说成"权限被拒"）
     ├── voice-asr-test.js     # 第 5 周：服务端转写接口（URL 归一化/失败分类/未启用时零外发）
     ├── command-ack-test.js   # 第 5 周：命令下发与板端 ack 的区分（accepted/busy/timeout/channel_unavailable/mock，端口 8090-8099 内自选空闲）
+    ├── voice-link-contract-test.js # 链路自检面板静态契约（板端在线/上传通道/板端 WiFi/最近一次录音）
+    ├── voice-stale-test.js   # 旧语音快照超过 10 分钟按历史渲染，不再冒充当前状态
+    ├── firmware-wifi-skip-test.js # 固件静态契约：WiFi 未连不刷屏、upload_skip 上报、断线指数退避
     ├── voice-hil.js          # 第 5 周：真机端到端，录音 → 上传 → 独立复核电平（需硬件）
     ├── probe-voice-stop.js   # 第 5 周：真机探针，连续多轮 start/stop 稳定性（需硬件）
     ├── fps-baseline-test.js  # 帧率基线回归：相邻帧间隔中位数超阈值即失败（需真机，不进编排器）
@@ -597,7 +600,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **24 个测试文件、634 项断言**，一条命令：
+全套 **27 个测试文件、681 项断言**，一条命令：
 
 ```bash
 npm test
