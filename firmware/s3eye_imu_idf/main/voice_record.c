@@ -158,6 +158,7 @@ voice_led_t voice_record_led(void)
 }
 
 bool voice_record_is_recording(void) { return s_recording; }
+bool voice_record_is_uploading(void) { return s_uploading; }
 
 static void put_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v & 0xFF); p[1] = (uint8_t)(v >> 8); }
 static void put_u32(uint8_t *p, uint32_t v)

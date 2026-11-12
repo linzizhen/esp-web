@@ -929,6 +929,19 @@ static void btn_task(void *arg)
 }
 
 /* ---------------------- UI 任务：按状态刷新 LED 与 LCD ---------------------- */
+
+/* 指示灯状态名（只用于串口日志，方便现场核对「灯到底处于哪一档」） */
+static const char *led_state_name(voice_led_t v)
+{
+    switch (v) {
+    case VOICE_LED_RECORDING: return "录音中（常亮）";
+    case VOICE_LED_UPLOADING: return "回传中（快闪 120ms）";
+    case VOICE_LED_OK:        return "成功（慢闪 400ms）";
+    case VOICE_LED_ERROR:     return "失败（急闪 60ms）";
+    default:                  return "空闲（心跳 120ms/2s）";
+    }
+}
+
 static void ui_task(void *arg)
 {
     (void)arg;
@@ -937,6 +950,7 @@ static void ui_task(void *arg)
     int64_t last_toggle = 0;
     int64_t last_idle_draw = 0;
     bool led_on = false;
+    voice_led_t s_led_seen = VOICE_LED_NONE;
 
     while (1) {
         int64_t now = esp_timer_get_time() / 1000;
@@ -998,15 +1012,25 @@ static void ui_task(void *arg)
 
         /* LED 优先级：第 5 周语音录音状态（按键说话）优先于第 3 周求助状态。
          * 理由：录音是「用户刚按下键」的即时动作，必须一眼看到；求助状态本来
-         * 还有 LCD 大字兜底，且语音空闲时立即把 LED 交还求助状态机。 */
+         * 还有 LCD 大字兜底，且语音空闲时立即把 LED 交还求助状态机。
+         *
+         * 2026-11-12 修正（用户反馈「长按 PLAY 后灯灭掉就再不亮」）：
+         *   旧实现空闲态 half==0 → 每 20ms 写灭，且录音成功后只有 1.5s 慢闪，
+         *   之后 LED 长期全黑，用户的结论是「板子好像死了 / 不知道录没录上」。
+         *   现在：空闲态留 120ms 心跳脉冲（每 2 秒一次），录音常亮、回传快闪、
+         *   成功慢闪、失败急闪，四种图案互不混淆，任何时刻都能看出板子在做什么。 */
         int half = 0;
         bool steady_on = false;
         voice_led_t vled = voice_record_led();
+        if (vled != s_led_seen) {
+            ESP_LOGI(TAG, "指示灯：%s", led_state_name(vled));
+            s_led_seen = vled;
+        }
         switch (vled) {
-        case VOICE_LED_RECORDING:  steady_on = true; break;      /* 常亮 */
-        case VOICE_LED_UPLOADING:  half = 120; break;            /* 快闪 */
-        case VOICE_LED_OK:         half = 400; break;            /* 慢闪 */
-        case VOICE_LED_ERROR:      half = 60;  break;            /* 急促闪 */
+        case VOICE_LED_RECORDING:  steady_on = true; break;      /* 常亮 = 正在录音 */
+        case VOICE_LED_UPLOADING:  half = 120; break;            /* 快闪 = 回传中 */
+        case VOICE_LED_OK:         half = 400; break;            /* 慢闪 = 成功 */
+        case VOICE_LED_ERROR:      half = 60;  break;            /* 急促闪 = 失败 */
         default:                                                 /* 交回求助状态机 */
             half = led == LED_FAST ? 100 : led == LED_SLOW ? 450 : 0;
             break;
@@ -1016,8 +1040,12 @@ static void ui_task(void *arg)
             led_write(true);
             led_on = true;
         } else if (half == 0) {
-            led_write(false);
-            led_on = false;
+            /* 空闲心跳：每 2 秒亮 120ms —— 灯不会再长时间全黑 */
+            bool pulse = (now % 2000) < 120;
+            if (pulse != led_on) {
+                led_on = pulse;
+                led_write(pulse);
+            }
         } else if (now - last_toggle >= half) {
             last_toggle = now;
             led_on = !led_on;
@@ -1095,15 +1123,20 @@ static int build_frame(char *body, size_t cap, const char *request_id)
     /* LCD 自检字段：屏幕是"板端本地反馈"的载体，坏了必须能远程看出来，
      * 否则只能靠肉眼猜（本次黑屏排查就绕了一大圈）。
      *   lcd_ok=1  LCD 初始化成功（背光已开）；0=初始化失败——失败的屏幕永远是黑的
-     *   scr       当前画面状态：0=空闲 1=求助已发送 2=对方已收到 3=已取消 */
+     *   scr       当前画面状态：0=空闲 1=求助已发送 2=对方已收到 3=已取消
+     *   rec/up    录音中 / 回传中（2026-11-12 新增：网页要能实时看出「现在到底在不在录音」，
+     *             否则用户只能靠猜；板端按键录音时服务端没有任何别的途径知道） */
     n += snprintf(body + n, cap - n,
                   ",\"rssi\":%d,\"heap\":%lu,\"upload_ok\":%lu,\"upload_fail\":%lu"
                   ",\"upload_skip\":%lu"
-                  ",\"lcd_ok\":%d,\"scr\":%d}",
+                  ",\"lcd_ok\":%d,\"scr\":%d"
+                  ",\"rec\":%d,\"up\":%d}",
                   rssi, (unsigned long)esp_get_free_heap_size(),
                   (unsigned long)s_ok, (unsigned long)s_fail,
                   (unsigned long)s_skip,
-                  s_lcd_ok ? 1 : 0, s_scr);
+                  s_lcd_ok ? 1 : 0, s_scr,
+                  voice_record_is_recording() ? 1 : 0,
+                  voice_record_is_uploading() ? 1 : 0);
     return n;
 }
 

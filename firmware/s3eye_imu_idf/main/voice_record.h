@@ -76,3 +76,7 @@ voice_led_t voice_record_led(void);
 
 /* 是否正在录音（供 UI / 日志判断）。 */
 bool voice_record_is_recording(void);
+
+/* 是否正在回传（WiFi 或 USB 串口）。供上报帧带上 rec/up 两个字段，
+ * 让网页能实时显示「现在在录音 / 在回传」，而不是只能等最后的结果。 */
+bool voice_record_is_uploading(void);
