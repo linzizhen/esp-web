@@ -82,6 +82,10 @@ const els = {
   voiceSrcAudio: $('voiceSrcAudio'), voiceSrcAsr: $('voiceSrcAsr'), voiceSrcTts: $('voiceSrcTts'),
   voiceAudioDir: $('voiceAudioDir'), voiceEventsFile: $('voiceEventsFile'),
   voiceHistory: $('voiceHistory'), voiceHistoryCount: $('voiceHistoryCount'),
+  // 链路自检面板（板端在线 / 上传通道 / 板端 WiFi / 最近一次录音）
+  voiceLinkTag: $('voiceLinkTag'), voiceLinkBoard: $('voiceLinkBoard'),
+  voiceLinkUpload: $('voiceLinkUpload'), voiceLinkWifi: $('voiceLinkWifi'),
+  voiceLinkLast: $('voiceLinkLast'),
 
   // 主题切换（浅色 / 深色）
   btnTheme: $('btnTheme'),
@@ -109,6 +113,8 @@ const S = {
   meta: { units: {}, labels: {}, historyMax: 600 },
   history: new Map(),   // field -> [{t, v}]
   order: [],            // 字段出现顺序
+  // 语音链路自检用：板端上报的上行健康度（录音 WAV 靠 WiFi 上传，这里能看出通不通）
+  link: { upload_ok: null, upload_fail: null, rssi: null },
 };
 
 let ws = null;
@@ -310,6 +316,7 @@ function renderStatus() {
 
   els.deviceId.textContent = S.deviceId || '—';
   renderDeviceCheck();
+  renderVoiceLink();   // 板端在线 / 上传通道 / 板端 WiFi 随连接状态一起刷新
 
   els.mDeviceId.textContent = S.deviceId || '—';
   els.mMac.textContent = S.deviceMac || '—';
@@ -1700,8 +1707,64 @@ function voiceBytesLabel(b) {
   return n >= 1024 ? `${(n / 1024).toFixed(1)} KB（${n} B）` : `${n} B`;
 }
 
-/** 带超时的 JSON 请求：超时由 AbortController 触发，抛出的错误 name === 'AbortError' */
-async function voiceFetchJson(url, opts, timeoutMs) {
+/* 链路自检：把「录音为什么没到页面」直接摊开说清楚。
+ *
+ * 真实成因（2026-11-12 实测）：录音在板端完成后**不是走 USB 串口**，而是板端用 WiFi
+ * 发 HTTP 到本机服务端。板端 WiFi 没连上时，固件在 wifi_wait(0) 失败处直接 return，
+ * 既不传 WAV、也不计 upload_fail —— 服务端 upload_ok=0 / upload_fail=0，页面一片安静，
+ * 用户只能猜「是不是没录上」。所以必须把板端在线、上行计数、WiFi 信号摆出来。 */
+function captureLink(fields) {
+  if (!fields || typeof fields !== 'object') return;
+  let touched = false;
+  for (const k of ['upload_ok', 'upload_fail', 'rssi']) {
+    const v = fields[k];
+    if (v !== undefined && v !== null && Number.isFinite(Number(v))) { S.link[k] = Number(v); touched = true; }
+  }
+  if (touched) renderVoiceLink();
+}
+
+/** 渲染链路自检四项：板端 / 上传通道 / 板端 WiFi / 最近一次录音 */
+function renderVoiceLink() {
+  if (!els.voiceLinkBoard) return;
+  const online = !!S.connected;
+  const transport = S.transport === 'wifi' ? 'WiFi' : S.transport === 'serial' ? '串口' : '';
+  const ok = S.link.upload_ok, bad = S.link.upload_fail, rssi = S.link.rssi;
+
+  els.voiceLinkBoard.textContent = online
+    ? ('在线' + (transport ? ' · ' + transport : '') + (S.live ? '' : '（暂无数据）'))
+    : '离线（没检测到开发板）';
+
+  let upload = '未知（还没有板端数据）';
+  if (ok !== null || bad !== null) {
+    const n1 = ok || 0, n2 = bad || 0;
+    if (n1 + n2 === 0) upload = '尚未上传过（板端 WiFi 未连时 WAV 传不上来）';
+    else if (n1 > 0 && n2 === 0) upload = `正常 · 成功 ${n1} 次`;
+    else if (n1 === 0) upload = `异常 · 失败 ${n2} 次`;
+    else upload = `成功 ${n1} 次 / 失败 ${n2} 次`;
+  }
+  els.voiceLinkUpload.textContent = upload;
+
+  let wifi = '未知';
+  if (rssi !== null) wifi = Number(rssi) === 0 ? '未连接（录音无法上传）' : `${rssi} dBm`;
+  els.voiceLinkWifi.textContent = wifi;
+
+  const sv = VOICE.state;
+  if (sv && sv.has_audio && sv.audio_id) {
+    els.voiceLinkLast.textContent = `${voiceDurLabel(sv.duration_ms)} · ${voiceBytesLabel(sv.bytes)}`
+      + (sv.received_at ? ' · ' + fmtTime(sv.received_at) : '');
+  } else {
+    els.voiceLinkLast.textContent = '还没收到过录音';
+  }
+
+  let tag = '等待录音', cls = 'tag';
+  if (!online) { tag = '板端离线'; cls = 'tag tag-warn'; }
+  else if (rssi !== null && Number(rssi) === 0) { tag = '板端 WiFi 未连'; cls = 'tag tag-warn'; }
+  else if ((ok || 0) > 0) { tag = '链路正常'; cls = 'tag tag-ok'; }
+  else if (bad) { tag = '上传异常'; cls = 'tag tag-warn'; }
+  if (els.voiceLinkTag) { els.voiceLinkTag.textContent = tag; els.voiceLinkTag.className = cls; }
+}
+
+/** 带超时的 JSON 请求：超时由 AbortController 触发，抛出的错误 name === 'AbortError' */async function voiceFetchJson(url, opts, timeoutMs) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs || 8000);
   try {
@@ -1870,6 +1933,7 @@ function voiceApplySnapshot(sv, doSegs) {
   if (els.voiceBadge) els.voiceBadge.classList.toggle('hidden', st !== 'recorded');
 
   renderVoiceFacts(sv);
+  renderVoiceLink();   // 「最近一次录音」取自服务端快照，随每次快照刷新
 
   // 音频来源与运行位置一律以服务端快照为准（前端不自己编造）
   if (els.voiceSrcAudio && sv.audio_source_text) els.voiceSrcAudio.textContent = sv.audio_source_text;
@@ -2780,7 +2844,7 @@ function connect() {
         els.baudSelect.value = String(m.config.baudRate || 115200);
       }
       (m.raw || []).forEach((r) => appendRaw(r.ts, r.text, r.ok));
-      if (m.fields && Object.keys(m.fields).length) renderSample(m.fields, m.lastDataAt);
+      if (m.fields && Object.keys(m.fields).length) { captureLink(m.fields); renderSample(m.fields, m.lastDataAt); }
       // 远程采集：恢复请求列表 / 模拟模式标记
       COLLECT.mockDevice = !!m.mockDevice;
       COLLECT.timeoutMs = m.collectTimeoutMs || 8000;
@@ -2831,6 +2895,7 @@ function connect() {
       S.boardTs = m.board_ts != null ? m.board_ts : S.boardTs;
       S.boardIso = m.board_iso || S.boardIso; S.seq = m.seq ?? S.seq;
       S.lastDataAt = m.ts || Date.now();
+      captureLink(m.fields || {});
       renderSample(m.fields || {}, m.ts);
       renderStatus();
       return;

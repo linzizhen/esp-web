@@ -65,6 +65,7 @@ const SUITES = [
   { name: 'voice-layout', file: 'voice-layout-contract-test.js', kind: 'unit' },
   { name: 'voice-longpress', file: 'voice-longpress-test.js', kind: 'unit' },
   { name: 'voice-mic',    file: 'voice-mic-preflight-test.js', kind: 'unit' },
+  { name: 'voice-link',   file: 'voice-link-contract-test.js', kind: 'unit' },
   { name: 'voice-asr',    file: 'voice-asr-test.js',    kind: 'integration' },
   { name: 'command-ack',  file: 'command-ack-test.js', kind: 'integration' },
   { name: 'e2e',          file: 'e2e-test.js',         kind: 'e2e', needsServer: false },

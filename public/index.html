@@ -505,6 +505,24 @@
     <section class="page" data-page="voice">
       <div class="grid">
 
+        <!-- 链路自检：一眼看出「录音为什么没到页面」 -->
+        <section class="card" style="grid-column: 1 / -1">
+          <div class="card-head">
+            <h2>链路自检 · 录音为什么没到</h2>
+            <span id="voiceLinkTag" class="tag">等待录音</span>
+          </div>
+          <div class="obs-grid">
+            <div class="obs-item"><div class="k">开发板</div><div class="v" id="voiceLinkBoard">—</div></div>
+            <div class="obs-item"><div class="k">WAV 上传通道</div><div class="v" id="voiceLinkUpload">—</div></div>
+            <div class="obs-item"><div class="k">板端 WiFi</div><div class="v" id="voiceLinkWifi">—</div></div>
+            <div class="obs-item"><div class="k">最近一次录音</div><div class="v" id="voiceLinkLast">—</div></div>
+          </div>
+          <p class="hint">
+            录音在板端完成后通过 <b>WiFi</b> 把 WAV 上传到本机服务端（不走 USB 串口）。
+            开发板离线、或板端 WiFi 没连上时，上传计数会停在 0，页面就不会有任何新录音。
+          </p>
+        </section>
+
         <!-- 四段链路总览 -->
         <section class="card" style="grid-column: 1 / -1">
           <div class="card-head">
@@ -609,6 +627,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=36"></script>
+<script src="/app.js?v=37"></script>
 </body>
 </html>
