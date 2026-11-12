@@ -17,6 +17,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { WebSocketServer } = require('ws');
 const { SerialPort } = require('serialport');
+const { createVoiceRx } = require('./voice-serial-rx.js');
 
 /* ------------------------------------------------------------------ */
 /* 配置                                                                */
@@ -2794,6 +2795,69 @@ function isDuplicateFrame(device, seq) {
   return false;
 }
 
+/* ---- 语音 WAV 串口回传（2026-11-12 新增通道）----
+ * 板端 WiFi 连不上时，录音没法用 HTTP 传回来。此时固件把 WAV 切成 base64
+ * 分块、用现有 JSON 行协议从 USB 串口发上来；这里把分块拼回二进制，再复用
+ * ingestVoiceWav() 走与 HTTP 上传完全相同的落盘 / 电平分析 / 事件链路。
+ * 上限与 HTTP 入口一致（VOICE_MAX_BYTES）；30 秒收不到 end 就整段作废，
+ * 绝不把半截字节包成一条「合法录音」。 */
+const voiceRx = createVoiceRx({
+  maxBytes: VOICE_MAX_BYTES,
+  timeoutMs: 30000,
+  maxChunks: Math.ceil(VOICE_MAX_BYTES / 1024) + 16,
+});
+
+/* 保存一段完整 WAV 并推进语音链路。HTTP 上传（/api/voice/audio）与串口回传共用。 */
+function ingestVoiceWav(buf, opts) {
+  const o = opts || {};
+  if (!buf || !buf.length) return { ok: false, error: 'empty_body' };
+  const wav = parseWavHeader(buf);
+  if (!wav.ok) {
+    return { ok: false, error: 'not_wav', detail: wav.error, riff: wav.riff, wave: wav.wave };
+  }
+  try {
+    ensureVoiceDir();
+  } catch (e) {
+    return { ok: false, error: 'storage_unavailable', message: '无法创建 data/voice 目录：' + e.message };
+  }
+  const audioId = newVoiceId();
+  const file = voiceAudioFile(audioId);
+  try {
+    // 先写临时文件再原子改名：中途失败不会留下半截 WAV 冒充合法录音
+    const tmp = file + '.part';
+    fs.writeFileSync(tmp, buf);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    console.error('[voice] WAV 落盘失败：', e.message);
+    return { ok: false, error: 'write_failed', message: 'WAV 落盘失败：' + e.message };
+  }
+  const lv = wavLevelStats(buf, wav);
+  const durNum = Number(o.durationMs);
+  const durationMs = Number.isFinite(durNum) && durNum > 0 ? Math.round(durNum) : wav.duration_ms;
+  const deviceId = o.deviceId || state.deviceId || null;
+  const r = voiceApply('recorded', {
+    audio_id: audioId,
+    device_id: deviceId,
+    bytes: buf.length,
+    duration_ms: durationMs,
+    received_at: Date.now(),
+    transport: o.transport || null,
+  });
+  console.log(`[voice] 收到 WAV ${audioId} ← ${deviceId || '(未标注设备)'} ${buf.length} 字节 / ${durationMs == null ? '?' : durationMs}ms（${o.transport || 'http'}，${wav.sample_rate || '?'}Hz ${wav.channels || '?'}ch ${wav.bits || '?'}bit，峰值 ${lv.peak_dbfs == null ? '?' : lv.peak_dbfs} dBFS）`);
+  return {
+    ok: true,
+    audio_id: audioId,
+    file: file,
+    bytes: buf.length,
+    duration_ms: durationMs,
+    wav: wav,
+    lv: lv,
+    device_id: deviceId,
+    persisted: r.persisted,
+    state: r.state,
+  };
+}
+
 function handleLine(line, source) {
   if (!line) return;
   const trimmed = line.trim();
@@ -2855,6 +2919,33 @@ function handleLine(line, source) {
           stats.linesValid++;
           pushRaw(trimmed, true);
           onVoiceUploadSummary(obj);
+          return;
+        }
+        /* 语音 WAV 串口回传（2026-11-12 新增）：板端 WiFi 不可用时，WAV 被切成
+         * base64 分块从 USB 串口发上来。这里只负责「拼字节」，拼完交给
+         * ingestVoiceWav() 落盘 —— 与 HTTP 上传走同一条链路、同一套电平分析。
+         * 分块行很长，只在原始日志里记一条摘要，绝不整行塞进环形缓冲。 */
+        if (obj.type === 'voice_begin' || obj.type === 'voice_chunk' || obj.type === 'voice_end') {
+          stats.linesValid++;
+          pushRaw('[语音串口] ' + obj.type + (obj.type === 'voice_chunk' ? ' #' + obj.seq : ''), true);
+          const vr = voiceRx.handle(obj);
+          if (vr.status === 'error') {
+            console.warn('[voice] 串口回传异常：' + vr.error + '（本次数据已丢弃，不会落盘）');
+            appendVoiceEvent({ ev: 'serial_rx_error', detail: vr.error, at: Date.now() });
+          } else if (vr.status === 'done') {
+            const m = vr.meta || {};
+            const saved = ingestVoiceWav(vr.data, {
+              deviceId: m.device_id,
+              durationMs: m.duration_ms,
+              transport: 'serial',
+            });
+            if (saved.ok) {
+              appendVoiceEvent({ ev: 'received_via_serial', detail: saved.audio_id, at: Date.now() });
+            } else {
+              console.error('[voice] 串口回传落盘失败：' + saved.error + (saved.message ? '（' + saved.message + '）' : ''));
+              appendVoiceEvent({ ev: 'serial_rx_error', detail: saved.error, at: Date.now() });
+            }
+          }
           return;
         }
         // 摄像头帧：JPEG 以 base64 内联，单独处理。
@@ -3678,52 +3769,34 @@ async function handleRequest(req, res) {
     const durNum = durRaw == null || String(durRaw).trim() === '' ? NaN : Number(durRaw);
     const durationMs = Number.isFinite(durNum) && durNum > 0 ? Math.round(durNum) : wav.duration_ms;
 
-    try {
-      ensureVoiceDir();
-    } catch (e) {
-      return json(res, 500, { ok: false, error: 'storage_unavailable', message: '无法创建 data/voice 目录：' + e.message });
+    /* 落盘 + 电平分析 + 推进链路：与串口回传共用 ingestVoiceWav()，
+     * 两条传输通道不可能出现「一边算得对、一边算错了」的分叉。 */
+    const saved = ingestVoiceWav(buf, { deviceId: deviceId, durationMs: durationMs, transport: 'wifi' });
+    if (!saved.ok) {
+      const status = saved.error === 'storage_unavailable' || saved.error === 'write_failed' ? 500 : 400;
+      return json(res, status, { ok: false, error: saved.error, message: saved.message || '' });
     }
-    const audioId = newVoiceId();
-    const file = voiceAudioFile(audioId);
-    try {
-      // 先写临时文件再原子改名：中途失败不会留下半截 WAV 冒充合法录音
-      const tmp = file + '.part';
-      fs.writeFileSync(tmp, buf);
-      fs.renameSync(tmp, file);
-    } catch (e) {
-      console.error('[voice] WAV 落盘失败：', e.message);
-      return json(res, 500, { ok: false, error: 'write_failed', message: 'WAV 落盘失败：' + e.message });
-    }
-
-    const lv = wavLevelStats(buf, wav);
-    const r = voiceApply('recorded', {
-      audio_id: audioId,
-      device_id: deviceId,
-      bytes: buf.length,
-      duration_ms: durationMs,
-      received_at: Date.now(),
-    });
-    console.log(`[voice] 收到 WAV ${audioId} ← ${deviceId || '(未标注设备)'} ${buf.length} 字节 / ${durationMs == null ? '?' : durationMs}ms（${wav.sample_rate || '?'}Hz ${wav.channels || '?'}ch ${wav.bits || '?'}bit，峰值 ${lv.peak_dbfs == null ? '?' : lv.peak_dbfs} dBFS）`);
+    const lv = saved.lv;
     return json(res, 200, {
       ok: true,
-      audio_id: audioId,
-      file: path.basename(file),
-      path: path.relative(ROOT, file).split(path.sep).join('/'),
-      bytes: buf.length,
-      duration_ms: durationMs,
+      audio_id: saved.audio_id,
+      file: path.basename(saved.file),
+      path: path.relative(ROOT, saved.file).split(path.sep).join('/'),
+      bytes: saved.bytes,
+      duration_ms: saved.duration_ms,
       riff: 'RIFF',
       wave: 'WAVE',
-      sample_rate: wav.sample_rate,
-      channels: wav.channels,
-      bits: wav.bits,
+      sample_rate: saved.wav.sample_rate,
+      channels: saved.wav.channels,
+      bits: saved.wav.bits,
       peak_dbfs: lv.peak_dbfs != null ? lv.peak_dbfs : null,
       rms_dbfs: lv.rms_dbfs != null ? lv.rms_dbfs : null,
       silent_hint: lv.silent_hint,
-      device_id: deviceId,
-      audio_url: `/api/voice/audio/${audioId}`,
-      download_url: `/api/voice/audio/${audioId}/download`,
-      event_persisted: r.persisted,
-      state: r.state,
+      device_id: saved.device_id,
+      audio_url: `/api/voice/audio/${saved.audio_id}`,
+      download_url: `/api/voice/audio/${saved.audio_id}/download`,
+      event_persisted: saved.persisted,
+      state: saved.state,
     });
   }
 

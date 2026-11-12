@@ -421,7 +421,7 @@ static void wifi_init(void)
     esp_wifi_connect();      /* 显式发起连接 */
 }
 
-static bool wifi_wait(int ms)
+bool wifi_wait(int ms)
 {
     EventBits_t bits = xEventGroupWaitBits(s_wifi_eg, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(ms));
     return (bits & WIFI_CONNECTED_BIT) != 0;

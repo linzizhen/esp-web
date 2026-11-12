@@ -77,6 +77,10 @@
 
 static const char *TAG = "VOICE";
 
+/* 由 main.c 提供（2026-11-12 起从 static 改为全局）：
+ * 判断 WiFi 是否已拿到 IP —— 决定 WAV 走 HTTP 还是走 USB 串口。 */
+extern bool wifi_wait(int ms);
+
 /* ---- 引脚（全部有 BSP 出处，见文件头）---- */
 #define VOICE_I2S_BCLK_GPIO   GPIO_NUM_41
 #define VOICE_I2S_WS_GPIO     GPIO_NUM_42
@@ -370,10 +374,115 @@ static size_t voice_capture(int *out_peak, int *out_elapsed_ms)
 }
 
 /* ------------------------------------------------------------------ */
+/* USB 串口回传（2026-11-12 新增：板子只连电脑、不连 WiFi 时用）        */
+/*                                                                     */
+/* 背景：录音本身在板端完成，但 WAV 原来只能靠 WiFi POST 到服务端。板端  */
+/* 连不上 AP 时，WAV 一个字节都传不出去，页面只能显示「未上传」。改为把  */
+/* WAV 切成 base64 分块，用服务端已有的 JSON 行协议从 USB 串口发上去：   */
+/*   {"type":"voice_begin", bytes, duration_ms, sample_rate, ...}      */
+/*   {"type":"voice_chunk", seq, data:"<base64>"}  × N                 */
+/*   {"type":"voice_end", chunks}                                      */
+/* 服务端（voice-serial-rx.js）拼回字节后走与 HTTP 完全相同的落盘链路。 */
+/* 注意：分块行按 \n 结尾，整行不超过约 2 KB —— 服务端的行缓冲上限是    */
+/* 64 KB，单行过长会顶爆环形日志，所以不要随手把 CHUNK 调大。           */
+/* ------------------------------------------------------------------ */
+#define VOICE_SERIAL_CHUNK 1536   /* 1536 字节 → base64 2048 字符 */
+
+static const char B64_TAB[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/* 标准 base64（带 '=' 补齐）。out 至少 (n/3+1)*4+1 字节。返回写入长度。 */
+static size_t b64_encode(const uint8_t *in, size_t n, char *out)
+{
+    size_t o = 0;
+    size_t i = 0;
+    for (; i + 3 <= n; i += 3) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8) | in[i + 2];
+        out[o++] = B64_TAB[(v >> 18) & 0x3f];
+        out[o++] = B64_TAB[(v >> 12) & 0x3f];
+        out[o++] = B64_TAB[(v >> 6) & 0x3f];
+        out[o++] = B64_TAB[v & 0x3f];
+    }
+    const size_t rem = n - i;
+    if (rem == 1) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        out[o++] = B64_TAB[(v >> 18) & 0x3f];
+        out[o++] = B64_TAB[(v >> 12) & 0x3f];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8);
+        out[o++] = B64_TAB[(v >> 18) & 0x3f];
+        out[o++] = B64_TAB[(v >> 12) & 0x3f];
+        out[o++] = B64_TAB[(v >> 6) & 0x3f];
+        out[o++] = '=';
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/* 走 USB 串口把整段 WAV 发给服务端。返回是否发出（服务器是否收下由服务端日志确认）。 */
+static bool voice_upload_serial(size_t pcm_bytes, int peak, int elapsed_ms)
+{
+    const uint32_t dur_ms = (uint32_t)(pcm_bytes / VOICE_BYTES_PER_MS);
+    const size_t   total  = 44 + pcm_bytes;
+
+    wav_build_header(s_wav, (uint32_t)pcm_bytes);
+
+    led_set(VOICE_LED_UPLOADING, 0);
+    s_uploading = true;
+    ESP_LOGI(TAG, "↑ 串口回传 WAV：%u 字节（%lums，WiFi 未连接）",
+             (unsigned)total, (unsigned long)dur_ms);
+
+    printf("{\"type\":\"voice_begin\",\"device\":\"%s\",\"bytes\":%u,\"duration_ms\":%lu,"
+           "\"sample_rate\":%d,\"bits\":%d,\"channels\":%d,\"peak\":%d,\"via\":\"serial\"}\n",
+           APP_DEVICE_ID, (unsigned)total, (unsigned long)dur_ms,
+           VOICE_SAMPLE_RATE, VOICE_BITS, VOICE_CHANNELS, peak);
+
+    char b64[(VOICE_SERIAL_CHUNK / 3 + 1) * 4 + 4];
+    size_t off = 0;
+    uint32_t seq = 0;
+    while (off < total) {
+        size_t n = total - off;
+        if (n > VOICE_SERIAL_CHUNK) n = VOICE_SERIAL_CHUNK;
+        b64_encode((const uint8_t *)(s_wav + off), n, b64);
+        printf("{\"type\":\"voice_chunk\",\"seq\":%lu,\"data\":\"%s\"}\n",
+               (unsigned long)seq, b64);
+        off += n;
+        seq++;
+        /* 每块让出 1 ms：USB-Serial/JTAG 的发送缓冲不大，连发太快会被丢字节 */
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    printf("{\"type\":\"voice_end\",\"device\":\"%s\",\"chunks\":%lu}\n",
+           APP_DEVICE_ID, (unsigned long)seq);
+
+    s_uploading = false;
+    led_set(VOICE_LED_OK, VOICE_LED_OK_MS);
+
+    /* 摘要行（服务端 type:'voice' 分支只留证据，不改链路状态 ——
+     * 真正的 recorded 状态由服务端拼包落盘后自己推进）。 */
+    printf("{\"type\":\"voice\",\"event\":\"serial_sent\",\"device\":\"%s\","
+           "\"source\":\"onboard_mems_mic\",\"bytes\":%u,\"duration_ms\":%lu,"
+           "\"sample_rate\":%d,\"bits\":%d,\"channels\":%d,\"riff\":\"RIFF\","
+           "\"peak\":%d,\"http\":0,\"audio_id\":\"\",\"error\":\"\","
+           "\"via\":\"serial\",\"elapsed_ms\":%d}\n",
+           APP_DEVICE_ID, (unsigned)total, (unsigned long)dur_ms,
+           VOICE_SAMPLE_RATE, VOICE_BITS, VOICE_CHANNELS, peak, elapsed_ms);
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* 上传 WAV                                                            */
 /* ------------------------------------------------------------------ */
 static bool voice_upload(size_t pcm_bytes, int peak, int elapsed_ms)
 {
+    /* 2026-11-12：WiFi 不通时改走 USB 串口。
+     * 这是「板子只连电脑」的唯一可用链路 —— 不让一整个录音白录。 */
+    if (!wifi_wait(0)) {
+        ESP_LOGW(TAG, "WiFi 未连接，改走 USB 串口回传 WAV");
+        return voice_upload_serial(pcm_bytes, peak, elapsed_ms);
+    }
+
     const uint32_t dur_ms = (uint32_t)(pcm_bytes / VOICE_BYTES_PER_MS);
     const size_t   total  = 44 + pcm_bytes;
 
