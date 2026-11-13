@@ -59,13 +59,34 @@ try {
     $engine.EndSilenceTimeout = [TimeSpan]::FromSeconds(1)
     $engine.InitialSilenceTimeout = [TimeSpan]::FromSeconds(3)
 
-    $res = $engine.Recognize([TimeSpan]::FromSeconds(20))
+    # 循环识别：Recognize() 一次只返回「一句话」。原来只调一次，长录音后面的话
+    # 全部丢掉（用户实测 8~10 秒的录音只换回一个「嗯」）。这里一直收到 $null 为止。
+    $parts = @()
+    $conf = @()
+    $firstErr = ''
+    $deadline = (Get-Date).AddSeconds(40)
+    while ((Get-Date) -lt $deadline) {
+        $res = $null
+        try {
+            $res = $engine.Recognize([TimeSpan]::FromSeconds(10))
+        } catch {
+            # 音频流读完之后再调 Recognize 会抛「没有将任何音频输入提供给此识别器」，
+            # 这是正常的结束信号，不是故障；但若一条都没识别出来就记下原因。
+            if ($parts.Count -eq 0) { $firstErr = "$($_.Exception.Message)" }
+            break
+        }
+        if (-not $res) { break }
+        if ($res.Text) { $parts += $res.Text; $conf += $res.Confidence }
+    }
     $engine.Dispose()
 
-    if ($res) {
-        Write-Result @{ ok = $true; text = $res.Text; confidence = [math]::Round($res.Confidence, 3); recognizer = $pick.Name; culture = $pick.Culture.Name }
+    if ($parts.Count -gt 0) {
+        $text = ($parts -join '')
+        $avg = 0.0
+        if ($conf.Count -gt 0) { $avg = ($conf | Measure-Object -Average).Average }
+        Write-Result @{ ok = $true; text = $text; parts = $parts.Count; confidence = [math]::Round($avg, 3); recognizer = $pick.Name; culture = $pick.Culture.Name }
     } else {
-        Write-Result @{ ok = $true; text = ''; reason = 'no_speech'; recognizer = $pick.Name; culture = $pick.Culture.Name }
+        Write-Result @{ ok = $true; text = ''; reason = 'no_speech'; first_error = $firstErr; recognizer = $pick.Name; culture = $pick.Culture.Name }
     }
 } catch {
     Write-Result @{ ok = $false; error = 'recognize_failed'; message = "$($_.Exception.Message)" }

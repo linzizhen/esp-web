@@ -96,6 +96,42 @@ function synthSpeech(text, file) {
   const missing = await asr.transcribe(path.join(tmpDir, 'no-such-file.wav'));
   ok(missing.ok === false && missing.error === 'wav_not_found', '文件不存在时如实报错', JSON.stringify(missing));
 
+  console.log('\n②b 录音预处理（高通 + 归一化）：板载麦克风录到的声音很轻，必须先把低频轰鸣切掉再放大');
+  const { normalizeForAsr } = require(path.join(ROOT, 'voice-local-asr.js'));
+  ok(typeof normalizeForAsr === 'function', '导出 normalizeForAsr()');
+  const rawSrc = fs.readFileSync(path.join(ROOT, 'voice-local-asr.js'), 'utf8');
+  ok(/hpfHz/.test(rawSrc) && /Math\.exp\(-2 \* Math\.PI \* hpfHz/.test(rawSrc), '确实做了一阶高通（系数按 hpfHz 与采样率算）');
+  ok(/targetPeak/.test(rawSrc) && /maxGainDb/.test(rawSrc), '归一化有目标峰值与最大增益上限（不会无限放大噪声）');
+  ok(/32767/.test(rawSrc) && /-32768/.test(rawSrc), '放大后按 16 bit 上下限夹紧（不产生环绕失真）');
+  const psSrc = fs.readFileSync(path.join(ROOT, 'scripts', 'asr-local.ps1'), 'utf8');
+  ok(/while\s*\(/.test(psSrc), 'PowerShell 侧循环识别（长录音里有多句话）');
+  ok(/parts/.test(psSrc), 'PowerShell 侧把多段结果拼起来返回');
+
+  if (haveTts && avail) {
+    // 把合成语音衰减 30 dB，模拟「板载麦克风录到的很轻的声音」：
+    // 归一化后仍应识别出关键词，否则说明放大/切低频没生效。
+    const quiet = path.join(tmpDir, 'quiet.wav');
+    const src = fs.readFileSync(ttsWav);
+    const quietBuf = Buffer.from(src);
+    let dataOff = 44;
+    for (let off = 12; off + 8 <= quietBuf.length;) {
+      const id = quietBuf.toString('ascii', off, off + 4);
+      const sz = quietBuf.readUInt32LE(off + 4);
+      if (id === 'data') { dataOff = off + 8; break; }
+      off += 8 + sz + (sz % 2);
+    }
+    for (let i = dataOff; i + 1 < quietBuf.length; i += 2) {
+      quietBuf.writeInt16LE(Math.round(quietBuf.readInt16LE(i) * 0.0316), i); // -30 dB
+    }
+    fs.writeFileSync(quiet, quietBuf);
+    const q = await asr.transcribe(quiet);
+    ok(q.ok === true && typeof q.text === 'string' && q.text.length > 0, '轻 30 dB 的语音经预处理后仍能识别', JSON.stringify({ text: q.text, gain_db: q.gain_db, rms: q.input_rms_db }).slice(0, 160));
+    ok(q.ok === true && /空调|温度|二十六|26/.test(q.text || ''), '轻语音的关键词仍识别正确', q.ok ? q.text : '-');
+    ok(Number(q.gain_db) > 10, '确实施加了明显增益', String(q.gain_db) + ' dB');
+  } else {
+    skipped('轻语音预处理识别', '缺少识别器或合成语音');
+  }
+
   console.log('\n③ 服务端与前端接线契约');
   const serverSrc = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
   const appSrc = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
