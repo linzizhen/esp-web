@@ -20,6 +20,9 @@ recordings/*.csv
 # 第 5 周语音链路：录音 WAV + 事件流都是真实素材（可能含人声），
 # 属用户资产，绝不入库。data/*.ndjson 只覆盖 data 根目录，管不到子目录。
 data/voice/
+# Vosk 识别的中间文件（归一化后的临时 WAV / 结果 JSON）。放在仓库内是因为
+# 系统临时目录下 Python 子进程写文件会 PermissionError（2026-11-13 实测）。
+data/.asr-tmp/
 
 # ---- 临时/调试文件 ----
 *.log

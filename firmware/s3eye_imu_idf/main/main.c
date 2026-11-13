@@ -1191,7 +1191,18 @@ static void send_frame(const char *request_id)
         s_consec_fail = 0;
         s_next_try_us = 0;
         s_backoff_log_us = 0;   /* 下次退避的日志间隔从零重算 */
-        if (s_ok % 10 == 1) ESP_LOGI(TAG, "上传成功 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
+        /* 成功摘要改为「每 60 秒一条」，不再每 10 帧一条。
+         * 原因：8 fps 下每 10 帧只有约 1.25 秒，这条日志会持续刷进服务端的
+         * 「非 JSON 行」统计，把 lines.invalid 顶到 9% 左右，看着像数据有问题。
+         * 计数本身仍逐帧累计，只是打印变稀疏。 */
+        {
+            static int64_t s_ok_log_us = 0;
+            int64_t ok_now = esp_timer_get_time();
+            if (s_ok_log_us == 0 || ok_now - s_ok_log_us >= 60000000) {
+                s_ok_log_us = ok_now;
+                ESP_LOGI(TAG, "上传成功 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
+            }
+        }
     } else {
         s_fail++;
         s_consec_fail++;
