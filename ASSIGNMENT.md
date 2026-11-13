@@ -302,7 +302,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 > 顺带修掉一个会破坏「一帧观测 = 一条记录」的真 bug：串口读取处调用
 > `handleLine()` 时漏传来源标记，导致串口数据被标成 `wifi`，且「串口优先」
 > 规则的判断条件永远不成立 —— 双通道同时在线时同一帧被记录两次
-> （实测 228 行里 107 行重复）。详见提交 `911d777`。
+> （实测 228 行里 107 行重复）。详见提交 `911d786`。
 
 **已知交互**：摄像头推流与 IMU 上报共用同一条 WiFi 链路，推流会分走一部分
 上行带宽。对照实验（每档 18 秒）显示摄像头关闭时 IMU 约 7.1~8.0 条/秒，
@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（30 个测试文件、777 项断言，全部通过）
+## 7. 自检脚本（30 个测试文件、786 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -357,7 +357,7 @@ node test/voice-stale-test.js  #  9 项  旧语音快照超过 10 分钟按历�
 node test/firmware-wifi-skip-test.js  # 16 项  固件静态契约：WiFi 未连不刷屏、upload_skip 上报、断线指数退避
 node test/voice-serial-upload-test.js # 23 项  录音 WAV 走 USB 串口回传：组装器二进制往返 + 服务端/固件契约
 node test/voice-local-asr-test.js # 14 项  本机离线识别（Windows System.Speech）：真识别合成语音、静音不瞎猜、接线契约
-node test/voice-hero-contract-test.js # 59 项  语音页「现在在做什么」决策卡与大字文字卡契约 + 指示灯心跳/四档状态契约
+node test/voice-hero-contract-test.js # 68 项  语音页「现在在做什么」决策卡与大字文字卡契约 + 指示灯心跳/四档状态契约
 ```
 
 以下需真实开发板在线，**不在**编排器内，手动跑：
