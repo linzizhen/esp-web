@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-<link rel="stylesheet" href="/style.css?v=14" />
+<link rel="stylesheet" href="/style.css?v=15" />
 <script>
 /* 主题防闪烁：样式生效前先把用户选择写到 <html data-theme>，
    否则深色用户每次刷新都会看到一帧浅色底闪一下。
@@ -641,16 +641,19 @@
           </p>
         </section>
 
-        <!-- 历史语音事件（落盘留证） -->
-        <section class="card" style="grid-column: 1 / -1">
+        <!-- 历史语音事件（落盘留证）——默认折叠：只占一行摘要，展开后列表内滚动 -->
+        <section class="card vh-card" style="grid-column: 1 / -1">
           <div class="card-head">
             <h2>历史语音事件</h2>
             <span id="voiceHistoryCount" class="mono req-id">—</span>
           </div>
-          <div id="voiceHistory" class="obs-empty">尚无语音事件。</div>
+          <details id="voiceHistBox" class="vh-box">
+            <summary class="vh-sum" id="voiceHistSummary">最近：尚无语音事件</summary>
+            <div id="voiceHistory" class="vh-list"></div>
+          </details>
           <p class="hint">
             事件已写入服务端 <code>data/voice/events.ndjson</code>（只追加不删），<b>服务重启后仍可追溯</b>。
-            这里显示最近 50 条；盘上保留全部。
+            默认折叠只显示最近一条；展开后显示最近 50 条，列表内部滚动，不再撑高整页。
           </p>
         </section>
 
@@ -661,6 +664,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=41"></script>
+<script src="/app.js?v=42"></script>
 </body>
 </html>

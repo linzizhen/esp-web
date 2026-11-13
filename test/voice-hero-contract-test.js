@@ -100,5 +100,16 @@ for (const k of ['transcribed_local', 'local_asr_empty', 'local_asr_error', 'rec
 ok(/e\.stage \|\| e\.status \|\| e\.ev/.test(APP), '事件行取键时回落到 ev 字段');
 ok(/\/app\.js\?v=(4[1-9]|[5-9]\d)/.test(HTML), 'app.js 版本号已推进（>=41）');
 
+// ⑦ 历史语音事件必须默认折叠、展开后列表内滚动（50 条不能把整页顶开）
+ok(/<details id="voiceHistBox"/.test(HTML), '历史事件用 details 折叠容器');
+ok(/id="voiceHistSummary"/.test(HTML), '折叠时有一行摘要（最近发生了什么）');
+ok(/<div id="voiceHistory"[^>]*>/.test(HTML) && !/voiceHistory"[^>]*class="obs-empty"/.test(HTML), '列表默认不再铺在页面上');
+ok(/\.vh-list \{[^}]*max-height:\s*220px/.test(CSS), '展开后的列表有 220px 上限');
+ok(/\.vh-list \{[^}]*overflow-y:\s*auto/.test(CSS), '超长时列表内部滚动，不撑高页面');
+ok(/\.vh-sum \{[^}]*min-height:\s*44px/.test(CSS), '折叠摘要行触控高度 ≥44px');
+ok(/VOICE\.hist = list/.test(APP), '渲染时缓存事件列表（折叠状态也能算摘要）');
+ok(/if \(els\.voiceHistBox && !els\.voiceHistBox\.open\) \{[\s\S]{0,120}innerHTML = ''/.test(APP), '折叠时不渲染 50 行 DOM');
+ok(/voiceHistBox\.addEventListener\('toggle'/.test(APP), '展开/收起事件已接线');
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);

@@ -82,6 +82,7 @@ const els = {
   voiceSrcAudio: $('voiceSrcAudio'), voiceSrcAsr: $('voiceSrcAsr'), voiceSrcTts: $('voiceSrcTts'),
   voiceAudioDir: $('voiceAudioDir'), voiceEventsFile: $('voiceEventsFile'),
   voiceHistory: $('voiceHistory'), voiceHistoryCount: $('voiceHistoryCount'),
+  voiceHistBox: $('voiceHistBox'), voiceHistSummary: $('voiceHistSummary'),
   // 链路自检面板（板端在线 / 上传通道 / 板端 WiFi / 最近一次录音）
   voiceLinkTag: $('voiceLinkTag'), voiceLinkBoard: $('voiceLinkBoard'),
   voiceLinkUpload: $('voiceLinkUpload'), voiceLinkWifi: $('voiceLinkWifi'),
@@ -1693,6 +1694,7 @@ const VOICE_EVENT_TEXT = {
 
 const VOICE = {
   state: null,          // 服务端最近一次全链快照（GET /api/voice/state 原样）
+  hist: [],             // 最近 50 条事件（折叠时只用来算摘要，展开才渲染）
   lastAudioId: null,    // 已接管过的 audio_id：避免轮询把同一段录音反复处理
   busy: false,          // 本机链路正在跑（播放 / 识别 / 任务 / 播报）
   seg: {
@@ -1994,33 +1996,64 @@ function renderVoiceFacts(sv) {
   if (els.voiceSrcText) els.voiceSrcText.textContent = '板载麦克风（I2S）';
 }
 
+function voiceEventRow(e) {
+  const t = e.at || e.updated_at ? fmtClock(e.at || e.updated_at) : '—';
+  // 目录里的记录有两种形状：状态快照（有 stage/status）与事件流水（只有 ev），
+  // 两种都要能查到中文，否则事件流水全部退化成「未知事件」。
+  const key = e.stage || e.status || e.ev;
+  const label = VOICE_EVENT_TEXT[key] || key || '未知事件';
+  const extra = [];
+  if (e.transcript) extra.push(`「${e.transcript}」`);
+  else if (typeof e.detail === 'string' && e.detail) extra.push(`「${e.detail}」`);
+  if (e.reply) extra.push(`intent=${e.intent || '—'} · ${e.reply}`);
+  if (e.reason) extra.push(e.reason);
+  if (e.audio_id) extra.push(e.audio_id);
+  const failKeys = ['asr_failed', 'silent', 'timeout', 'local_asr_empty', 'local_asr_error', 'serial_rx_error'];
+  const cls = failKeys.includes(key) ? 'fail' : '';
+  return { cls, text: `${escHtml(label)}` + (extra.length ? ' · ' + escHtml(extra.join(' · ')) : ''), t, key };
+}
+
+/**
+ * 历史语音事件：默认折叠。
+ * 之前把 50 条全部铺在页面上，占掉大半个屏幕；现在只露一行「最近发生了什么」，
+ * 展开后列表内部滚动（max-height），页面高度不再随事件条数增长。
+ */
 function renderVoiceHistory(hist) {
   if (!els.voiceHistory) return;
   const list = Array.isArray(hist) ? hist : [];
-  if (els.voiceHistoryCount) els.voiceHistoryCount.textContent = list.length ? `${list.length} 条` : '—';
+  VOICE.hist = list;
+  const rows = list.slice().reverse().map(voiceEventRow);
+  const fails = rows.filter((r) => r.cls === 'fail').length;
+  if (els.voiceHistoryCount) {
+    els.voiceHistoryCount.textContent = list.length
+      ? `${list.length} 条${fails ? ` · 失败 ${fails}` : ''}`
+      : '—';
+  }
+  if (els.voiceHistSummary) {
+    const latest = rows[0];
+    els.voiceHistSummary.textContent = latest
+      ? `最近：${latest.t} ${latest.text.replace(/<[^>]+>/g, '')}`
+      : '最近：尚无语音事件';
+  }
   if (!list.length) {
     els.voiceHistory.innerHTML = '<div class="obs-empty">尚无语音事件。</div>';
     return;
   }
-  // 倒序：最新的在最上面
-  const rows = list.slice().reverse().map((e) => {
-    const t = e.at || e.updated_at ? fmtClock(e.at || e.updated_at) : '—';
-    // 目录里的记录有两种形状：状态快照（有 stage/status）与事件流水（只有 ev），
-    // 两种都要能查到中文，否则事件流水全部退化成「未知事件」。
-    const key = e.stage || e.status || e.ev;
-    const label = VOICE_EVENT_TEXT[key] || key || '未知事件';
-    const extra = [];
-    if (e.transcript) extra.push(`「${e.transcript}」`);
-    else if (typeof e.detail === 'string' && e.detail) extra.push(`「${e.detail}」`);
-    if (e.reply) extra.push(`intent=${e.intent || '—'} · ${e.reply}`);
-    if (e.reason) extra.push(e.reason);
-    if (e.audio_id) extra.push(e.audio_id);
-    const failKeys = ['asr_failed', 'silent', 'timeout', 'local_asr_empty', 'local_asr_error', 'serial_rx_error'];
-    const cls = failKeys.includes(key) ? 'fail' : '';
-    return `<li class="${cls}"><span class="st-time">${t}</span>${escHtml(label)}`
-      + (extra.length ? ' · ' + escHtml(extra.join(' · ')) : '') + '</li>';
+  // 折叠时不渲染 50 行 DOM，展开才画（保持页面轻）
+  if (els.voiceHistBox && !els.voiceHistBox.open) {
+    els.voiceHistory.innerHTML = '';
+    return;
+  }
+  els.voiceHistory.innerHTML = `<ol class="steps">${rows
+    .map((r) => `<li class="${r.cls}"><span class="st-time">${r.t}</span>${r.text}</li>`)
+    .join('')}</ol>`;
+}
+
+if (els.voiceHistBox) {
+  els.voiceHistBox.addEventListener('toggle', () => {
+    if (els.voiceHistBox.open) renderVoiceHistory(VOICE.hist);
+    else if (els.voiceHistory) els.voiceHistory.innerHTML = '';
   });
-  els.voiceHistory.innerHTML = `<ol class="steps">${rows.join('')}</ol>`;
 }
 
 /** 服务端快照 → 四段状态（用于刷新后恢复，以及非本机推进的阶段） */
