@@ -291,6 +291,10 @@ const stats = {
   bytesReceived: 0,
   linesTotal: 0,
   linesValid: 0,
+  /* 设备日志行（形如 "I (123) S3EYE: ..."）单独计数。
+   * 它们既不是数据也不是「解析失败」—— 早年混算进 linesInvalid，
+   * 于是正常运行时会显示「9% 的行无效」，看着像数据出了问题（2026-11-13 修正）。 */
+  linesLogs: 0,
   linesInvalid: 0,
   lastError: null,
   lastOpenError: null,
@@ -2941,7 +2945,7 @@ function handleLine(line, source) {
   //    这类日志常含 "SDA=4"、"成功=12" 等片段，若不拦截会被键值解析器
   //    误当成传感器字段，污染展示字段与趋势曲线。日志只进原始日志，不算数据。
   if (/^[IWEDV] \(\d+\)/.test(trimmed)) {
-    stats.linesInvalid++;
+    stats.linesLogs++;
     pushRaw(trimmed, false);
     return;
   }
@@ -3096,6 +3100,13 @@ function handleLine(line, source) {
   state.connected = true;
   state.live = true;
   state.transport = transport;
+  /* 串口数据到达时把被 WiFi 覆盖掉的设备路径纠回来：
+   * 双通道都开着时 WiFi 那一路可能先把 device.path 写成 WiFi(ip)，
+   * 之后串口帧照常到站（transport 也被改回 serial），标签就与事实不符了。 */
+  if (transport === 'serial' && state.device && /^WiFi\(/.test(String(state.device.path || ''))
+      && port && port.isOpen && port.path) {
+    state.device = { path: port.path, baudRate: port.baudRate || config.baudRate };
+  }
   state.lastDataAt = recvTs;
   state.fields = disp;          // disp 已在上方算好并做过空帧守卫
   pushRaw(trimmed, true);
@@ -3590,6 +3601,8 @@ async function handleRequest(req, res) {
       lines: {
         total: stats.linesTotal,
         valid: stats.linesValid,
+        // 设备日志行（ESP_LOG 文本）：既不是数据，也不该算作「解析失败」
+        logs: stats.linesLogs || 0,
         invalid: stats.linesInvalid,
         // 双通道（串口 + WiFi 同时在线）时被丢弃的重复帧数。
         // 正常值：只连一路时为 0；两路都连时约等于其中一路的帧数。
@@ -4322,7 +4335,12 @@ async function handleRequest(req, res) {
     }
     state.transport = 'wifi';
     state.wifiSource = { ip };
-    state.device = { path: `WiFi(${ip})`, ip };
+    /* 只有串口没打开时才把「设备路径」改成 WiFi(ip)。
+     * 原实现无条件覆盖：串口在线时只要有一帧走了 WiFi（例如状态短暂断连时
+     * connected=false 让上面那条「串口优先」守卫漏过），device.path 就会从
+     * COM4 变成 WiFi(10.x.x.x)，此后 /api/diag 的 currentPort 一直显示 WiFi，
+     * 与真实的 transport=serial 互相矛盾（2026-11-13 实测就是这个现象）。 */
+    if (!serialOpen()) state.device = { path: `WiFi(${ip})`, ip };
     /* 支持 JSON 或 key=value 两种上报；WiFi 固件走 JSON，提取 device/mac/ts 等元数据。
      * 分帧规则：整体是合法 JSON（允许跨行美化格式）→ 当作一帧；
      * 否则含多行（NDJSON / 多行 key=value 批量上报）→ 逐行当一帧。
