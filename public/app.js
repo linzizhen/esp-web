@@ -1915,7 +1915,9 @@ function renderVoiceHero() {
   }
   if (els.vxTextMeta) {
     if (hasText) {
-      const eng = sv.asr_engine === 'local_windows_asr' ? '本机离线识别' : (sv.asr_engine || '识别');
+      const eng = sv.asr_engine === 'local_windows_asr' ? '本机离线识别'
+        : sv.asr_engine === 'vosk' ? '本机离线识别（Vosk）'
+        : (sv.asr_engine || '识别');
       els.vxTextMeta.textContent = eng + (sv.received_at ? ' · ' + fmtClock(sv.received_at) : '');
       els.vxTextMeta.className = 'tag tag-ok';
     } else {
@@ -2235,6 +2237,13 @@ async function voiceProbeMic() {
   } catch (e) {
     return { ok: true, skipped: 'enumerate_failed', detail: (e && e.message) || String(e) };
   }
+}
+
+/* 本机离线引擎的可读名字（服务端在 /api/voice/state 的 asr.local_engine 里告诉我们用的是哪条） */
+function voiceLocalEngineLabel(cfg) {
+  if (cfg && cfg.local_engine === 'vosk') return '本机离线识别（Vosk 中文模型）';
+  if (cfg && cfg.local_engine === 'windows_system_speech') return '本机离线识别（Windows 自带）';
+  return '本机离线识别';
 }
 
 /* 服务端转写（降级路径）：把这段 WAV 的 audio_id 交给服务端，由服务端调识别接口。
@@ -2560,10 +2569,10 @@ async function voiceStartChain(audioId) {
       }
       els.voicePlayer.src = `/api/voice/audio/${encodeURIComponent(audioId)}`;
       try { els.voicePlayer.currentTime = 0; } catch (_) {}
-      voiceSetSeg('asr', 'run', `本机没有录音设备，改用${asrCfg.local_available ? '本机离线识别（Windows 自带，录音不上传）' : '服务端转写（' + (asrCfg.model || 'GLM-ASR') + '）'}…`);
+      voiceSetSeg('asr', 'run', `本机没有录音设备，改用${asrCfg.local_available ? voiceLocalEngineLabel(asrCfg) + '（录音不上传）' : '服务端转写（' + (asrCfg.model || 'GLM-ASR') + '）'}…`);
       renderVoiceSegments();
       voiceNote(asrCfg.local_available
-        ? '本机没有可用的麦克风，浏览器识别收不到声音，已自动改用本机离线识别：WAV 直接在本机转成文字，不联网、不上传。'
+        ? '本机没有可用的麦克风，浏览器识别收不到声音，已自动改用' + voiceLocalEngineLabel(asrCfg) + '：WAV 直接在本机转成文字，不联网、不上传。'
         : '本机没有可用的麦克风，浏览器识别收不到声音，已自动改用服务端转写：把这段 WAV 直接交给识别接口，不需要本机声卡。');
       const tr = await voiceTranscribeServer(audioId);
       if (!tr.ok) {

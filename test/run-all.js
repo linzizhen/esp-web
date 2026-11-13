@@ -68,6 +68,7 @@ const SUITES = [
   { name: 'voice-link',   file: 'voice-link-contract-test.js', kind: 'unit' },
   { name: 'voice-stale',  file: 'voice-stale-test.js', kind: 'unit' },
   { name: 'voice-local-asr', file: 'voice-local-asr-test.js', kind: 'unit' },
+  { name: 'voice-vosk-asr', file: 'voice-vosk-asr-test.js', kind: 'unit' },
   { name: 'voice-serial', file: 'voice-serial-upload-test.js', kind: 'unit' },
   { name: 'fw-wifi-skip', file: 'firmware-wifi-skip-test.js', kind: 'unit' },
   { name: 'voice-hero',   file: 'voice-hero-contract-test.js', kind: 'unit' },

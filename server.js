@@ -19,9 +19,14 @@ const { WebSocketServer } = require('ws');
 const { SerialPort } = require('serialport');
 const { createVoiceRx } = require('./voice-serial-rx.js');
 const { createLocalAsr } = require('./voice-local-asr.js');
-/* 本机离线识别（Windows 自带 System.Speech）：不联网、不上传，录音不出这台电脑。
+const { createVoskAsr } = require('./voice-vosk-asr.js');
+/* 本机离线识别有两条实现，都不联网、不上传，录音不出这台电脑：
+ *   1) Vosk small-cn（首选）：Kaldi 系 DNN 模型，对远场/带噪的板载录音明显更稳
+ *      实测同一段录音 Vosk 听出「喂喂喂听得到吗…」，Windows 自带只能扒出碎片。
+ *   2) Windows 自带 System.Speech（兜底）：机器没装 Vosk 时才用。
  * 与云端 GLM-ASR 是两条独立通道：云端仍受 asrEnabled 开关约束，默认关闭。 */
 const LOCAL_ASR = createLocalAsr({ timeoutMs: 25000 });
+const VOSK_ASR = createVoskAsr({ timeoutMs: 40000 });
 
 /* ------------------------------------------------------------------ */
 /* 配置                                                                */
@@ -1868,14 +1873,42 @@ function asrTranscriptionsUrl(endpoint) {
   return base + '/v1/audio/transcriptions';
 }
 
+/* 本机离线识别引擎的优先级：Vosk 优先（DNN 模型，远场/带噪明显更稳），
+ * Windows 自带 SAPI5 兜底（对板载录音常常只能扒出碎片）。两者都没有时为 null。 */
+function localAsrEngine() {
+  if (VOSK_ASR && VOSK_ASR.probed && VOSK_ASR.probed.ok) return 'vosk';
+  if (LOCAL_ASR && LOCAL_ASR.probed && LOCAL_ASR.probed.ok) return 'windows_system_speech';
+  return null;
+}
+
+/* 用本机引擎转写一段已落盘的 WAV。返回统一形状，便于上层不关心用的是哪个引擎。 */
+async function transcribeLocal(file) {
+  const engine = localAsrEngine();
+  if (engine === 'vosk') {
+    const r = await VOSK_ASR.transcribe(file);
+    const text = r && r.ok ? String(r.text || '').trim() : '';
+    return { engine: 'vosk', model: (r && r.model) || null, confidence: (r && r.confidence != null ? r.confidence : null),
+      text, ok: !!(r && r.ok), reason: (r && r.ok ? (text ? null : 'no_speech') : (r && r.error) || 'local_asr_error') };
+  }
+  if (engine === 'windows_system_speech') {
+    const r = await LOCAL_ASR.transcribe(file);
+    const text = r && r.ok ? String(r.text || '').trim() : '';
+    return { engine: 'windows_system_speech', model: (r && r.recognizer) || null,
+      confidence: (r && r.confidence != null ? r.confidence : null),
+      text, ok: !!(r && r.ok), reason: (r && r.ok ? (text ? null : 'no_speech') : (r && r.error) || 'local_asr_error') };
+  }
+  return { engine: null, ok: false, text: '', reason: 'engine_unavailable' };
+}
+
 /* 给前端看的转写配置（脱敏）。configured=false 时前端应改走文字入口，而不是硬试。 */
 function asrConfigView() {
   const configured = !!(ASR.endpoint && ASR.apiKey);
   let host = null;
   try { host = ASR.endpoint ? new URL(ASR.endpoint).host : null; } catch (_) { /* 非法 URL */ }
+  const localEngine = localAsrEngine();
   return {    enabled: ASR.enabled,
-    local_available: !!(LOCAL_ASR && LOCAL_ASR.probed && LOCAL_ASR.probed.ok),
-    local_engine: 'windows_system_speech',
+    local_available: !!localEngine,
+    local_engine: localEngine,
     configured,
     endpoint: ASR.endpoint || null,
     model: ASR.model,
@@ -1921,20 +1954,19 @@ async function voiceTranscribe(audioId) {
     } };
   }
   if (!ASR.enabled) {
-    /* 云端默认关闭，但本机离线识别不需要联网也不需要账号 —— 先试它。 */
-    const lr = await LOCAL_ASR.transcribe(file);
-    if (lr && lr.ok) {
-      const text = String(lr.text || '').trim();
-      if (text) {
+    /* 云端默认关闭，但本机离线识别不需要联网也不需要账号 —— 先试它（Vosk 优先）。 */
+    const lr = await transcribeLocal(file);
+    if (lr.ok) {
+      if (lr.text) {
         return { http: 200, body: {
-          ok: true, audio_id: audioId, engine: 'local_windows_asr',
-          model: lr.recognizer || null, confidence: (lr.confidence != null ? lr.confidence : null),
-          text: text, transcript: text, uploaded: false,
+          ok: true, audio_id: audioId, engine: lr.engine,
+          model: lr.model, confidence: lr.confidence,
+          text: lr.text, transcript: lr.text, uploaded: false,
         } };
       }
       return { http: 200, body: {
-        ok: false, error: 'no_speech', audio_id: audioId, engine: 'local_windows_asr',
-        message: '本机离线识别没听出内容（桌面识别器对远场与噪声比较敏感）。请靠近板载麦克风、放慢语速重录，或改用文字输入。',
+        ok: false, error: 'no_speech', audio_id: audioId, engine: lr.engine,
+        message: '本机离线识别没听出内容。请靠近板载麦克风（10~20 厘米）、放慢语速重录，或改用文字输入。',
       } };
     }
   }
@@ -2869,10 +2901,10 @@ function ingestVoiceWav(buf, opts) {
   console.log(`[voice] 收到 WAV ${audioId} ← ${deviceId || '(未标注设备)'} ${buf.length} 字节 / ${durationMs == null ? '?' : durationMs}ms（${o.transport || 'http'}，${wav.sample_rate || '?'}Hz ${wav.channels || '?'}ch ${wav.bits || '?'}bit，峰值 ${lv.peak_dbfs == null ? '?' : lv.peak_dbfs} dBFS）`);
   /* 自动转写：录音一到就尽量把文字准备好，用户不必再点一次「重新识别」。
    * 只在本机做（离线识别）；云端转写仍受 asrEnabled 约束，绝不在这里偷偷外发。 */
-  if (!ASR.enabled && LOCAL_ASR) {
-    LOCAL_ASR.transcribe(file).then((lr) => {
+  if (!ASR.enabled) {
+    transcribeLocal(file).then((lr) => {
       if (!lr || !lr.ok) {
-        appendVoiceEvent({ ev: 'local_asr_error', audio_id: audioId, at: Date.now(), detail: (lr && (lr.error || lr.message)) || 'unknown' });
+        appendVoiceEvent({ ev: 'local_asr_error', audio_id: audioId, at: Date.now(), detail: (lr && (lr.reason || lr.error)) || 'unknown' });
         return;
       }
       const text = String(lr.text || '').trim();
@@ -2880,9 +2912,9 @@ function ingestVoiceWav(buf, opts) {
         appendVoiceEvent({ ev: 'local_asr_empty', audio_id: audioId, at: Date.now(), detail: '本机离线识别未听出内容' });
         return;
       }
-      voiceApply('transcribed', { audio_id: audioId, transcript: text, asr_engine: 'local_windows_asr' });
+      voiceApply('transcribed', { audio_id: audioId, transcript: text, asr_engine: lr.engine });
       appendVoiceEvent({ ev: 'transcribed_local', audio_id: audioId, at: Date.now(), detail: text });
-      console.log('[voice] 本机离线识别 ' + audioId + ' → 「' + text + '」');
+      console.log('[voice] 本机离线识别（' + lr.engine + '）' + audioId + ' → 「' + text + '」');
     }).catch((e) => { console.warn('[voice] 本机离线识别异常：', e && e.message); });
   }
   return {
@@ -4476,8 +4508,13 @@ server.listen(config.httpPort, config.host, () => {
   console.log('==========================================================');
   loadHelpHistory();   // 回读历史求助事件（重启不丢证据）
   loadVoiceHistory();  // 回读历史语音事件（重启不丢语音链路证据）
-  LOCAL_ASR.available().then((a) => {
-    console.log('[voice] 本机离线识别（Windows System.Speech）：' + (a ? '可用' : '不可用'));
+  // 启动时把两条本机离线引擎都探一次，日志里如实写清用的是哪条
+  Promise.all([VOSK_ASR.available(), LOCAL_ASR.available()]).then(([v, s]) => {
+    const vOk = !!(v && v.ok);
+    const sOk = !!(s && s.ok);
+    console.log('[voice] 本机离线识别 Vosk：' + (vOk ? '可用' : '不可用') + (vOk ? '' : '（' + ((v && v.error) || '未知原因') + '）'));
+    console.log('[voice] 本机离线识别 Windows System.Speech：' + (sOk ? '可用（兜底）' : '不可用'));
+    console.log('[voice] 当前首选本机引擎：' + (localAsrEngine() || '无（只能在页面用文字输入）'));
   });
   if (config.autoDetect || config.portPath) startScanning();
 });

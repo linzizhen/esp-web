@@ -556,10 +556,20 @@ function staticContract() {
     ok(stageSeq.includes('transcribed') && stageSeq.includes('silent') && stageSeq.includes('timeout'),
       '四个分支都留下了事件证据', stageSeq.join(' → '));
 
-    // 所有 stage 一律以 event 的 stage 字段为准（兼容 status 别名）
-    ok(evs.every((e) => ['recorded', 'transcribed', 'asr_failed', 'task_running',
-      'task_done', 'spoken', 'silent', 'timeout'].includes(e.stage)),
-      '落盘事件阶段值全部合法');
+    // 所有 stage 一律以 event 的 stage 字段为准（兼容 status 别名）。
+    // 注意：events.ndjson 里混着两种记录 —— 状态快照（带 stage）与事件流水（带 ev，
+    // 例如 transcribed_local / local_asr_empty / received_via_serial / serial_rx_error）。
+    // 事件流水本来就没有 stage，不能拿 stage 白名单去判它；它该用 ev 白名单判。
+    const KNOWN_STAGES = ['recorded', 'transcribed', 'asr_failed', 'task_running',
+      'task_done', 'spoken', 'silent', 'timeout'];
+    const KNOWN_EVS = ['received', 'cancelled', 'ack_sent', 'ack_mock', 'ack_failed', 'cancel_sent',
+      'ack_delivered', 'ack_rejected', 'cancel_delivered', 'reset',
+      'transcribed_local', 'local_asr_empty', 'local_asr_error',
+      'received_via_serial', 'serial_rx_error'];
+    ok(evs.every((e) => (e.stage ? KNOWN_STAGES.includes(e.stage) : KNOWN_EVS.includes(e.ev))),
+      '落盘事件阶段值/事件名全部合法',
+      evs.filter((e) => !(e.stage ? KNOWN_STAGES.includes(e.stage) : KNOWN_EVS.includes(e.ev)))
+        .map((e) => JSON.stringify({ stage: e.stage, ev: e.ev })).join(',') || '全部合法');
 
     const eventsBefore = evs.length;
     await stopServer(srv);
