@@ -601,42 +601,71 @@ POST /api/voice/record {"action":"start"} → ack_status=recording  waited_ms=27
 「板子录了音，页面上却看不到文字」的根因不是识别坏了，而是原来只有两条路：
 浏览器 Web Speech（只能听**麦克风**，这台电脑没有录音设备）与云端 GLM-ASR
 （要把 WAV 发给厂商，默认关闭）。两条都走不通，于是只能显示「未识别」。
+现在补了第三条：**本机离线识别**——录音在这台电脑上转成文字，不联网、不上传、
+不需要账号与费用。
 
-现在补了第三条：**Windows 自带的 System.Speech 中文桌面识别器**（本机实测
-MS-2052-80-DESK / zh-CN）。录音在本机转文字，不联网、不上传、不需要账号与费用。
+### 实现（第一版：Windows 自带 System.Speech）
 
-### 实现
-
-- oice-local-asr.js：createLocalAsr() 暴露 vailable() 与 	ranscribe(wavPath)；
-  内部 execFile 调 scripts/asr-local.ps1，结果写成 UTF-8 JSON 文件再读回
+- `voice-local-asr.js`：`createLocalAsr()` 暴露 `available()` 与 `transcribe(wavPath)`；
+  内部 `execFile` 调 `scripts/asr-local.ps1`，结果写成 UTF-8 JSON 文件再读回
   （避免 PowerShell 控制台按 GBK 输出把中文弄成乱码 —— 这是踩过的坑）。
-- scripts/asr-local.ps1：**必须存成带 BOM 的 UTF-8**，否则 Windows PowerShell 5.1
+- `scripts/asr-local.ps1`：**必须存成带 BOM 的 UTF-8**，否则 Windows PowerShell 5.1
   会把中文当 ANSI 解析、直接语法报错（字符串缺少终止符）。
-- server.js：
-  - ingestVoiceWav() 落盘后**自动**跑一次本机识别，成功就 oiceApply('transcribed')
-    并记 	ranscribed_local 事件 —— 用户不用再点「重新识别」；
-  - POST /api/voice/transcribe 在云端关闭时先走本机引擎（返回 engine:"local_windows_asr"、
-    uploaded:false），本机也没有识别器才回落到原来的 503 sr_disabled；
-  - srConfigView() 增加 local_available / local_engine；
-  - 启动时探测一次，日志打印「本机离线识别（Windows System.Speech）：可用/不可用」。
-- 前端 public/app.js：无麦克风时若 sr.local_available 为真，直接走本机识别，
-  文案与识别段标签也随之区分「本机离线识别 / 服务端转写」。
+- 识别前先做 200 Hz 一阶高通（切掉板载麦克风收到的低频轰鸣）并按有效段峰值归一化
+  （跳过开头按键撞击，放大上限 24 dB），再交给识别器；长录音按 10 秒分句识别后拼接。
+- `server.js`：
+  - `ingestVoiceWav()` 落盘后**自动**跑一次本机识别，成功就 `voiceApply('transcribed')`
+    并记 `transcribed_local` 事件 —— 用户不用再点「重新识别」；
+  - `POST /api/voice/transcribe` 在云端关闭时先走本机引擎，本机也没有识别器才回落到
+    原来的 503 `asr_disabled`；
+  - `asrConfigView()` 增加 `local_available` / `local_engine`；
+  - 启动时把两条本机引擎都探测一次并打日志，如实写明当前首选哪条。
+- 前端 `public/app.js`：无麦克风时若 `asr.local_available` 为真，直接走本机识别，
+  文案与识别段标签按 `local_engine` 区分「Vosk 中文模型 / Windows 自带」。
 
-### 真机/接口实测
+### 2026-11-13 追加：首选引擎换成 Vosk（关键改进）
 
-`
-POST /api/voice/transcribe {"audio_id":"voice-20261112-151900-001-ab12"}
-→ {"ok":true,"engine":"local_windows_asr","model":"MS-2052-80-DESK",
-   "confidence":0.152,"text":"请把空调温度调到","uploaded":false}
-静音 WAV → {"ok":true,"text":"","reason":"no_speech"}   ← 听不出就如实返回空，不瞎猜
-`
+**为什么换。** 同一批板端录音（10 秒、峰值 −28.9 dBFS、300 Hz 以下占 52% 能量），
+两条引擎的结果差一个量级：
 
-### 边界（必须知道）
+| 录音 | Windows 自带（SAPI5） | **Vosk small-cn** |
+|---|---|---|
+| `voice-20261113-095432-081-59e9` | 空 / 碎片「我也区」 | **「喂喂喂听得到吗听得到吗你听得到吗听得到吗」**（置信度 0.956） |
+| `voice-20261113-095516-507-a13c` | 空 | 「呢得到吗」（0.669） |
+| 合成语音（衰减 30 dB，RMS −52.6 dBFS） | 「请把空调温度调16 kWh」 | 「请把空调温度调到二十六六度」 |
 
-- 桌面识别器模型较老：安静环境、离板子近、语速正常时可用；远场/嘈杂/口音重时
-  识别率明显下降，也**不会**把整句都认全（实测尾字常被吞）。听不出就返回空文本，
-  页面显示「没听出内容」，绝不编造。
-- 只在 Windows 上可用；没有安装中文识别器的机器上 local_available=false，
-  自动回落到原来的提示。
-- 云端 GLM-ASR 仍是可选升级项（config.local.json 里 srEnabled: true），
-  开与不开都不会让本机这条失效。
+差距不在算法与接线（同样的预处理、同样的 WAV），而在**声学模型**：SAPI5 是 2007 年的
+听写模型，Vosk 是近年的 Kaldi/DNN 模型。因此 `localAsrEngine()` 让 Vosk 优先、SAPI 兜底，
+两者都没有时 `local_available=false`，页面明说「只能用文字输入」，不许假装能用。
+
+**安装（一次性，装在本仓库同级目录，不进仓库）**
+
+```powershell
+# 1) 建一个独立 venv（不要污染 ESP-IDF 的 python 环境）
+python -m venv D:\workBUDDY\esp32\.asr-venv        # 本机用的是 ESP-IDF 自带 3.11 解释器
+D:\workBUDDY\esp32\.asr-venv\Scripts\python.exe -m pip install vosk -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir
+
+# 2) 下中文小模型（41.9 MB）并解压到 .asr-model
+#    https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip
+```
+
+**接线**
+
+- `voice-vosk-asr.js`：`createVoskAsr({ timeoutMs })` → `{ available(), transcribe(wav), engine:'vosk' }`；
+  解释器默认 `../.asr-venv/Scripts/python.exe`（`ASR_VOSK_PYTHON` 覆盖），
+  模型默认 `../.asr-model/vosk-model-small-cn-0.22`（`ASR_VOSK_MODEL` 覆盖）。
+- `scripts/asr-vosk.py`：`wave` 读 PCM，`KaldiRecognizer(model, rate)` + `AcceptWaveform` 循环，
+  `SetWords(True)` 取词级置信度；只接受 16 bit 单声道（否则如实报 `not_pcm16_mono`）。
+- 中间 JSON 写在 `data/.asr-tmp/`（已被 `.gitignore` 覆盖）而**不是系统临时目录**：
+  实测系统 TMP 下 Python 子进程报 `PermissionError: [Errno 13]`，换仓库内目录即正常。
+- 启动日志示例：`[voice] 本机离线识别 Vosk：可用` / `当前首选本机引擎：vosk`。
+
+**边界（必须知道）**
+
+- 听不出就返回空文本（`reason:"no_speech"`），页面显示「没听清」，**绝不编造**。
+- 板载麦克风是远场、低频重的拾音；说话离板子 10~20 厘米、语速别太快，识别率才稳。
+- 云端 GLM-ASR 仍是可选升级项（`config.local.json` 里 `"asrEnabled": true`）。
+  注意 2026-11-13 实测该配置里的智谱 API Key 已失效：`/api/nl/config/test` 与
+  `/api/voice/transcribe` 都返回 401「身份验证失败」，故当时已把它改回 `false`；
+  换一把有效 Key 后再开，云端与 NL 才能用。
+- 没有装 Vosk 的机器上自动退回 SAPI；两条都没有时页面明确提示改走「文字入口」。
