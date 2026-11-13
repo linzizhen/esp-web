@@ -92,5 +92,13 @@ for (const s of ['录音中（常亮）', '回传中（快闪 120ms）', '成功
   ok(MAIN_C.includes(s), `指示灯日志含「${s}」`);
 }
 
+// ⑥ 语音事件文案：事件流水（只有 ev、没有 stage）也必须查到中文，
+//    否则整片显示成「未知事件」——用户会以为又出新故障
+for (const k of ['transcribed_local', 'local_asr_empty', 'local_asr_error', 'received_via_serial', 'serial_rx_error']) {
+  ok(APP.includes(k + ":"), `事件文案表含 ${k}`);
+}
+ok(/e\.stage \|\| e\.status \|\| e\.ev/.test(APP), '事件行取键时回落到 ev 字段');
+ok(/\/app\.js\?v=(4[1-9]|[5-9]\d)/.test(HTML), 'app.js 版本号已推进（>=41）');
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);

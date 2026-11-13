@@ -1683,6 +1683,12 @@ const VOICE_EVENT_TEXT = {
   spoken: '浏览器已播报',
   silent: '没有检测到语音（未进入识别）',
   timeout: '链路超时',
+  // 下面这些是「事件记录」（只有 ev，没有 stage），漏掉就会显示成「未知事件」
+  transcribed_local: '本机离线识别成功（录音未上传）',
+  local_asr_empty: '本机离线识别没听出内容',
+  local_asr_error: '本机离线识别出错',
+  received_via_serial: 'WAV 经 USB 串口回传完成',
+  serial_rx_error: '串口回传出错（分块丢失或超时）',
 };
 
 const VOICE = {
@@ -1999,13 +2005,18 @@ function renderVoiceHistory(hist) {
   // 倒序：最新的在最上面
   const rows = list.slice().reverse().map((e) => {
     const t = e.at || e.updated_at ? fmtClock(e.at || e.updated_at) : '—';
-    const label = VOICE_EVENT_TEXT[e.stage || e.status] || e.stage || '未知事件';
+    // 目录里的记录有两种形状：状态快照（有 stage/status）与事件流水（只有 ev），
+    // 两种都要能查到中文，否则事件流水全部退化成「未知事件」。
+    const key = e.stage || e.status || e.ev;
+    const label = VOICE_EVENT_TEXT[key] || key || '未知事件';
     const extra = [];
     if (e.transcript) extra.push(`「${e.transcript}」`);
+    else if (typeof e.detail === 'string' && e.detail) extra.push(`「${e.detail}」`);
     if (e.reply) extra.push(`intent=${e.intent || '—'} · ${e.reply}`);
     if (e.reason) extra.push(e.reason);
     if (e.audio_id) extra.push(e.audio_id);
-    const cls = e.stage === 'asr_failed' || e.stage === 'silent' || e.stage === 'timeout' ? 'fail' : '';
+    const failKeys = ['asr_failed', 'silent', 'timeout', 'local_asr_empty', 'local_asr_error', 'serial_rx_error'];
+    const cls = failKeys.includes(key) ? 'fail' : '';
     return `<li class="${cls}"><span class="st-time">${t}</span>${escHtml(label)}`
       + (extra.length ? ' · ' + escHtml(extra.join(' · ')) : '') + '</li>';
   });
