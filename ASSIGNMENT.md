@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（31 个测试文件、835 项断言，全部通过）
+## 7. 自检脚本（32 个测试文件、848 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -359,6 +359,7 @@ node test/voice-serial-upload-test.js # 23 项  录音 WAV 走 USB 串口回传�
 node test/voice-local-asr-test.js # 23 项  本机离线识别（Windows System.Speech）：真识别合成语音、静音不瞎猜、接线契约
 node test/voice-vosk-asr-test.js # 28 项  本机离线识别（Vosk 中文模型）：真识别合成语音、静音不瞎猜、引擎优先序契约
 node test/voice-hero-contract-test.js # 68 项  语音页「现在在做什么」决策卡与大字文字卡契约 + 指示灯心跳/四档状态契约
+node test/diag-hygiene-test.js # 13 项  /api/diag 口径：设备日志行单独计数、不再算「无效行」；设备路径不被 WiFi 标签冒充
 ```
 
 以下需真实开发板在线，**不在**编排器内，手动跑：
