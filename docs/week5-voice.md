@@ -665,7 +665,10 @@ D:\workBUDDY\esp32\.asr-venv\Scripts\python.exe -m pip install vosk -i https://p
 - 听不出就返回空文本（`reason:"no_speech"`），页面显示「没听清」，**绝不编造**。
 - 板载麦克风是远场、低频重的拾音；说话离板子 10~20 厘米、语速别太快，识别率才稳。
 - 云端 GLM-ASR 仍是可选升级项（`config.local.json` 里 `"asrEnabled": true`）。
-  注意 2026-11-13 实测该配置里的智谱 API Key 已失效：`/api/nl/config/test` 与
-  `/api/voice/transcribe` 都返回 401「身份验证失败」，故当时已把它改回 `false`；
-  换一把有效 Key 后再开，云端与 NL 才能用。
+  2026-11-13 那把智谱 API Key 已失效（`/api/nl/config/test` 与 `/api/voice/transcribe`
+  都返回 401「身份验证失败」），**2026-11-16 换新 Key 后 NL 已恢复**：
+  `/api/nl/config/test` 返回 `ok:true`（latencyMs 1326），`/api/nl` 的
+  `source` 从 `rule` 变回 `llm`，实测「查看上次数据」能答出真实记录。
+  ASR（语音转写）仍保持 `false`：本机 Vosk 已能离线出文字，云端转写要上传
+  录音给厂商，等确认费用后再决定是否开启。
 - 没有装 Vosk 的机器上自动退回 SAPI；两条都没有时页面明确提示改走「文字入口」。
