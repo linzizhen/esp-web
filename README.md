@@ -546,7 +546,7 @@ Web 页「**语音**」标签页让佩戴者**按 BOOT 键说一句话**，查�
 ```bash
 node test/voice-hil.js --speak    # 真机：录音 → 上传 → 独立复核 WAV 电平（需硬件）
 node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
-node test/voice-test.js           # 104 项接口契约（隔离实例 + 合成 WAV，无需硬件）
+node test/voice-test.js           # 112 项接口契约（隔离实例 + 合成 WAV，无需硬件）
 node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/timeout/mock，无需硬件）
 ```
 
@@ -605,7 +605,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **35 个测试文件、941 项断言**，一条命令：
+全套 **35 个测试文件、949 项断言**，一条命令：
 
 ```bash
 npm test

@@ -142,7 +142,7 @@ node test/probe-voice-stop.js 5 2
 ### 验证 3：接口契约（无需硬件）
 
 ```powershell
-node test/voice-test.js          # 104 项：隔离实例 + 合成 WAV
+node test/voice-test.js          # 112 项：隔离实例 + 合成 WAV
 node test/voice-layout-contract-test.js   # 25 项：数据布局静态契约
 node test/voice-longpress-test.js         # 26 项：长按 2 秒录音的按键语义契约
 node test/voice-mic-preflight-test.js     # 24 项：识别前麦克风自检契约
@@ -507,7 +507,7 @@ Web Speech API 的设计前提是"麦克风实时拾音"，**没有任何接口�
 | `server.js` | `/api/voice*` 七个接口 + 阶段状态机 + WAV 校验 + 事件落盘；收尾新增 `sendCommandAndWaitAck()` 等板端 ack；2026-10-30 新增 `POST /api/voice/transcribe`（服务端转写，**默认关闭**） |
 | `public/app.js` | 语音页：录音回放、Web Speech 识别、`speechSynthesis` 播报 |
 | `public/index.html` | 语音页 DOM（样式全部复用既有类，未新增 CSS） |
-| `test/voice-test.js` | 新增，104 项接口契约 |
+| `test/voice-test.js` | 新增，112 项接口契约 |
 | `test/voice-hil.js` | 新增，真机端到端（需硬件），含板端回执核对与 45 秒等待预算 |
 | `test/voice-layout-contract-test.js` | 新增，25 项数据布局静态契约 |
 | `test/voice-longpress-test.js` | 新增，26 项按键语义契约：**按下不录、短按松手不录、录音中按键立即停**（2026-11-02） |
@@ -546,6 +546,68 @@ Web Speech API 的设计前提是"麦克风实时拾音"，**没有任何接口�
 | 阶段状态机 + 失败可见 | 任何多步骤异步流程 |
 
 ★ 迁移时保留的判据：**没有证据就不许报成功**。这条比代码本身更重要。
+
+---
+
+## 八、课堂验收补记（2026-11-16）
+
+课程验收里还有三条要「看得见证据」，这里逐条补上，并写清哪一条能自动化、哪一条只能现场演示。
+
+### 8.1 停止说话后的超时反馈
+
+**服务端契约**（`test/voice-test.js` 第 ⑥b 组，8 项断言，本次新增，该文件 104 → 112 项）：
+
+| 要证的事 | 实测 |
+|---|---|
+| `timeout` 阶段能写入并读回 | `POST /api/voice/state {stage:"timeout"}` → 200，`stage=timeout` |
+| 没传原因时不能空着 | 服务端补「链路等待超时」 |
+| 超时仍指向本次录音 | `audio_id` 保留 → 能回放确认「刚才说了什么」 |
+| 前端上报的具体原因不被覆盖 | 传「识别超时：浏览器 20 秒内没有返回结果…」原样保留 |
+| 事件落盘留证 | `events.ndjson` 里 `stage=timeout` 且都带 `reason` |
+
+**前端文案**（同组静态断言，防止有人把文案删了却以为还有反馈）：
+
+- 横幅：「链路超时（可改用文字入口）」+「如果反复超时，直接用下方「文字入口」输入同一句话，避免一直等」
+- 大字卡：「这次链路超时了」+「可以直接重录一次；如果反复超时，看下面「链路自检」里的板端 WiFi 与上传计数」
+- 分段归因：`识别超时` / `任务执行超时` / `播报超时` 三段各有文案，能看出超在哪一步
+
+**真实超时的三个来源与验证方式**：
+
+| 超时来源 | 超时阈值 | 验证方式 |
+|---|---|---|
+| 浏览器 Web Speech 一直不出结果 | 20 秒（`VOICE_ASR_TIMEOUT_MS`） | ❌ 无法脚本化（需真人 + 厂商识别服务）→ 课堂现场演示：对着板子说一句后**停住不说**，等横幅出现 |
+| 服务端 ASR 上游太慢 | `ASR.timeoutMs` 默认 30 秒 | ✅ `test/voice-asr-test.js` ⑦（假 ASR 服务故意拖延 → 504 `asr_timeout`） |
+| 任务下发后等不到新观测 | `collectTimeoutMs` 默认 8 秒 | ✅ 见 8.2 表 2 实测 `evidence.status=timeout` |
+
+★ 界面上「超时」绝不会显示成成功：`voiceSetSeg` 只有拿到真实文字或真实回执才置 `done`。
+
+### 8.2 同一句任务对照文字入口与语音入口
+
+**方法**（隔离实例，不碰生产、不污染真实录音）：
+
+1. 起隔离实例：独立端口 + `DATA_DIR=test/.test-data-compare-<pid>` + `NL_REPLY_MODE=template`（规则回复，排除 LLM 措辞随机性）。
+2. 用本机 TTS 合成一句话（16 kHz / 16 bit / 单声道，与板端录音格式一致），按「授权录音」路径 `POST /api/voice/audio?duration_ms=…` 上传。
+3. 服务端 Vosk 自动转写出文字 → 页面拿到文字后会调 `/api/nl`（`public/app.js` 的 `voiceTaskAndSpeak` 就是这一步），本实验用同一请求复现，即**语音入口**。
+4. 同一句原文直接 `POST /api/nl`，即**文字入口**。两边结果逐字段比对。
+
+| 句子 | 识别出的文字 | 语音入口 | 文字入口 | 一致 |
+|---|---|---|---|---|
+| 查看上次数据 | 查看上次数据 | `intent=query_last`、`tool=query_last`、`params={device:null}` | 同左，回复一字不差 | ✅ |
+| 重新采集一次 | 重新采集一次 | `intent=collect_once`、`evidence.status=timeout`、回复「未能确认采集完成：命令通道不可用…超时≠硬件故障」 | 同左，回复一字不差 | ✅ |
+
+两次 `audio_id` 分别为 `voice-20261116-141405-751-8302`、`voice-20261116-141426-721-0ecd`（隔离实例内，已随临时目录删除）。
+
+**结论**：同一句话无论从哪个入口进来，任务判定与回执语义一致；差别只在入口本身——语音多一步转写，可能听错字（例如早前真人录音被识别成「做得很漂亮漂亮」）。
+
+**诚实边界**：这两句是 TTS 合成的「授权录音」，不是真人对着板子说。板载麦克风是远场拾音，真人需要靠近板子说话（已多次实测：3 米外只能收到环境声）。
+
+### 8.3 播报：本轮不做
+
+板端 `BSP_CAPS_AUDIO_SPEAKER = 0`，物理上没有扬声器，所以「听到开发板回答」不可能发生在板子上。按项目决定，本轮**不把播报作为验收项**：
+
+- 代码与文档保留（`voiceSpeak()`、失败文案、`stage=spoken` 的写入条件），要验证时在有扬声器的电脑上跑 `node test/voice-hil.js --speak`；
+- 页面上「回复」始终以文字形式可见，播报只是附加；
+- 任何「已播报」的判断只看 `speechSynthesis` 的 `onend`，没有真实发声证据时如实写「未实际发声」。
 
 ---
 

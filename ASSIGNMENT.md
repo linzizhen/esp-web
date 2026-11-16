@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（35 个测试文件、941 项断言，全部通过）
+## 7. 自检脚本（35 个测试文件、949 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -345,7 +345,7 @@ node test/help-test.js        # 26 项  第 3 周教学求助闭环（状态不�
 node test/nl-test.js          # 37 项  第 4 周意图解析与诚实性回复
 node test/nl-config-test.js   # 44 项  第 4 周 LLM 配置增删改查与降级
 node test/handleline-guard-test.js  # 23 项  空帧守卫：只含元数据的帧不落盘（8091）
-node test/voice-test.js       # 104 项 第 5 周语音链路接口契约（8090）
+node test/voice-test.js       # 112 项 第 5 周语音链路接口契约（8090）
 node test/voice-layout-contract-test.js  # 25 项  第 5 周 WAV 数据布局静态契约
 node test/voice-longpress-test.js  # 26 项  第 5 周长按 2 秒录音：按下不录、放宽松开不录、录音中按键即停
 node test/voice-mic-preflight-test.js    # 24 项  第 5 周识别前麦克风自检（零设备不得说成"权限被拒"）
@@ -802,7 +802,7 @@ BOOT 键 → 板载 MEMS 麦克风 I2S 直采 → WAV(16kHz/16bit/单声道)
 ```bash
 node test/voice-hil.js --speak            # 真机：录音 → 上传 → 独立复核 WAV 电平
 node test/probe-voice-stop.js 5 2         # 真机探针：5 轮 start → 2s → stop 时长稳定性
-node test/voice-test.js                   # 104 项接口契约（隔离实例 + 合成 WAV）
+node test/voice-test.js                   # 112 项接口契约（隔离实例 + 合成 WAV）
 node test/voice-layout-contract-test.js   # 25 项数据布局静态契约
 node test/voice-asr-test.js               # 50 项服务端转写契约（含「未启用零外发」）
 ```
