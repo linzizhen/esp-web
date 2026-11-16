@@ -672,3 +672,83 @@ D:\workBUDDY\esp32\.asr-venv\Scripts\python.exe -m pip install vosk -i https://p
   ASR（语音转写）仍保持 `false`：本机 Vosk 已能离线出文字，云端转写要上传
   录音给厂商，等确认费用后再决定是否开启。
 - 没有装 Vosk 的机器上自动退回 SAPI；两条都没有时页面明确提示改走「文字入口」。
+
+---
+
+## 附：2026-11-16 新增 —— 云端转写失败自动回退本机（429 实测驱动的修复）
+
+### 现象与取证
+
+当天真机实测云端转写：四段**真实板载录音**逐一调 `POST /api/voice/transcribe`，
+全部返回 **HTTP 502**，上游原文是：
+
+```json
+{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}
+```
+
+耗时 92 / 102 / 162 / 214 ms（这么快说明不是网络问题）。同一条 Key 拉
+`/api/paas/v4/models` 能拿到 12 个对话模型（`glm-4.5` … `glm-5.3-flashx-legal`），
+**里面没有任何 ASR 模型**：语音识别要单独买资源包，不在免费额度内。
+
+而同一批录音交给本机 Vosk：
+
+| 录音 | 云端 | 本机 Vosk |
+|---|---|---|
+| `voice-20261113-095432-081-59e9` | 429 无资源包 | 「喂喂喂听得到吗听得到吗你听得到吗听得到吗」conf 0.956 |
+| `voice-20261113-095516-507-a13c` | 429 无资源包 | 「呢得到吗」conf 0.669 |
+| `voice-20261113-090009-348-89ad` | 429 无资源包 | 空（如实报 `no_speech`） |
+
+### 缺陷
+
+旧实现是「二选一」：`asrEnabled` 为真就走云端，云端失败直接 502 返回页面。
+结果是**一次本可以识别成功的录音被白丢**，用户看到的是「识别失败」。
+云端本该是「更好的可选路径」，却变成了单点依赖。
+
+### 修复设计（`server.js`）
+
+三个函数，职责单一：
+
+- `transcribeCloud(file)`：只发请求、只翻译结果（`{ok, text, model, provider_ms, upstream_status, reason, error, http}`），
+  **不碰状态机、不写事件** —— 否则「回退成功」这条路上会先写 `asr_failed` 再写 `transcribed`，页面来回跳。
+- `transcribeLocal(file)`：本机引擎（Vosk 优先、SAPI 兜底），返回同形状。
+- `transcribeAny(file)`：**统一入口**。云端仅在「显式启用 + 配好端点与 Key」时才被调用；
+  没出文字就回退本机；返回体里 `cloud_error` 非空即表示「文字来自本机、云端失败过」。
+
+调用方语义（`voiceTranscribe` / 录音到站后的自动转写共用）：
+
+1. 云端成功 → `200 {ok:true, engine:"cloud:<模型>", uploaded:true, fallback:false}`。
+2. 云端失败、本机出文字 → `200 {ok:true, engine:"vosk", uploaded:true, fallback:true, cloud_error:"转写服务返回 HTTP 429：…"}`，
+   状态推进到 `transcribed`，并把 `asr_engine` / `asr_fallback_reason` 写进状态。
+3. 两边都没文字 → 仍按**云端**的失败原因报 `502 asr_failed`，但附 `local_fallback:{engine, ok, text:""}`
+   与「（本机 vosk 也没听出内容）」，页面才不会显示成「什么都没试过」。
+4. 只有本机在跑且没听出内容 → `200 {ok:false, error:"no_speech"}`，不编造文字。
+
+**开关**：`ASR_FALLBACK_LOCAL=0`（或 `config.local.json` 里 `"asrFallbackLocal": false`）
+可关掉回退；默认开启。
+
+**前端**：`publicVoice()` 补出 `asr_engine` / `asr_fallback_reason`（此前根本没暴露，
+页面引擎标签一直是空的）；`vxTextMeta` 显示「本机离线识别（Vosk）· 云端失败已回退」，
+`title` 里带完整原因；`VOICE_EVENT_TEXT` 新增 `cloud_asr_failed`，不再显示成「未知事件」。
+
+### 验证（`test/voice-asr-fallback-test.js`，34 项）
+
+隔离实例 + 进程内假 ASR 服务（`429 余额不足`），五组：
+
+1. 静态契约：`transcribeCloud → transcribeAny → voiceTranscribe` 顺序、回退标志、开关、事件名、前端版本号。
+2. 云端成功：`engine` 带 `cloud:` 前缀、`uploaded:true`、`fallback:false`、状态里回退原因为空。
+3. 云端 429 + 本机听不出（440 Hz 正弦）：`502 asr_failed`，`cloud_error` 带 429 原文，
+   `local_fallback.engine === "vosk"`，`reason` 明说本机也没听出内容。
+4. 云端 429 + **真实语音样本**：`200 ok:true`、`engine:"vosk"`、`uploaded:true`、`fallback:true`、
+   文字为「喂喂喂听得到吗听得到吗你听得到吗听得到吗」，状态 `transcribed` 且 `asr_fallback_reason` 带 429。
+   （样本属用户资产、不入库；文件不存在时该组 `skip`，绝不假装通过。）
+5. `ASR_FALLBACK_LOCAL=0`：云端失败即失败（502），且不标本机引擎。
+
+测试本身踩过一个坑：**本机引擎是启动时异步探测的**（要起 python 加载模型，数秒），
+不等探测完成就发转写请求，读到的是 `local_engine=null` —— 测出来的其实是「没装引擎」而不是「不回退」。
+现在显式轮询 `/api/voice/state` 的 `asr.local_available` 直到就绪（40 秒上限），超时如实失败。
+
+### 仍然存在的边界
+
+- 云端 ASR 仍需单独购买资源包（当前 429）；这条 Key 的免费额度只覆盖对话模型。
+- 本机 Vosk 对远场、低频重的板载录音仍会漏字（尤其开头按键撞击之后那段）。
+- 回退是「一次尝试」而非「多次重试」：云端 429 这类确定性失败不会反复撞墙，但网络抖动时也只回退一次。
