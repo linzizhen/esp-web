@@ -480,9 +480,79 @@ static bool http_post(const char *path, const char *body)
     return (err == ESP_OK && status == 200);
 }
 
+/* ── 方案 A：帧上传复用长连接（keep-alive）──────────────────────
+ * 实测（2026-11-16）：上面这个一次性 http_post() 每次都要
+ * esp_http_client_init → TCP 三次握手 → 请求/响应 → cleanup，
+ * 一次 POST 吃掉 2~3 个 RTT（RTT 200ms 时 0.5 秒以上），于是 10 fps 的采样
+ * 只有约 1~6 帧/分钟能挤过 WiFi（其余堆在队列里被丢弃）。
+ * 这里给「帧上传」配一个常驻客户端，把握手摊到多次请求上。
+ *
+ * ★ 常驻句柄只归 upload_task 使用：esp_http_client 不是线程安全的句柄，
+ *   多个任务共用会互相踩状态。ack_task 的回执、求助事件仍然走各自的
+ *   一次性 http_post()，两者互不影响。 */
+#define HTTP_KA_MAX_REUSE 300        /* 复用这么多帧后主动重建，避免连接僵死 */
+static esp_http_client_handle_t s_http_ka = NULL;
+static uint32_t s_http_ka_sent = 0;
+
+static void http_ka_reset(void)
+{
+    if (s_http_ka) {
+        esp_http_client_close(s_http_ka);
+        esp_http_client_cleanup(s_http_ka);
+        s_http_ka = NULL;
+    }
+    s_http_ka_sent = 0;
+}
+
+/* 惰性创建常驻客户端；失败返回 NULL（调用方按普通失败处理） */
+static esp_http_client_handle_t http_ka_get(void)
+{
+    if (s_http_ka) return s_http_ka;
+
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/api/data", APP_SERVER_HOST, APP_SERVER_PORT);
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 3000,
+        .keep_alive_enable = true,     /* 复用 TCP 连接 */
+        .keep_alive_idle = 5,          /* TCP keepalive：空闲 5 秒开始探测 */
+        .keep_alive_interval = 5,
+        .keep_alive_count = 3,
+    };
+    s_http_ka = esp_http_client_init(&cfg);
+    if (s_http_ka) {
+        esp_http_client_set_header(s_http_ka, "Content-Type", "application/json");
+    }
+    return s_http_ka;
+}
+
+/* 帧上传专用：复用长连接发一帧。任何失败都销毁连接并重试一次 ——
+ * 服务端把空闲连接关掉是常态，重试一次比整个退避 10 秒划算得多。 */
+static bool http_post_keepalive(const char *body)
+{
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!http_ka_get()) return false;
+
+        esp_http_client_set_post_field(s_http_ka, body, strlen(body));
+        esp_err_t err = esp_http_client_perform(s_http_ka);
+        int status = esp_http_client_get_status_code(s_http_ka);
+
+        if (err == ESP_OK && status == 200) {
+            s_http_ka_sent++;
+            /* 主动换新连接：长连接放久了会被中间设备静默回收，
+             * 与其等它某次超时，不如定期重建。 */
+            if (s_http_ka_sent >= HTTP_KA_MAX_REUSE) http_ka_reset();
+            return true;
+        }
+        http_ka_reset();               /* 坏连接立刻丢弃，下一轮重建 */
+    }
+    return false;
+}
+
 static bool http_upload(const char *body)
 {
-    return http_post("/api/data", body);
+    return http_post_keepalive(body);
 }
 
 /* HTTP GET，把响应体读进 buf（带截断保护）。返回 true = HTTP 200。 */
