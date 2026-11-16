@@ -183,6 +183,11 @@ function startServer(port, opts = {}) {
     ASR_ENDPOINT: '', ASR_API_KEY: '',          // 先清空，下面按用例决定注入
     ASR_ENABLED: '',                            // 默认关闭：必须显式开启才会外发
     ASR_TIMEOUT_MS: String(asrTimeoutMs),
+    /* 本文件只测「云端这条路的映射对不对」，所以把「云端失败回退本机」关掉。
+     * 回退本身由 voice-asr-fallback-test.js 专门覆盖 —— 这里若开着回退，
+     * 断言 502/504 就会被本机引擎的结果干扰（同一段 440Hz 正弦，Vosk 有时会听出字来）。
+     * 这正是「一个测试只锁一种语义」的用法，不是绕过失败。 */
+    ASR_FALLBACK_LOCAL: '0',
   });
   if (asrEnabled) env.ASR_ENABLED = '1';
   if (asr) {

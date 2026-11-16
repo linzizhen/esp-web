@@ -75,6 +75,7 @@ const SUITES = [
   { name: 'fw-keepalive', file: 'firmware-keepalive-test.js', kind: 'unit' },
   { name: 'voice-hero',   file: 'voice-hero-contract-test.js', kind: 'unit' },
   { name: 'voice-asr',    file: 'voice-asr-test.js',    kind: 'integration' },
+  { name: 'voice-asr-fb', file: 'voice-asr-fallback-test.js', kind: 'integration' },
   { name: 'diag-hygiene', file: 'diag-hygiene-test.js', kind: 'integration' },
   { name: 'command-ack',  file: 'command-ack-test.js', kind: 'integration' },
   { name: 'e2e',          file: 'e2e-test.js',         kind: 'e2e', needsServer: false },

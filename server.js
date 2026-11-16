@@ -1183,6 +1183,10 @@ function publicVoice() {
     stage: voice.stage,
     stage_text: VOICE_STAGE_TEXT[voice.stage] || voice.stage,
     transcript: voice.transcript,
+    // 文字是谁出的：vosk / windows_system_speech / cloud:<模型>；空表示还没转写
+    asr_engine: voice.asr_engine || null,
+    // 非空表示「云端试过并失败，文字来自本机兜底」——必须传给页面，否则额度问题会被掩盖
+    asr_fallback_reason: voice.asr_fallback_reason || null,
     intent: voice.intent,
     reply: voice.reply,
     error: voice.error,
@@ -1237,11 +1241,16 @@ function voiceResetChain() {
   voice.reason = null;
   voice.bytes = null;
   voice.duration_ms = null;
+  // 新链路不能继承上一段的「文字出自哪个引擎 / 云端回退原因」
+  voice.asr_engine = null;
+  voice.asr_fallback_reason = null;
   voice.received_at = null;
 }
 
 const VOICE_EVENT_FIELDS = ['audio_id', 'device_id', 'transcript', 'intent', 'reply',
-  'error', 'reason', 'bytes', 'duration_ms', 'received_at'];
+  'error', 'reason', 'bytes', 'duration_ms', 'received_at',
+  // 哪个引擎出的文字、以及「云端失败后由本机兜底」的原因（空=纯本机或纯云端）
+  'asr_engine', 'asr_fallback_reason'];
 
 /** 把一条事件应用进内存状态（追加新事件与启动回读共用同一条路径，避免两套逻辑漂移） */
 function applyVoiceEventToState(ev) {
@@ -1832,7 +1841,7 @@ function nlChatCompletionsUrl(endpoint) {
 const ASR_MAX_BYTES = 25 * 1024 * 1024;   // 智谱该接口限制 25 MB
 const ASR_MAX_MS = 30000;                 // 智谱该接口限制 30 秒
 const ASR_DEFAULT_MODEL = 'glm-asr-2512'; // 该接口文档里唯一枚举
-const ASR = { enabled: false, endpoint: null, apiKey: null, model: ASR_DEFAULT_MODEL, timeoutMs: 20000 };
+const ASR = { enabled: false, endpoint: null, apiKey: null, model: ASR_DEFAULT_MODEL, timeoutMs: 20000, fallbackLocal: true };
 
 /* 默认**关闭**。这不是保守，是隐私边界：一旦启用，用户按下识别就会把录音发到厂商。
  * 所以启用必须是一次显式动作（config.local.json 里 asrEnabled: true，或 ASR_ENABLED=1），
@@ -1851,6 +1860,12 @@ function reloadAsrConfig() {
   ASR.model = process.env.ASR_MODEL || f.asrModel || ASR_DEFAULT_MODEL;
   const t = Number(process.env.ASR_TIMEOUT_MS || f.asrTimeoutMs || 20000);
   ASR.timeoutMs = Number.isFinite(t) && t > 0 ? t : 20000;
+  /* 云端失败是否回退本机离线识别。默认开：
+   * 云端是「更好的可选路径」，不是单点依赖 —— 2026-11-16 实测云端 429「余额不足」时，
+   * 关掉回退就会把一次本可识别的录音白白报成「识别失败」。
+   * 只有明确写 false / 0 / no / off 才关（个别部署可能不希望本机引擎兜底）。 */
+  const fb = process.env.ASR_FALLBACK_LOCAL != null ? process.env.ASR_FALLBACK_LOCAL : f.asrFallbackLocal;
+  ASR.fallbackLocal = !(fb === false || /^(0|false|no|off)$/i.test(String(fb == null ? '' : fb).trim()));
 }
 reloadAsrConfig();
 
@@ -1928,6 +1943,111 @@ function asrConfigView() {
 /* 把一段已落盘的 WAV 送去转写。
  * 返回 { http, body }：http 是给前端的 HTTP 状态码，body 是响应体（ok 字段区分成败）。
  * 任何失败都必须如实分类，绝不把「没转出来」当成功 —— 这是本项目一以贯之的判据。 */
+/* 云端转写一次（智谱 GLM-ASR）。只负责「发请求 + 把结果翻译成统一形状」，
+ * 不碰状态机、不写事件 —— 那是调用方的事，否则「云端失败后回退本机」这条路上
+ * 会先写一条 asr_failed 再写一条 transcribed，页面来回跳。 */
+async function transcribeCloud(file) {
+  const started = Date.now();
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ASR.timeoutMs);
+  let resp, text, upstreamStatus = null;
+  try {
+    const buf = fs.readFileSync(file);
+    const form = new FormData();
+    form.append('model', ASR.model);
+    form.append('file', new Blob([buf], { type: 'audio/wav' }), path.basename(file));
+    resp = await fetch(asrTranscriptionsUrl(ASR.endpoint), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ASR.apiKey}` },
+      body: form,
+      signal: ac.signal,
+    });
+    upstreamStatus = resp.status;
+    text = await resp.text();
+  } catch (e) {
+    const aborted = e && (e.name === 'AbortError' || /abort/i.test(e.message || ''));
+    const providerMs = Date.now() - started;
+    const code = aborted ? 'asr_timeout' : 'asr_failed';
+    const reason = aborted
+      ? `转写请求超时（${ASR.timeoutMs} ms 内未返回）：请检查网络，或调大 ASR_TIMEOUT_MS。`
+      : `转写请求失败：${e && e.message ? e.message : '未知网络错误'}`;
+    return { ok: false, error: code, http: aborted ? 504 : 502, reason, provider_ms: providerMs };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const providerMs = Date.now() - started;
+  let parsed = null;
+  let parseOk = false;
+  try { parsed = JSON.parse(text || '{}'); parseOk = true; } catch (_) { /* 上游不是 JSON */ }
+
+  if (!resp.ok) {
+    // 上游 401/402/429 这类最常见于「key 不对 / 余额不足 / 没有资源包」，
+    // 把状态码与原文带出来便于定位，但绝不回显 key
+    const detail = parsed && parsed.error && (parsed.error.message || parsed.error.code);
+    const reason = `转写服务返回 HTTP ${upstreamStatus}${detail ? '：' + String(detail).slice(0, 200) : ''}`;
+    return { ok: false, error: 'asr_failed', http: 502, reason, provider_ms: providerMs, upstream_status: upstreamStatus };
+  }
+
+  // HTTP 200 但响应体不是 JSON：协议层面就不对（多半是打到了错误地址、拿回一张 HTML 错误页），
+  // 与「模型没识别出内容」是两回事，必须分开报，否则排查方向会被带偏。
+  if (!parseOk) {
+    const reason = `转写服务返回的不是 JSON（HTTP ${upstreamStatus}），可能是地址不对或网关拦截：${String(text).slice(0, 120)}`;
+    return { ok: false, error: 'asr_failed', http: 502, reason, provider_ms: providerMs, upstream_status: upstreamStatus };
+  }
+
+  const transcribed = parsed && typeof parsed.text === 'string' ? parsed.text.trim() : '';
+  if (!transcribed) {
+    const reason = '转写服务返回了空文本（可能录音无声、过短，或模型没识别出内容）。';
+    return { ok: false, error: 'asr_empty_text', http: 502, reason, provider_ms: providerMs, upstream_status: upstreamStatus };
+  }
+
+  return {
+    ok: true, http: 200, text: transcribed, provider_ms: providerMs, upstream_status: upstreamStatus,
+    model: (parsed && parsed.model) || ASR.model,
+  };
+}
+
+/* 统一转写入口：云端优先（仅在显式启用时），没出文字就回退本机离线引擎。
+ *
+ * 为什么必须回退：2026-11-16 实测云端返回 429「余额不足或无可用资源包」，
+ * 当时服务端直接把 502 抛给页面 —— 明明本机 Vosk 能把同一段录音完整识别出来，
+ * 用户看到的却是「识别失败」。云端是「更好的可选路径」，不是单点依赖。
+ *
+ * 返回形状统一，调用方不用关心用哪个引擎：
+ *   { ok, text, engine, model, confidence, uploaded, local_engine, local_ok,
+ *     cloud_error, cloud_code, cloud_http, upstream_status, provider_ms }
+ * 其中 cloud_error 非空表示「云端试过并失败，文字来自本机」—— 这个信息要一路带到页面上，
+ * 不能吞掉，否则计费/额度问题会被悄悄掩盖。 */
+async function transcribeAny(file) {
+  const cloudReady = ASR.enabled && ASR.endpoint && ASR.apiKey;
+  let cloud = null;
+  if (cloudReady) {
+    cloud = await transcribeCloud(file);
+    if (cloud.ok && String(cloud.text || '').trim()) {
+      return {
+        ok: true, text: cloud.text, engine: 'cloud:' + (cloud.model || ASR.model),
+        model: cloud.model || ASR.model, provider_ms: cloud.provider_ms,
+        uploaded: true, local_engine: null, local_ok: false,
+        cloud_error: null, cloud_code: null, cloud_http: null, upstream_status: cloud.upstream_status,
+      };
+    }
+    console.warn('[asr] 云端未出结果，回退本机离线识别：' + (cloud.reason || cloud.error));
+  }
+  const lr = ASR.fallbackLocal === false ? null : await transcribeLocal(file);
+  const text = String((lr && lr.text) || '').trim();
+  return {
+    ok: !!(lr && lr.ok), text,
+    engine: lr && lr.engine, model: lr && lr.model, confidence: lr && lr.confidence,
+    uploaded: !!cloud, local_engine: lr && lr.engine, local_ok: !!(lr && lr.ok),
+    cloud_error: cloud ? (cloud.reason || cloud.error) : null,
+    cloud_code: cloud ? cloud.error : null,
+    cloud_http: cloud ? cloud.http : null,
+    upstream_status: cloud ? cloud.upstream_status : null,
+    provider_ms: cloud ? cloud.provider_ms : null,
+  };
+}
+
 async function voiceTranscribe(audioId) {
   const file = voiceAudioFile(audioId);
   if (!file || !fs.existsSync(file)) {
@@ -1957,24 +2077,18 @@ async function voiceTranscribe(audioId) {
       message: `录音 ${durMs} ms 超过转写上限 ${lim.maxMs} ms（${Math.round(lim.maxMs / 1000)} 秒），未上传。`,
     } };
   }
-  if (!ASR.enabled) {
-    /* 云端默认关闭，但本机离线识别不需要联网也不需要账号 —— 先试它（Vosk 优先）。 */
-    const lr = await transcribeLocal(file);
-    if (lr.ok) {
-      if (lr.text) {
-        return { http: 200, body: {
-          ok: true, audio_id: audioId, engine: lr.engine,
-          model: lr.model, confidence: lr.confidence,
-          text: lr.text, transcript: lr.text, uploaded: false,
-        } };
-      }
-      return { http: 200, body: {
-        ok: false, error: 'no_speech', audio_id: audioId, engine: lr.engine,
-        message: '本机离线识别没听出内容。请靠近板载麦克风（10~20 厘米）、放慢语速重录，或改用文字输入。',
+  /* 能不能转：云端要「显式启用 + 配好端点与 key」，本机要「装了离线引擎」。
+   * 两条都不具备时才拒绝，并且拒绝原因要说清是哪种缺口。 */
+  const cloudReady = ASR.enabled && ASR.endpoint && ASR.apiKey;
+  const localEngine = localAsrEngine();
+  if (!cloudReady && !localEngine) {
+    if (ASR.enabled) {
+      return { http: 503, body: {
+        ok: false, error: 'asr_not_configured', audio_id: audioId,
+        message: '服务端转写未配置：请在 config.local.json 里配 asrEndpoint/asrApiKey（或复用 NL 的 endpoint/key），'
+          + '也可用环境变量 ASR_ENDPOINT / ASR_API_KEY 注入。未配置时请改用文字输入。',
       } };
     }
-  }
-  if (!ASR.enabled) {
     // 关闭状态下绝不外发：连一次请求都不发，录音不出本机
     return { http: 503, body: {
       ok: false, error: 'asr_disabled', audio_id: audioId,
@@ -1983,90 +2097,51 @@ async function voiceTranscribe(audioId) {
         + '在此之前请改用文字输入。',
     } };
   }
-  if (!ASR.endpoint || !ASR.apiKey) {
-    return { http: 503, body: {
-      ok: false, error: 'asr_not_configured', audio_id: audioId,
-      message: '服务端转写未配置：请在 config.local.json 里配 asrEndpoint/asrApiKey（或复用 NL 的 endpoint/key），'
-        + '也可用环境变量 ASR_ENDPOINT / ASR_API_KEY 注入。未配置时请改用文字输入。',
-    } };
-  }
 
-  const started = Date.now();
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), ASR.timeoutMs);
-  let resp, text, upstreamStatus = null;
-  try {
-    const buf = fs.readFileSync(file);
-    const form = new FormData();
-    form.append('model', ASR.model);
-    form.append('file', new Blob([buf], { type: 'audio/wav' }), path.basename(file));
-    resp = await fetch(asrTranscriptionsUrl(ASR.endpoint), {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${ASR.apiKey}` },
-      body: form,
-      signal: ac.signal,
+  const r = await transcribeAny(file);
+  const outText = String(r.text || '').trim();
+  if (r.ok && outText) {
+    const engine = r.engine || null;
+    voiceApply('transcribed', {
+      audio_id: audioId, transcript: outText, asr_engine: engine,
+      asr_fallback_reason: r.cloud_error || null,
     });
-    upstreamStatus = resp.status;
-    text = await resp.text();
-  } catch (e) {
-    clearTimeout(timer);
-    const aborted = e && (e.name === 'AbortError' || /abort/i.test(e.message || ''));
-    const providerMs = Date.now() - started;
-    const code = aborted ? 'asr_timeout' : 'asr_failed';
-    const reason = aborted
-      ? `转写请求超时（${ASR.timeoutMs} ms 内未返回）：请检查网络，或调大 ASR_TIMEOUT_MS。`
-      : `转写请求失败：${e && e.message ? e.message : '未知网络错误'}`;
-    voiceApply('asr_failed', { audio_id: audioId, reason, error: code });
-    return { http: aborted ? 504 : 502, body: { ok: false, error: code, audio_id: audioId, provider_ms: providerMs, reason, message: reason } };
-  } finally {
-    clearTimeout(timer);
-  }
-
-  const providerMs = Date.now() - started;
-  let parsed = null;
-  let parseOk = false;
-  try { parsed = JSON.parse(text || '{}'); parseOk = true; } catch (_) { /* 上游不是 JSON */ }
-
-  if (!resp.ok) {
-    // 上游 401/402 这类最常见于「key 不对 / 余额不足」，把状态码带出来便于定位，但绝不回显 key
-    const detail = parsed && parsed.error && (parsed.error.message || parsed.error.code);
-    const reason = `转写服务返回 HTTP ${upstreamStatus}${detail ? '：' + String(detail).slice(0, 200) : ''}`;
-    voiceApply('asr_failed', { audio_id: audioId, reason, error: 'asr_failed' });
-    console.warn(`[asr] ${audioId} 转写失败 HTTP ${upstreamStatus}（provider ${providerMs}ms）`);
-    return { http: 502, body: {
-      ok: false, error: 'asr_failed', audio_id: audioId, upstream_status: upstreamStatus,
-      provider_ms: providerMs, reason, message: reason,
+    if (r.cloud_error) {
+      console.warn(`[asr] ${audioId} 云端失败已回退本机（${engine}）：${r.cloud_error}`);
+    } else {
+      console.log(`[asr] ${audioId} 转写完成（${engine}，provider ${r.provider_ms == null ? '?' : r.provider_ms}ms）：${outText}`);
+    }
+    return { http: 200, body: {
+      ok: true, audio_id: audioId, text: outText, transcript: outText,
+      engine: engine, model: r.model || null,
+      confidence: r.confidence == null ? null : r.confidence,
+      uploaded: !!r.uploaded, fallback: !!r.cloud_error,
+      cloud_error: r.cloud_error || null,
+      provider_ms: r.provider_ms == null ? null : r.provider_ms,
     } };
   }
-
-  const transcribed = parsed && typeof parsed.text === 'string' ? parsed.text.trim() : '';
-  // HTTP 200 但响应体不是 JSON：协议层面就不对（多半是打到了错误地址、拿回一张 HTML 错误页），
-  // 与「模型没识别出内容」是两回事，必须分开报，否则排查方向会被带偏。
-  if (!parseOk) {
-    const reason = `转写服务返回的不是 JSON（HTTP ${upstreamStatus}），可能是地址不对或网关拦截：${String(text).slice(0, 120)}`;
-    voiceApply('asr_failed', { audio_id: audioId, reason, error: 'asr_failed' });
-    return { http: 502, body: {
-      ok: false, error: 'asr_failed', audio_id: audioId, provider_ms: providerMs,
-      upstream_status: upstreamStatus, reason, message: reason,
+  /* 云端与本机都没出文字。优先如实报**云端**的失败原因（那才是要排查的方向），
+   * 同时把本机尝试的结果带上，页面上才不会显示成「什么都没试过」。 */
+  if (r.cloud_error) {
+    const code = r.cloud_code || 'asr_failed';
+    voiceApply('asr_failed', { audio_id: audioId, reason: r.cloud_error, error: code });
+    return { http: r.cloud_http || 502, body: {
+      ok: false, error: code, audio_id: audioId,
+      upstream_status: r.upstream_status == null ? null : r.upstream_status,
+      provider_ms: r.provider_ms == null ? null : r.provider_ms,
+      cloud_error: r.cloud_error,
+      local_fallback: { engine: r.local_engine || null, ok: !!(r.local_ok), text: '' },
+      reason: `${r.cloud_error}（本机 ${r.local_engine || '离线识别'} 也没听出内容）`,
+      message: `${r.cloud_error}；本机离线识别也没听出内容，请靠近麦克风重录或改用文字输入。`,
     } };
   }
-  if (!transcribed) {
-    const reason = '转写服务返回了空文本（可能录音无声、过短，或模型没识别出内容）。';
-    voiceApply('asr_failed', { audio_id: audioId, reason, error: 'asr_empty_text' });
-    return { http: 502, body: {
-      ok: false, error: 'asr_empty_text', audio_id: audioId, provider_ms: providerMs,
-      upstream_status: upstreamStatus, reason, message: reason,
-    } };
-  }
-
-  voiceApply('transcribed', { audio_id: audioId, transcript: transcribed });
-  console.log(`[asr] ${audioId} 转写完成（provider ${providerMs}ms）：${transcribed}`);
+  // 只跑了本机且没听出内容（静音/太轻）：200 + no_speech，不编造文字
   return { http: 200, body: {
-    ok: true, audio_id: audioId, text: transcribed,
-    model: (parsed && parsed.model) || ASR.model,
-    provider_ms: providerMs, upstream_status: upstreamStatus,
+    ok: false, error: 'no_speech', audio_id: audioId, engine: r.local_engine || null,
+    message: '本机离线识别没听出内容。请靠近板载麦克风（10~20 厘米）、放慢语速重录，或改用文字输入。',
   } };
-}
+
+  }
 
 /* 连通性测试：用给定参数发一次最小 chat 请求（不落盘） */
 async function nlTestConnection({ endpoint, apiKey, model, timeoutMs }) {
@@ -2904,22 +2979,30 @@ function ingestVoiceWav(buf, opts) {
   });
   console.log(`[voice] 收到 WAV ${audioId} ← ${deviceId || '(未标注设备)'} ${buf.length} 字节 / ${durationMs == null ? '?' : durationMs}ms（${o.transport || 'http'}，${wav.sample_rate || '?'}Hz ${wav.channels || '?'}ch ${wav.bits || '?'}bit，峰值 ${lv.peak_dbfs == null ? '?' : lv.peak_dbfs} dBFS）`);
   /* 自动转写：录音一到就尽量把文字准备好，用户不必再点一次「重新识别」。
-   * 只在本机做（离线识别）；云端转写仍受 asrEnabled 约束，绝不在这里偷偷外发。 */
-  if (!ASR.enabled) {
-    transcribeLocal(file).then((lr) => {
-      if (!lr || !lr.ok) {
-        appendVoiceEvent({ ev: 'local_asr_error', audio_id: audioId, at: Date.now(), detail: (lr && (lr.reason || lr.error)) || 'unknown' });
-        return;
+   * 云端只在外发已获授权（asrEnabled）时才会被调用；云端没出文字就回退本机离线引擎，
+   * 回退这件事既写进事件（cloud_asr_failed），也写进状态（asr_fallback_reason）——
+   * 额度/计费类问题不能被「其实本机识别成功了」掩盖过去。 */
+  if ((ASR.enabled && ASR.endpoint && ASR.apiKey) || localAsrEngine()) {
+    transcribeAny(file).then((r) => {
+      const text = String(r.text || '').trim();
+      if (r.cloud_error) {
+        appendVoiceEvent({ ev: 'cloud_asr_failed', audio_id: audioId, at: Date.now(), detail: r.cloud_error });
       }
-      const text = String(lr.text || '').trim();
       if (!text) {
-        appendVoiceEvent({ ev: 'local_asr_empty', audio_id: audioId, at: Date.now(), detail: '本机离线识别未听出内容' });
+        appendVoiceEvent({
+          ev: 'local_asr_empty', audio_id: audioId, at: Date.now(),
+          detail: r.local_ok ? '本机离线识别未听出内容' : (r.cloud_error || 'no_speech'),
+        });
         return;
       }
-      voiceApply('transcribed', { audio_id: audioId, transcript: text, asr_engine: lr.engine });
+      const engine = r.engine || null;
+      voiceApply('transcribed', {
+        audio_id: audioId, transcript: text, asr_engine: engine,
+        asr_fallback_reason: r.cloud_error || null,
+      });
       appendVoiceEvent({ ev: 'transcribed_local', audio_id: audioId, at: Date.now(), detail: text });
-      console.log('[voice] 本机离线识别（' + lr.engine + '）' + audioId + ' → 「' + text + '」');
-    }).catch((e) => { console.warn('[voice] 本机离线识别异常：', e && e.message); });
+      console.log(`[voice] 自动转写（${engine}${r.cloud_error ? '，云端失败后回退' : ''}）${audioId} → 「${text}」`);
+    }).catch((e) => { console.warn('[voice] 自动转写异常：', e && e.message); });
   }
   return {
     ok: true,

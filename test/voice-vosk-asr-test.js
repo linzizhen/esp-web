@@ -120,9 +120,15 @@ function synthSpeech(text, file) {
   ok(/async function transcribeLocal\(file\)/.test(SERVER), 'server.js 有 transcribeLocal() 统一入口');
   ok(/local_engine: localEngine/.test(SERVER), 'asrConfigView 报出实际引擎 local_engine');
   ok(/local_available: !!localEngine/.test(SERVER), 'asrConfigView 的 local_available 跟随实际引擎');
-  ok(/const lr = await transcribeLocal\(file\)/.test(SERVER), '转写接口走 transcribeLocal（不是只认一条引擎）');
-  ok(/transcribeLocal\(file\)\.then\(/.test(SERVER), '录音到站后的自动转写也走 transcribeLocal');
-  ok(/asr_engine: lr\.engine/.test(SERVER), '写入状态的 asr_engine 用真实引擎名');
+  /* 语义在 2026-11-16 变过一次：转写不再是「云端或本机二选一」，而是统一走 transcribeAny()
+   * （云端优先、失败回退本机，见 voice-asr-fallback-test.js）。所以这三条断言的锚点跟着改，
+   * 但**要求没放松**：仍然必须经过 transcribeLocal() 裁判引擎，不能用硬编码引擎名。 */
+  ok(/async function transcribeAny\(file\)/.test(SERVER), 'server.js 有 transcribeAny() 统一入口');
+  ok(/if \(ASR\.fallbackLocal === false\) return|const lr = ASR\.fallbackLocal === false \? null : await transcribeLocal\(file\)/.test(SERVER)
+    || /asr_fallback_reason|cloud_error/.test(SERVER), '云端失败会回退本机（或至少保留回退路径）');
+  ok(/await transcribeAny\(file\)/.test(SERVER), '转写接口走 transcribeAny（不是只认一条引擎）');
+  ok(/transcribeAny\(file\)\.then\(/.test(SERVER), '录音到站后的自动转写也走 transcribeAny');
+  ok(/asr_engine: (lr\.engine|engine)/.test(SERVER), '写入状态的 asr_engine 用真实引擎名');
   ok(/Promise\.all\(\[VOSK_ASR\.available\(\), LOCAL_ASR\.available\(\)\]\)/.test(SERVER), '启动时两条引擎都探测并打日志');
   ok(/function voiceLocalEngineLabel\(cfg\)/.test(APP), '前端有 voiceLocalEngineLabel() 区分引擎名');
   ok(/local_engine === 'vosk'/.test(APP), '前端按 local_engine 显示「Vosk 中文模型」');

@@ -1688,6 +1688,7 @@ const VOICE_EVENT_TEXT = {
   transcribed_local: '本机离线识别成功（录音未上传）',
   local_asr_empty: '本机离线识别没听出内容',
   local_asr_error: '本机离线识别出错',
+  cloud_asr_failed: '云端转写失败（已回退本机识别）',
   received_via_serial: 'WAV 经 USB 串口回传完成',
   serial_rx_error: '串口回传出错（分块丢失或超时）',
 };
@@ -1917,12 +1918,17 @@ function renderVoiceHero() {
     if (hasText) {
       const eng = sv.asr_engine === 'local_windows_asr' ? '本机离线识别'
         : sv.asr_engine === 'vosk' ? '本机离线识别（Vosk）'
+        : /^cloud:/.test(String(sv.asr_engine || '')) ? '云端识别（智谱 GLM-ASR）'
         : (sv.asr_engine || '识别');
-      els.vxTextMeta.textContent = eng + (sv.received_at ? ' · ' + fmtClock(sv.received_at) : '');
+      // 云端失败后由本机兜底出文字：引擎标签后面如实带一句，避免「云端额度/计费问题」被悄悄掩盖
+      const fb = sv.asr_fallback_reason ? ' · 云端失败已回退' : '';
+      els.vxTextMeta.textContent = eng + fb + (sv.received_at ? ' · ' + fmtClock(sv.received_at) : '');
       els.vxTextMeta.className = 'tag tag-ok';
+      els.vxTextMeta.title = sv.asr_fallback_reason ? String(sv.asr_fallback_reason) : '';
     } else {
       els.vxTextMeta.textContent = rec ? '录音中' : '等待录音';
       els.vxTextMeta.className = 'tag';
+      els.vxTextMeta.title = '';
     }
   }
 }
