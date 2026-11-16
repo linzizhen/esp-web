@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（35 个测试文件、928 项断言，全部通过）
+## 7. 自检脚本（35 个测试文件、941 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -360,7 +360,7 @@ node test/firmware-upload-queue-test.js # 24 项  固件静态契约：上传移
 node test/voice-serial-upload-test.js # 23 项  录音 WAV 走 USB 串口回传：组装器二进制往返 + 服务端/固件契约
 node test/voice-local-asr-test.js # 23 项  本机离线识别（Windows System.Speech）：真识别合成语音、静音不瞎猜、接线契约
 node test/voice-vosk-asr-test.js # 30 项  本机离线识别（Vosk 中文模型）：真识别合成语音、静音不瞎猜、引擎优先序契约
-node test/voice-asr-fallback-test.js # 34 项  云端转写失败自动回退本机（429 实测：回退出文字、两边都没文字时如实报错、开关可关闭）
+node test/voice-asr-fallback-test.js # 47 项  云端转写失败自动回退本机（429 实测：回退出文字、两边都没文字时如实报错、开关可关闭）
 node test/voice-hero-contract-test.js # 68 项  语音页「现在在做什么」决策卡与大字文字卡契约 + 指示灯心跳/四档状态契约
 node test/diag-hygiene-test.js # 13 项  /api/diag 口径：设备日志行单独计数、不再算「无效行」；设备路径不被 WiFi 标签冒充
 ```

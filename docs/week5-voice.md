@@ -730,7 +730,7 @@ D:\workBUDDY\esp32\.asr-venv\Scripts\python.exe -m pip install vosk -i https://p
 页面引擎标签一直是空的）；`vxTextMeta` 显示「本机离线识别（Vosk）· 云端失败已回退」，
 `title` 里带完整原因；`VOICE_EVENT_TEXT` 新增 `cloud_asr_failed`，不再显示成「未知事件」。
 
-### 验证（`test/voice-asr-fallback-test.js`，34 项）
+### 验证（`test/voice-asr-fallback-test.js`，47 项）
 
 隔离实例 + 进程内假 ASR 服务（`429 余额不足`），五组：
 
@@ -746,6 +746,27 @@ D:\workBUDDY\esp32\.asr-venv\Scripts\python.exe -m pip install vosk -i https://p
 测试本身踩过一个坑：**本机引擎是启动时异步探测的**（要起 python 加载模型，数秒），
 不等探测完成就发转写请求，读到的是 `local_engine=null` —— 测出来的其实是「没装引擎」而不是「不回退」。
 现在显式轮询 `/api/voice/state` 的 `asr.local_available` 直到就绪（40 秒上限），超时如实失败。
+
+### 第 ⑥ 组：引擎归属要跨阶段存活（真机踩出来的）
+
+真机实测暴露过一个状态机缺陷：识别出文字后链路继续推进（`transcribed → task_running →
+task_done → spoken`），每推进一步都会 `POST /api/voice/state` 重写状态；而旧的
+`voiceApply()` 里「非新链路 base」只继承 audio_id / transcript / bytes 等字段，
+**`asr_engine` 不在其中**，于是「已识别」之后发动机标签就退回成笼统的「识别」——
+文字明明是 Vosk 出的，页面却不再说。
+
+修法两条：
+
+1. `voiceApply()` 的非新链路 base 继承 `asr_engine` / `asr_fallback_reason`
+   （文字出自哪个引擎是「上一次识别的事实」，链路往前推进不该抹掉它）；
+   新链路（新 `audio_id`）仍强制清空，避免上一段的本机引擎跟着新录音显示。
+2. `POST /api/voice/state` 的白名单补上这两个字段，前端两处 `transcribed` 上报
+   分别带 `asr_engine: tr.engine`（服务端转写）与 `asr_engine: 'browser_speech'`
+   （Web Speech 出的文字只有前端知道是谁出的）；页面新增
+   `browser_speech → 浏览器识别（Web Speech）` 标签。
+
+对应 13 条断言：6 条源码契约（含版本号 v>=45）+ 7 条实跑（上报引擎名被接受、
+task_done / spoken 之后仍在、spoken 不挂失败原因、新录音清空、新 audio_id 确实不同）。
 
 ### 仍然存在的边界
 
