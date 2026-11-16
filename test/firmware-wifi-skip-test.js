@@ -58,7 +58,9 @@ check('send_frame 在 wifi_wait(0) 为假时进入分支（不再直接 return�
 check('该分支内按 WIFI_OFF_LOG_MS 限频', /WIFI_OFF_LOG_MS/.test(sendFrame));
 
 /* ---------- ② 未连接也有账可查 ---------- */
-check('有 s_skip 计数', /static\s+uint32_t\s+s_skip/.test(SRC));
+check('有 s_skip 计数',
+  /* 方案 B 之后 s_skip 改为 volatile（采样任务写、上传任务读），故容忍 volatile 前缀 */
+  /static\s+(?:volatile\s+)?uint32_t\s+s_skip/.test(SRC));
 check('未连接分支里 s_skip++', /s_skip\s*\+\+/.test(sendFrame));
 check('帧里上报 upload_skip 字段', /upload_skip\\?"\s*:\s*%lu/.test(buildFrame));
 check('build_frame 传入了 s_skip', /\(unsigned long\)\s*s_skip/.test(buildFrame));

@@ -71,6 +71,7 @@ const SUITES = [
   { name: 'voice-vosk-asr', file: 'voice-vosk-asr-test.js', kind: 'unit' },
   { name: 'voice-serial', file: 'voice-serial-upload-test.js', kind: 'unit' },
   { name: 'fw-wifi-skip', file: 'firmware-wifi-skip-test.js', kind: 'unit' },
+  { name: 'fw-upload-q',  file: 'firmware-upload-queue-test.js', kind: 'unit' },
   { name: 'voice-hero',   file: 'voice-hero-contract-test.js', kind: 'unit' },
   { name: 'voice-asr',    file: 'voice-asr-test.js',    kind: 'integration' },
   { name: 'diag-hygiene', file: 'diag-hygiene-test.js', kind: 'integration' },

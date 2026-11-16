@@ -143,8 +143,12 @@ static EventGroupHandle_t s_wifi_eg = NULL;
 static char s_ip[16] = "0.0.0.0";
 
 /* ---------------------- 统计 ---------------------- */
-static uint32_t s_seq = 0, s_ok = 0, s_fail = 0;
-static uint32_t s_skip = 0;             /* WiFi 未连接而跳过上传的帧数（build_frame 要上报，故前置声明） */
+/* ★ 采样任务在写、上传任务在读，故三个上传计数与丢帧计数都必须是 volatile，
+ * 否则编译器的寄存器缓存会让 build_frame 读到过时值。 */
+static uint32_t s_seq = 0;
+static volatile uint32_t s_ok = 0, s_fail = 0;
+static volatile uint32_t s_skip = 0;    /* WiFi 未连接而跳过上传的帧数（build_frame 要上报，故前置声明） */
+static volatile uint32_t s_drop = 0;    /* 上传队列满 / 退避中丢弃的帧数（方案 B 新增） */
 static char     s_mac[13] = "000000000000";
 
 /* ===================== I2C / QMA7981 ===================== */
@@ -1128,12 +1132,12 @@ static int build_frame(char *body, size_t cap, const char *request_id)
      *             否则用户只能靠猜；板端按键录音时服务端没有任何别的途径知道） */
     n += snprintf(body + n, cap - n,
                   ",\"rssi\":%d,\"heap\":%lu,\"upload_ok\":%lu,\"upload_fail\":%lu"
-                  ",\"upload_skip\":%lu"
+                  ",\"upload_skip\":%lu,\"upload_drop\":%lu"
                   ",\"lcd_ok\":%d,\"scr\":%d"
                   ",\"rec\":%d,\"up\":%d}",
                   rssi, (unsigned long)esp_get_free_heap_size(),
                   (unsigned long)s_ok, (unsigned long)s_fail,
-                  (unsigned long)s_skip,
+                  (unsigned long)s_skip, (unsigned long)s_drop,
                   s_lcd_ok ? 1 : 0, s_scr,
                   voice_record_is_recording() ? 1 : 0,
                   voice_record_is_uploading() ? 1 : 0);
@@ -1155,10 +1159,21 @@ static int64_t  s_wifi_off_log_us = 0;  /* 上次输出「WiFi 未连接」日�
 #define UPLOAD_BACKOFF_LOG_MS     30000   /* 退避期间每 30 秒报一次「仍在退避」 */
 #define WIFI_OFF_LOG_MS           30000   /* WiFi 未连接时每 30 秒报一次，避免每帧刷屏 */
 
-/* 构建并双通道发送一帧（USB 串口 + WiFi） */
+/* ── 方案 B：WiFi 上传移出采样循环 ──────────────────────────────
+ * 实测（2026-10-28 / 0.33~8 fps 反复横跳）证明：只要把 http_upload() 留在
+ * 采样循环里，100ms 的采样节拍就会被 TCP 往返拖成 100ms + k×RTT ——
+ * RTT 120ms 时帧率从 10 掉到 2~3，断网时每帧撞 3 秒超时、采样率掉到 1/30。
+ * 现在采样任务只把组好的帧丢进队列（非阻塞），由独立的 upload_task 慢慢发，
+ * 采样率与网络状况彻底解耦（代价：网络跟不上时会丢帧，丢了多少如实上报）。 */
+#define UPLOAD_QUEUE_LEN   8              /* 约缓冲 0.8 秒（按 10 fps 计） */
+#define UPLOAD_FRAME_MAX   768            /* 单帧 JSON 上限，与 body[] 一致 */
+#define UPLOAD_DROP_LOG_MS 30000          /* 丢帧告警限频 */
+static QueueHandle_t s_upload_q = NULL;
+
+/* 构建并双通道发送一帧（USB 串口 + WiFi 上传队列） */
 static void send_frame(const char *request_id)
 {
-    char body[768];
+    char body[UPLOAD_FRAME_MAX];
     int n = build_frame(body, sizeof(body), request_id);
     if (n <= 0 || n >= (int)sizeof(body)) {
         ESP_LOGW(TAG, "组帧溢出(%d)，跳过本帧", n);
@@ -1180,58 +1195,90 @@ static void send_frame(const char *request_id)
         return;                           /* 通道 2：WiFi 未连接则跳过 */
     }
 
-    int64_t now = esp_timer_get_time();
-    if (now < s_next_try_us) return;      /* 退避中，本帧不尝试 WiFi */
+    /* ★ 方案 B 的核心：这里只做非阻塞入队，绝不发起 HTTP 上传。
+     * 实测把网络请求留在采样循环里时，100ms 节拍会被 TCP 往返拖成
+     * 100ms + k×RTT，帧率随 RTT 在 0.33~10 fps 之间乱跳。 */
+    if (!s_upload_q) {
+        s_drop++;                          /* 队列没建起来：退化为只走串口 */
+        return;
+    }
+    if (xQueueSend(s_upload_q, body, 0) != pdTRUE) {
+        s_drop++;
+        static int64_t s_drop_log_us = 0;
+        int64_t drop_now = esp_timer_get_time();
+        if (s_drop_log_us == 0 || drop_now - s_drop_log_us >= (int64_t)UPLOAD_DROP_LOG_MS * 1000) {
+            s_drop_log_us = drop_now;
+            ESP_LOGW(TAG, "上传队列已满，丢弃本帧（累计丢弃 %lu 帧，成功=%lu 失败=%lu）",
+                     (unsigned long)s_drop, (unsigned long)s_ok, (unsigned long)s_fail);
+        }
+    }
+}
 
-    if (http_upload(body)) {
-        s_ok++;
-        if (s_consec_fail >= UPLOAD_FAIL_BACKOFF_AFTER) {
-            ESP_LOGI(TAG, "WiFi 上传已恢复（此前连续失败 %u 次）", (unsigned)s_consec_fail);
+/* WiFi 上传任务：从队列取帧慢慢发（方案 B）。
+ * 退避判定也搬到这里 —— 采样循环不再关心网络通不通。 */
+static void upload_task(void *arg)
+{
+    (void)arg;
+    char body[UPLOAD_FRAME_MAX];
+    for (;;) {
+        if (xQueueReceive(s_upload_q, body, portMAX_DELAY) != pdTRUE) continue;
+
+        int64_t now = esp_timer_get_time();
+        if (now < s_next_try_us) {         /* 退避中：不撞 HTTP，丢弃并记账 */
+            s_drop++;
+            continue;
         }
-        s_consec_fail = 0;
-        s_next_try_us = 0;
-        s_backoff_log_us = 0;   /* 下次退避的日志间隔从零重算 */
-        /* 成功摘要改为「每 60 秒一条」，不再每 10 帧一条。
-         * 原因：8 fps 下每 10 帧只有约 1.25 秒，这条日志会持续刷进服务端的
-         * 「非 JSON 行」统计，把 lines.invalid 顶到 9% 左右，看着像数据有问题。
-         * 计数本身仍逐帧累计，只是打印变稀疏。 */
-        {
-            static int64_t s_ok_log_us = 0;
-            int64_t ok_now = esp_timer_get_time();
-            if (s_ok_log_us == 0 || ok_now - s_ok_log_us >= 60000000) {
-                s_ok_log_us = ok_now;
-                ESP_LOGI(TAG, "上传成功 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
+
+        if (http_upload(body)) {
+            s_ok++;
+            if (s_consec_fail >= UPLOAD_FAIL_BACKOFF_AFTER) {
+                ESP_LOGI(TAG, "WiFi 上传已恢复（此前连续失败 %u 次）", (unsigned)s_consec_fail);
             }
-        }
-    } else {
-        s_fail++;
-        s_consec_fail++;
-        /* ★ 必须用「跨过阈值」而不是「等于阈值」来判定进入退避。
-         * 原实现写 `s_consec_fail == UPLOAD_FAIL_BACKOFF_AFTER`：第 5 次失败时
-         * 进入退避（next_try_us = now+10s），但 10 秒后重试再次失败时计数变成 6，
-         * `== 5` 不再成立、`< 5` 也不成立 —— 两个分支都不进，next_try_us 从此
-         * 停留在过去，退避彻底失效：此后每一帧都尝试上传，每帧被 3 秒超时阻塞。
-         * 实测（2026-10-15，服务端关闭）：帧间隔恒为 3.017s、帧率 0.33 帧/秒
-         * （应为 ~10），即采样率掉到 1/30，且现场无任何日志提示。 */
-        if (s_consec_fail >= UPLOAD_FAIL_BACKOFF_AFTER) {
-            /* 每次失败都重算窗口，退避才真正持续生效 */
-            s_next_try_us = now + (int64_t)UPLOAD_BACKOFF_MS * 1000;
-            if (s_consec_fail == UPLOAD_FAIL_BACKOFF_AFTER) {
-                ESP_LOGW(TAG, "★ WiFi 上传连续失败 %u 次，进入退避：每 %d 秒重试一次。"
-                              "请检查 APP_SERVER_HOST=%s:%d 是否可达、电脑防火墙是否放行。"
-                              "（USB 串口输出不受影响）",
-                         (unsigned)s_consec_fail, UPLOAD_BACKOFF_MS / 1000,
-                         APP_SERVER_HOST, APP_SERVER_PORT);
-                s_backoff_log_us = now;
-            } else if (now - s_backoff_log_us >= (int64_t)UPLOAD_BACKOFF_LOG_MS * 1000) {
-                /* 退避期间按间隔报平安：否则现场只看到「板子不出数」，
-                 * 无法区分是退避中还是真的卡死。 */
-                s_backoff_log_us = now;
-                ESP_LOGW(TAG, "WiFi 上传仍在退避中（已连续失败 %u 次，每 %d 秒重试一次）",
-                         (unsigned)s_consec_fail, UPLOAD_BACKOFF_MS / 1000);
+            s_consec_fail = 0;
+            s_next_try_us = 0;
+            s_backoff_log_us = 0;   /* 下次退避的日志间隔从零重算 */
+            /* 成功摘要改为「每 60 秒一条」，不再每 10 帧一条。
+             * 原因：8 fps 下每 10 帧只有约 1.25 秒，这条日志会持续刷进服务端的
+             * 「非 JSON 行」统计，把 lines.invalid 顶到 9% 左右，看着像数据有问题。
+             * 计数本身仍逐帧累计，只是打印变稀疏。 */
+            {
+                static int64_t s_ok_log_us = 0;
+                int64_t ok_now = esp_timer_get_time();
+                if (s_ok_log_us == 0 || ok_now - s_ok_log_us >= 60000000) {
+                    s_ok_log_us = ok_now;
+                    ESP_LOGI(TAG, "上传成功 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
+                }
             }
         } else {
-            ESP_LOGW(TAG, "上传失败 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
+            s_fail++;
+            s_consec_fail++;
+            /* ★ 必须用「跨过阈值」而不是「等于阈值」来判定进入退避。
+             * 原实现写 `s_consec_fail == UPLOAD_FAIL_BACKOFF_AFTER`：第 5 次失败时
+             * 进入退避（next_try_us = now+10s），但 10 秒后重试再次失败时计数变成 6，
+             * `== 5` 不再成立、`< 5` 也不成立 —— 两个分支都不进，next_try_us 从此
+             * 停留在过去，退避彻底失效：此后每一帧都尝试上传，每帧被 3 秒超时阻塞。
+             * 实测（2026-10-15，服务端关闭）：帧间隔恒为 3.017s、帧率 0.33 帧/秒
+             * （应为 ~10），即采样率掉到 1/30，且现场无任何日志提示。 */
+            if (s_consec_fail >= UPLOAD_FAIL_BACKOFF_AFTER) {
+                /* 每次失败都重算窗口，退避才真正持续生效 */
+                s_next_try_us = now + (int64_t)UPLOAD_BACKOFF_MS * 1000;
+                if (s_consec_fail == UPLOAD_FAIL_BACKOFF_AFTER) {
+                    ESP_LOGW(TAG, "★ WiFi 上传连续失败 %u 次，进入退避：每 %d 秒重试一次。"
+                                  "请检查 APP_SERVER_HOST=%s:%d 是否可达、电脑防火墙是否放行。"
+                                  "（USB 串口输出不受影响）",
+                             (unsigned)s_consec_fail, UPLOAD_BACKOFF_MS / 1000,
+                             APP_SERVER_HOST, APP_SERVER_PORT);
+                    s_backoff_log_us = now;
+                } else if (now - s_backoff_log_us >= (int64_t)UPLOAD_BACKOFF_LOG_MS * 1000) {
+                    /* 退避期间按间隔报平安：否则现场只看到「板子不出数」，
+                     * 无法区分是退避中还是真的卡死。 */
+                    s_backoff_log_us = now;
+                    ESP_LOGW(TAG, "WiFi 上传仍在退避中（已连续失败 %u 次，每 %d 秒重试一次）",
+                             (unsigned)s_consec_fail, UPLOAD_BACKOFF_MS / 1000);
+                }
+            } else {
+                ESP_LOGW(TAG, "上传失败 成功=%lu 失败=%lu", (unsigned long)s_ok, (unsigned long)s_fail);
+            }
         }
     }
 }
@@ -1874,6 +1921,12 @@ void app_main(void)
     s_ack_q = xQueueCreate(ACK_QUEUE_LEN, ACK_LINE_MAX);
     if (!s_ack_q) ESP_LOGW(TAG, "回执 WiFi 队列创建失败，回执只能走串口");
     else xTaskCreate(ack_task, "ack", 8192, NULL, 4, NULL);
+    /* 方案 B：WiFi 上传队列 + 独立上传任务。
+     * ★ 必须建在采样循环之前，否则最早的帧会因为队列为空而只走串口。
+     * ★ 优先级 3（低于采样/命令/摄像头）：上传是最不着急的事，绝不能抢采样节拍。 */
+    s_upload_q = xQueueCreate(UPLOAD_QUEUE_LEN, UPLOAD_FRAME_MAX);
+    if (!s_upload_q) ESP_LOGW(TAG, "上传队列创建失败，WiFi 上传将退化为只走串口");
+    else xTaskCreate(upload_task, "upload", 8192, NULL, 3, NULL);
     /* 启动远程命令接收任务（下行通道，与上报共用同一 USB 串口） */
     xTaskCreate(cmd_task, "cmd", 4096, NULL, 5, NULL);
     /* 启动 WiFi 命令轮询任务（串口不在线时的下行兜底通道） */
