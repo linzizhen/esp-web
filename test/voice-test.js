@@ -546,6 +546,34 @@ function staticContract() {
     const badAid = await jpost('/api/voice/state', { stage: 'transcribed', audio_id: '../../x' });
     ok(badAid.status === 400 && badAid.json.error === 'invalid_audio_id', '非法 audio_id → 400');
 
+    /* ⑥b 超时反馈：课程要求「停止说话超时 → 页面有明确反馈」。
+     *   为什么单独成组：超时是链路里最容易「静默」的一步 —— 服务端不报错、
+     *   页面不重绘，用户只看到一直等。所以既要证服务端会把 timeout 记下来、
+     *   带可读原因，也要证前端确有「超时」这一档文案（否则记了也没人看见）。
+     *   浏览器侧 Web Speech 的 20 秒超时无法在无头环境触发（需要真人说话 +
+     *   厂商识别服务），那一段只能靠课堂现场演示；此处锁住接口契约与文案。 */
+    console.log('\n— ⑥b 超时反馈：状态 + 缺省原因 + 前端文案 —');
+    const to1 = await jpost('/api/voice/state', { stage: 'timeout', audio_id: aid });
+    const toGot = await jget('/api/voice/state');
+    ok(to1.status === 200 && toGot.stage === 'timeout', '超时阶段可写入并读回');
+    ok(typeof toGot.reason === 'string' && /超时/.test(toGot.reason),
+      '超时没传原因时服务端补中文原因（不空着）', toGot.reason);
+    ok(toGot.audio_id === aid, '超时记录仍指向本次录音（可回放确认说了什么）', String(toGot.audio_id));
+    const toCustom = await jpost('/api/voice/state', { stage: 'timeout', reason: '识别超时：浏览器 20 秒内没有返回结果，可点重新识别' });
+    const toGot2 = await jget('/api/voice/state');
+    ok(toCustom.status === 200 && /浏览器 20 秒/.test(String(toGot2.reason)),
+      '前端上报的具体超时原因不被覆盖（现场能看出超在哪一段）', String(toGot2.reason));
+    const toEv = readEvents().filter((e) => e.stage === 'timeout');
+    ok(toEv.length >= 2 && toEv.every((e) => !!e.reason),
+      `超时事件落盘且带原因（${toEv.length} 条）`);
+    const appSrc = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
+    ok(/链路超时/.test(appSrc) && /文字入口/.test(appSrc),
+      '前端有「链路超时」横幅且引导改用文字入口');
+    ok(/这次链路超时了/.test(appSrc) && /重录一次/.test(appSrc),
+      '大字卡把超时说成一句话并告诉用户可以直接重录');
+    ok(/识别超时/.test(appSrc) && /任务执行超时/.test(appSrc) && /播报超时/.test(appSrc),
+      '三段（识别 / 任务 / 播报）各自的超时文案都在，能看出超在哪一步');
+
     console.log('\n— ⑦ 事件落盘 + 重启后历史可读回 —');
     const evs = readEvents();
     ok(evs.length >= 7, `events.ndjson 已追加事件（${evs.length} 条）`);
