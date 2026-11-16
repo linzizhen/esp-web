@@ -1106,7 +1106,8 @@ function resetHelp() {
 /*                                                                     */
 /* 6) POST /api/voice/state —— 前端推进阶段                              */
 /*    body：{ stage(必填), audio_id?, transcript?, intent?, reply?,      */
-/*           reason?, error?, duration_ms? }                            */
+/*           reason?, error?, duration_ms?, asr_engine?,                 */
+/*           asr_fallback_reason? }                                     */
 /*    200 → { ok, persisted, voice:<GET state 同构快照> }                */
 /*    400 → { ok:false, error:"missing_stage"|"invalid_stage"           */
 /*           |"invalid_audio_id", stages:[枚举] }                        */
@@ -1288,6 +1289,8 @@ function voiceApply(stage, patch) {
     audio_id: patchAid,          // 未指定则留空：绝不沿用上一段的 audio_id 冒充本次
     device_id: p.device_id !== undefined ? p.device_id : null,
     transcript: null, intent: null, reply: null, error: null, reason: null,
+    /* 引擎归属也随链路走：新链路必须清空，否则上一段的「本机 Vosk」会跟着新录音显示 */
+    asr_engine: null, asr_fallback_reason: null,
     bytes: p.bytes !== undefined ? p.bytes : null,
     duration_ms: p.duration_ms !== undefined ? p.duration_ms : null,
     received_at: now,
@@ -1296,6 +1299,11 @@ function voiceApply(stage, patch) {
     device_id: p.device_id !== undefined ? p.device_id : voice.device_id,
     transcript: voice.transcript, intent: voice.intent, reply: voice.reply,
     error: null, reason: null,
+    /* 引擎归属要跨阶段继承：文字出自哪个引擎是「上一次识别的事实」，
+     * 后续 task_running / task_done / spoken 只是链路往前推进，不该把它抹掉 ——
+     * 否则页面在「已识别」之后就把引擎标签退回成笼统的「识别」。 */
+    asr_engine: voice.asr_engine != null ? voice.asr_engine : null,
+    asr_fallback_reason: voice.asr_fallback_reason != null ? voice.asr_fallback_reason : null,
     bytes: voice.bytes, duration_ms: voice.duration_ms, received_at: voice.received_at,
   };
   const entry = { at: now, ts: now, stage, status: stage };
@@ -4011,6 +4019,11 @@ async function handleRequest(req, res) {
       patch.audio_id = aid;
     }
     for (const k of ['transcript', 'intent', 'reply', 'reason', 'error']) {
+      if (body[k] !== undefined) patch[k] = body[k] == null ? null : String(body[k]);
+    }
+    /* 引擎归属允许前端上报：浏览器 Web Speech 出的文字只有前端知道是它出的，
+     * 不传的话服务端只能记成「没有引擎」（页面标签退回笼统的「识别」）。 */
+    for (const k of ['asr_engine', 'asr_fallback_reason']) {
       if (body[k] !== undefined) patch[k] = body[k] == null ? null : String(body[k]);
     }
     // duration_ms 只在真给了有效正数时才覆盖（Number(null) === 0，必须显式判空）

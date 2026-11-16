@@ -1918,6 +1918,7 @@ function renderVoiceHero() {
     if (hasText) {
       const eng = sv.asr_engine === 'local_windows_asr' ? '本机离线识别'
         : sv.asr_engine === 'vosk' ? '本机离线识别（Vosk）'
+        : sv.asr_engine === 'browser_speech' ? '浏览器识别（Web Speech）'
         : /^cloud:/.test(String(sv.asr_engine || '')) ? '云端识别（智谱 GLM-ASR）'
         : (sv.asr_engine || '识别');
       // 云端失败后由本机兜底出文字：引擎标签后面如实带一句，避免「云端额度/计费问题」被悄悄掩盖
@@ -2594,7 +2595,7 @@ async function voiceStartChain(audioId) {
       }
       voiceSetSeg('asr', 'done', `识别文本（${asrCfg.local_available ? '本机离线识别' : '服务端转写'}）：「${tr.text}」`);
       renderVoiceSegments();
-      await voicePostState({ stage: 'transcribed', audio_id: audioId, transcript: tr.text });
+      await voicePostState({ stage: 'transcribed', audio_id: audioId, transcript: tr.text, asr_engine: tr.engine || null });
       await voiceTaskAndSpeak(audioId, tr.text);
       return;
     }
@@ -2659,7 +2660,7 @@ async function voiceStartChain(audioId) {
     const text = String(speech.text || '').trim();
     voiceSetSeg('asr', 'done', `识别文本（Web Speech）：「${text}」`);
     renderVoiceSegments();
-    await voicePostState({ stage: 'transcribed', audio_id: audioId, transcript: text });
+    await voicePostState({ stage: 'transcribed', audio_id: audioId, transcript: text, asr_engine: 'browser_speech' });
     await voiceTaskAndSpeak(audioId, text);
   } catch (e) {
     voiceNote('链路异常：' + ((e && e.message) || String(e)) + '。可使用下方文字入口完成任务。');

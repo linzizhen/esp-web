@@ -301,6 +301,57 @@ const REAL_WAV = path.join(ROOT, 'data', 'voice', 'voice-20261113-095432-081-59e
     ok(!r.json.local_fallback || !r.json.local_fallback.engine, '开关关闭 → local_fallback 不标明本机引擎',
       r.json && JSON.stringify(r.json.local_fallback || null));
 
+    /* ============ ⑥ 引擎归属要跨阶段存活 ============ */
+    /* 真机实测过这个坑：识别出文字后链路继续推进（task_running → task_done → spoken），
+     * 每次 POST /api/voice/state 都会重写状态；旧实现里 asr_engine 不在「跨阶段继承」的字段里，
+     * 于是「已识别」之后页面引擎标签退回成笼统的「识别」—— 文字明明是 Vosk 出的。
+     * 引擎归属是「上一次识别的事实」，不该被链路推进抹掉；只有新录音（新 audio_id）才清空。 */
+    console.log('\n⑥ 引擎归属跨阶段继承、新链路清空');
+    {
+      const appSrc = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
+      const srvSrc = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+      const idxSrc = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
+      ok(/asr_engine:\s*voice\.asr_engine\s*!=\s*null/.test(srvSrc),
+        'voiceApply 的非新链路 base 继承 asr_engine（源码契约）');
+      ok(/for\s*\(const k of \['asr_engine',\s*'asr_fallback_reason'\]\)/.test(srvSrc),
+        'POST /api/voice/state 允许前端上报引擎归属（源码契约）');
+      ok(/stage:\s*'transcribed'[^}]*asr_engine:\s*tr\.engine/.test(appSrc),
+        '前端服务端转写分支把引擎名一起上报');
+      ok(/stage:\s*'transcribed'[^}]*asr_engine:\s*'browser_speech'/.test(appSrc),
+        '前端 Web Speech 分支把 engine=browser_speech 上报');
+      ok(/browser_speech'?\s*\?\s*'浏览器识别（Web Speech）'/.test(appSrc),
+        '页面能把 browser_speech 显示成中文引擎名');
+      ok(/app\.js\?v=(\d+)/.test(idxSrc) && Number(/app\.js\?v=(\d+)/.exec(idxSrc)[1]) >= 45,
+        '前端版本号已推进（app.js?v>=45）');
+    }
+    if (!fs.existsSync(REAL_WAV)) {
+      skip('引擎归属跨阶段继承（实跑）', `缺少 ${path.relative(ROOT, REAL_WAV)}`);
+    } else {
+      const wav6 = fs.readFileSync(REAL_WAV);
+      const up6 = await postBinary(PORT, '/api/voice/audio?duration_ms=3072', wav6);
+      const aid6 = up6.json && up6.json.audio_id;
+      ok(!!aid6, '⑥ 准备了一段带 audio_id 的录音', aid6);
+      let s6 = await httpReq(PORT, 'POST', '/api/voice/state',
+        { stage: 'transcribed', audio_id: aid6, transcript: '喂喂喂', asr_engine: 'vosk' });
+      ok(s6.status === 200 && s6.json && s6.json.voice && s6.json.voice.asr_engine === 'vosk',
+        'transcribed 上报引擎名被接受', s6.json && s6.json.voice && s6.json.voice.asr_engine);
+      await httpReq(PORT, 'POST', '/api/voice/state',
+        { stage: 'task_done', audio_id: aid6, intent: 'other', reply: '我只能帮你…' });
+      let g6 = await httpReq(PORT, 'GET', '/api/voice/state');
+      ok(g6.json && g6.json.stage === 'task_done' && g6.json.asr_engine === 'vosk',
+        'task_done 之后引擎名仍保留（不被抹成空）', `stage=${g6.json && g6.json.stage} engine=${g6.json && g6.json.asr_engine}`);
+      await httpReq(PORT, 'POST', '/api/voice/state', { stage: 'spoken', audio_id: aid6 });
+      g6 = await httpReq(PORT, 'GET', '/api/voice/state');
+      ok(g6.json && g6.json.stage === 'spoken' && g6.json.asr_engine === 'vosk',
+        'spoken 之后引擎名仍保留', `stage=${g6.json && g6.json.stage} engine=${g6.json && g6.json.asr_engine}`);
+      ok(g6.json && g6.json.reason == null, 'spoken 阶段不再挂着失败原因（不跨阶段继承）');
+      const up6b = await postBinary(PORT, '/api/voice/audio?duration_ms=1000', makeToneWav(1000));
+      g6 = await httpReq(PORT, 'GET', '/api/voice/state');
+      ok(g6.json && g6.json.stage === 'recorded' && g6.json.asr_engine == null,
+        '新录音（新 audio_id）把引擎归属清空，不串上一段', `engine=${g6.json && g6.json.asr_engine}`);
+      ok(!!(up6b.json && up6b.json.audio_id) && up6b.json.audio_id !== aid6, '新录音确实是另一个 audio_id');
+    }
+
   } catch (e) {
     fail++;
     console.error('  ✗ 异常：', e && e.stack || e);
