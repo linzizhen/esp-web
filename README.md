@@ -115,6 +115,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   ├── week4-nl-assistant.md    # 第 4 周：自然语言查询与请求采集（受限工具 + 诚实性回复）
 │   ├── week4-test-guide.md      # 第 4 周：LLM 配置与验收步骤
 │   ├── week5-voice.md           # 第 5 周：按键录音 → 上传 → 浏览器识别与播报（含 I2S 交错缺陷复盘）
+│   ├── week6-voice.md           # 第 6 周：澄清上下文、任务取消、迟到结果隔离、时序测量
 │   ├── week3-flash-evidence.txt # 第 3 周烧录留存证据
 │   ├── code-issues-review.md    # 代码问题评审记录
 │   ├── course-weeks-review.md   # 课程周次对照检查
@@ -181,6 +182,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── voice-local-asr-test.js # 本机离线识别（Windows System.Speech，不联网不上传）：真识别 + 静音不瞎猜 + 接线契约
     ├── voice-vosk-asr-test.js # 本机离线识别（Vosk 中文模型，首选引擎）：真识别 + 静音不瞎猜 + 引擎优先序契约
     ├── voice-asr-fallback-test.js # 云端转写失败自动回退本机（429 场景回退出文字、两边都空时如实报错、开关可关）
+    ├── voice-cancel-test.js # 第 6 周：取消链路（迟到结果丢弃）、澄清上下文、request_id 防覆盖、时序采集
     ├── voice-hero-contract-test.js # 语音页决策卡与大字数文字卡契约 + 指示灯四档图案与心跳契约
     ├── voice-hil.js          # 第 5 周：真机端到端，录音 → 上传 → 独立复核电平（需硬件）
     ├── probe-voice-stop.js   # 第 5 周：真机探针，连续多轮 start/stop 稳定性（需硬件）
@@ -605,7 +607,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **35 个测试文件、949 项断言**，一条命令：
+全套 **36 个测试文件、986 项断言**，一条命令：
 
 ```bash
 npm test
