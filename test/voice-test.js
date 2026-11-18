@@ -300,14 +300,14 @@ function staticContract() {
     jsV ? `app.js?v=${jsV[1]}` : '缺少版本号');
   ok(/style\.css\?v=\d+/.test(html), 'index.html 保留 style.css 版本号');
 
-  // 服务端 8 个阶段枚举必须与前端历史事件中文映射一一对应
+  // 服务端 9 个阶段枚举必须与前端历史事件中文映射一一对应（cancelled 为第 6 周新增）
   const srvStages = (() => {
     const m = /const VOICE_STAGES\s*=\s*\[([^\]]*)\]/.exec(server);
     return m ? [...m[1].matchAll(/'([a-z_]+)'/g)].map((x) => x[1]) : [];
   })();
   const appEventMap = /const VOICE_EVENT_TEXT\s*=\s*\{([\s\S]*?)\n\};/.exec(app);
   const appKeys = appEventMap ? [...appEventMap[1].matchAll(/^\s{2}([a-z_]+)\s*:/gm)].map((x) => x[1]) : [];
-  ok(srvStages.length === 8, 'server.js 阶段枚举 8 项', srvStages.join(','));
+  ok(srvStages.length === 9, 'server.js 阶段枚举 9 项', srvStages.join(','));
   const missingEvt = srvStages.filter((s) => !appKeys.includes(s));
   ok(srvStages.length > 0 && missingEvt.length === 0,
     '前端历史事件映射覆盖服务端全部阶段',
@@ -510,7 +510,7 @@ function staticContract() {
     console.log('\n— ⑥ POST state 各分支可读回 —');
     const st0 = await jget('/api/voice/state');
     ok(st0.ok === true && st0.stage === 'recorded', '初始状态可读（stage=recorded）');
-    ok(Array.isArray(st0.stages) && st0.stages.length === 8, '状态快照带 8 个阶段枚举');
+    ok(Array.isArray(st0.stages) && st0.stages.length === 9, '状态快照带 9 个阶段枚举');
 
     const branches = [
       ['transcribed', { transcript: '查看上次数据' }],
@@ -539,7 +539,7 @@ function staticContract() {
     const badStage = await jpost('/api/voice/state', { stage: 'listening' });
     ok(badStage.status === 400 && badStage.json.error === 'invalid_stage',
       '非法 stage 被拒绝（400 invalid_stage）', `返回 ${badStage.status}`);
-    ok(Array.isArray(badStage.json.stages) && badStage.json.stages.length === 8,
+    ok(Array.isArray(badStage.json.stages) && badStage.json.stages.length === 9,
       '拒绝时回显合法阶段枚举');
     const noStage = await jpost('/api/voice/state', {});
     ok(noStage.status === 400 && noStage.json.error === 'missing_stage', '缺 stage → 400 missing_stage');
@@ -624,7 +624,7 @@ function staticContract() {
     ok(!!hello, 'WS 收到 hello');
     ok(!!hello && !!hello.voice && Array.isArray(hello.voice.history),
       'hello 携带语音快照（刷新页面不丢链路）');
-    ok(!!hello && hello.voice.stages && hello.voice.stages.length === 8, 'hello.voice 带 8 个阶段枚举');
+    ok(!!hello && hello.voice.stages && hello.voice.stages.length === 9, 'hello.voice 带 9 个阶段枚举');
 
     const wsUp = await uploadWav(makeWav(3200, 6000));
     ok(wsUp.status === 200, 'WS 在线时再上传一段录音成功');

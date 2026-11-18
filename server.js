@@ -148,6 +148,10 @@ const _fileConfig = JSON.parse(JSON.stringify(config));
 // 环境变量覆盖：部署 VPS 或并行测试时可设 PORT=8099 / HOST=0.0.0.0 改变监听
 if (process.env.PORT) config.httpPort = Number(process.env.PORT) || config.httpPort;
 if (process.env.HOST) config.host = process.env.HOST;
+/* 延迟注入（第 6 周）：只认显式配置 —— 环境变量 VOICE_LATENCY_MS 或 config.voiceLatencyMs，
+ * 默认 0，生产环境不可能误开。用途：在当堂演示 / 自动化里复现「任务还在路上」的时序错误，
+ * 否则「取消后迟到结果」这条判据只能靠手快，无法稳定复现。 */
+const VOICE_LATENCY_MS = Math.max(0, Number(process.env.VOICE_LATENCY_MS || config.voiceLatencyMs) || 0);
 
 /* ------------------------------------------------------------------ */
 /* 全局状态                                                            */
@@ -1132,8 +1136,14 @@ const VOICE_DIR = path.join(DATA_DIR, 'voice');
 const VOICE_EVENTS_FILE = path.join(VOICE_DIR, 'events.ndjson');
 const VOICE_KEEP = 50;                    // 内存只留最近 N 条事件，盘上仍是全量
 const VOICE_MAX_BYTES = 1024 * 1024;       // 单个 WAV 上限 1 MB
-const VOICE_STAGES = ['recorded', 'transcribed', 'asr_failed', 'task_running', 'task_done', 'spoken', 'silent', 'timeout'];
+/* cancelled：用户在链路中途点了「停止」（第 6 周新增）。
+ * 它是终点阶段，和 timeout 一样只描述「这一次没走完」；不再往后推进。 */
+const VOICE_STAGES = ['recorded', 'transcribed', 'asr_failed', 'task_running', 'task_done', 'spoken', 'silent', 'timeout', 'cancelled'];
 const VOICE_STAGE_SET = new Set(VOICE_STAGES);
+/* 在飞（in-flight）：链路还没走到终点，这期间不许被别的 request_id 覆盖。
+ * 反过来，cancelled / timeout / spoken / task_done / asr_failed / silent 都已终结，
+ * 新链路可以直接接管 —— 否则新任务必须先补一条 recorded 才解得开锁。 */
+const VOICE_IN_FLIGHT = new Set(['recorded', 'transcribed', 'task_running']);
 const VOICE_STAGE_TEXT = {
   idle: '尚无语音链路',
   recorded: '已收到板端 WAV',
@@ -1144,6 +1154,7 @@ const VOICE_STAGE_TEXT = {
   spoken: '已在浏览器播报',
   silent: '没有检测到语音（无声或过短）',
   timeout: '链路超时（可改用文字入口）',
+  cancelled: '已取消（用户中途停止）',
 };
 /* audio_id 同时用作文件名，必须严格校验，杜绝路径穿越 */
 const VOICE_ID_RE = /^voice-\d{8}-\d{6}-\d{3}(-[0-9a-f]{4})?$/;
@@ -1161,6 +1172,11 @@ const voice = {
   duration_ms: null,
   received_at: null,      // 服务端收到 WAV 的时刻
   updated_at: null,       // 最近一次阶段推进的时刻
+  /* 第 6 周：链路 id 与时序。request_id 由前端在「一次按键」开始时生成，
+   * 服务端只用它做两件事 —— 把迟到结果认出来（cancelled 登记表）、
+   * 把一次链路的各段耗时串成一条（timings）。 */
+  request_id: null,
+  timings: null,          // { to_first_feedback_ms, to_task_done_ms }
   history: [],            // 最近 VOICE_KEEP 条事件（只是事件流水，不是全量）
 };
 
@@ -1196,6 +1212,8 @@ function publicVoice() {
     duration_ms: voice.duration_ms,
     received_at: voice.received_at,
     updated_at: voice.updated_at,
+    request_id: voice.request_id || null,
+    timings: voice.timings || null,
     has_audio: !!(voice.audio_id && fs.existsSync(path.join(VOICE_DIR, voice.audio_id + '.wav'))),
     audio_url: voice.audio_id ? `/api/voice/audio/${voice.audio_id}` : null,
     download_url: voice.audio_id ? `/api/voice/audio/${voice.audio_id}/download` : null,
@@ -1246,12 +1264,17 @@ function voiceResetChain() {
   voice.asr_engine = null;
   voice.asr_fallback_reason = null;
   voice.received_at = null;
+  // 时序属于「这一次链路」，新链路必须清空；request_id 由本次上报带入
+  voice.request_id = null;
+  voice.timings = null;
 }
 
 const VOICE_EVENT_FIELDS = ['audio_id', 'device_id', 'transcript', 'intent', 'reply',
   'error', 'reason', 'bytes', 'duration_ms', 'received_at',
   // 哪个引擎出的文字、以及「云端失败后由本机兜底」的原因（空=纯本机或纯云端）
-  'asr_engine', 'asr_fallback_reason'];
+  'asr_engine', 'asr_fallback_reason',
+  // 第 6 周：链路 id 与时序（迟到结果的判定依据 / 课堂要量的两个时长）
+  'request_id', 'timings'];
 
 /** 把一条事件应用进内存状态（追加新事件与启动回读共用同一条路径，避免两套逻辑漂移） */
 function applyVoiceEventToState(ev) {
@@ -1294,6 +1317,10 @@ function voiceApply(stage, patch) {
     bytes: p.bytes !== undefined ? p.bytes : null,
     duration_ms: p.duration_ms !== undefined ? p.duration_ms : null,
     received_at: now,
+    /* 链路 id 与时序同样随链路走：新一次的按键必然是新 request_id，
+     * 沿用旧的会让「迟到结果」误判成当前任务。 */
+    request_id: p.request_id !== undefined ? p.request_id : null,
+    timings: p.timings !== undefined ? p.timings : null,
   } : {
     audio_id: voice.audio_id,
     device_id: p.device_id !== undefined ? p.device_id : voice.device_id,
@@ -1305,6 +1332,8 @@ function voiceApply(stage, patch) {
     asr_engine: voice.asr_engine != null ? voice.asr_engine : null,
     asr_fallback_reason: voice.asr_fallback_reason != null ? voice.asr_fallback_reason : null,
     bytes: voice.bytes, duration_ms: voice.duration_ms, received_at: voice.received_at,
+    request_id: p.request_id !== undefined ? p.request_id : (voice.request_id || null),
+    timings: p.timings !== undefined ? p.timings : (voice.timings || null),
   };
   const entry = { at: now, ts: now, stage, status: stage };
   for (const k of VOICE_EVENT_FIELDS) {
@@ -1342,6 +1371,134 @@ function loadVoiceHistory() {
   } catch (e) {
     console.error('[voice] 历史回读失败：', e.message);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 第 6 周：让语音任务可以澄清与停止                                   */
+/* ------------------------------------------------------------------ */
+
+/* 已取消的 request_id 登记表：rid → 取消时刻。
+ * 为什么需要它：用户点「停止」时，已经发出去的 /api/nl 请求还在路上，
+ * 它回来时服务端没有任何依据知道「这一次已经不算了」—— 页面能挡住渲染，
+ * 但服务端仍会把回复当成一次成功任务记进事件，事后追查就分不清是真回还是迟到。
+ * 前端取消时把 rid 报上来，这里记 60 秒（一次链路拖不过一分钟），过期即删。 */
+const CANCELLED_RIDS = new Map();
+const VOICE_CANCELLED_TTL_MS = Math.max(5000, Number(process.env.VOICE_CANCELLED_TTL_MS) || 60000);
+
+function markCancelled(requestId) {
+  const rid = String(requestId || '').trim();
+  if (!rid) return false;
+  CANCELLED_RIDS.set(rid, Date.now());
+  return true;
+}
+
+function isCancelled(requestId) {
+  const rid = String(requestId || '').trim();
+  if (!rid) return false;
+  const at = CANCELLED_RIDS.get(rid);
+  if (!at) return false;
+  if (Date.now() - at > VOICE_CANCELLED_TTL_MS) { CANCELLED_RIDS.delete(rid); return false; }
+  return true;
+}
+
+function pruneCancelled() {
+  const now = Date.now();
+  for (const [rid, at] of CANCELLED_RIDS) {
+    if (now - at > VOICE_CANCELLED_TTL_MS) CANCELLED_RIDS.delete(rid);
+  }
+}
+
+/* 澄清上下文：session_id → { question, options, at }。
+ * 「数据」这种模糊说法先反问一句，用户只回「第一个」时必须接得上 ——
+ * 否则就是每问一次反问一次，课程要求的「有限多轮」直接不成立。
+ * TTL 默认 30 秒（只在本进程内存里；不用持久化，重启后重问一句即可）。 */
+const CLARIFY = new Map();
+const VOICE_CLARIFY_TTL_MS = Math.max(500, Number(process.env.VOICE_CLARIFY_TTL_MS) || 30000);
+/* 「第一个 / 第二项 / 2 / 一」这类指代；也接受直接说出候选任务名 */
+const CLARIFY_PICK_RE = /^(?:第\s*)?([12一二两])(?:\s*(?:个|项|条|种))?$/;
+const CLARIFY_WORDS = [
+  { intent: 'query_last', re: /(查看|查询|看看|上次|历史|数据)/ },
+  { intent: 'collect_once', re: /(重新|重采|再采|采集|采一帧|新的)/ },
+];
+
+function clarifyKey(sessionId) {
+  return String(sessionId || '').trim().slice(0, 64) || null;
+}
+
+function rememberClarify(sessionId, options) {
+  const key = clarifyKey(sessionId);
+  if (!key) return null;      // 没有 session_id 就退化成「每次都反问」，不记上下文
+  CLARIFY.set(key, { options, at: Date.now() });
+  return key;
+}
+
+/** 取出并消费澄清上下文：命中返回候选任务，未命中/过期返回 null（用一次即清） */
+function takeClarify(sessionId, text) {
+  const key = clarifyKey(sessionId);
+  if (!key) return null;
+  const ent = CLARIFY.get(key);
+  if (!ent) return null;
+  if (Date.now() - ent.at > VOICE_CLARIFY_TTL_MS) { CLARIFY.delete(key); return null; }
+  const t = String(text || '').trim();
+  let picked = null;
+  const m = CLARIFY_PICK_RE.exec(t);
+  if (m) {
+    const idx = '12一二两'.indexOf(m[1]);
+    picked = ent.options[idx >= 2 ? idx - 2 : idx] || null;
+  } else {
+    for (const w of CLARIFY_WORDS) {
+      if (w.re.test(t)) { picked = ent.options.find((o) => o.intent === w.intent) || null; break; }
+    }
+  }
+  if (!picked) return null;
+  CLARIFY.delete(key);           // 一句话只能用一次，避免反复套用上文
+  return picked;
+}
+
+/* 时序：到站 → 首次反馈 → 任务完成。单位毫秒，非法值一律丢弃（不夹紧成 0 骗人）。
+ * 只认真实上报过的字段，缺就缺 —— 页面显示「—」比显示 0 更诚实。 */
+const TIMING_FIELDS = ['to_first_feedback_ms', 'to_task_done_ms'];
+
+function sanitizeTimings(t) {
+  if (!t || typeof t !== 'object') return null;
+  const out = {};
+  for (const k of TIMING_FIELDS) {
+    const v = Number(t[k]);
+    if (Number.isFinite(v) && v >= 0) out[k] = Math.round(v);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function p50(arr) {
+  const xs = arr.filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+  if (!xs.length) return null;
+  const mid = Math.floor(xs.length / 2);
+  return xs.length % 2 ? xs[mid] : Math.round((xs[mid - 1] + xs[mid]) / 2);
+}
+
+/** 时序视图：最近 N 条带时序的事件 + 两个中位数（课堂演示「单元增量」用） */
+function voiceTimingsView(limit = 20) {
+  const rows = voice.history.filter((e) => e && e.timings && typeof e.timings === 'object')
+    .slice(-Math.max(1, Math.min(200, Number(limit) || 20)))
+    .map((e) => ({
+      request_id: e.request_id || null,
+      audio_id: e.audio_id || null,
+      stage: e.stage || null,
+      at: e.at || null,
+      timings: e.timings,
+    }));
+  return {
+    ok: true,
+    count: rows.length,
+    recent: rows.slice().reverse(),          // 最近的排前面
+    p50: {
+      to_first_feedback_ms: p50(rows.map((r) => r.timings.to_first_feedback_ms)),
+      to_task_done_ms: p50(rows.map((r) => r.timings.to_task_done_ms)),
+    },
+    inject_ms: VOICE_LATENCY_MS,
+    cancelled_rids: CANCELLED_RIDS.size,
+    clarify_sessions: CLARIFY.size,
+  };
 }
 
 /* ---- WAV 头解析：只读头部，不解码 PCM（服务端不需要听声音） ---- */
@@ -3725,6 +3882,14 @@ async function handleRequest(req, res) {
         lastCommandChannel: stats.lastCommandChannel || null,
         lastAckChannel: stats.lastAckChannel || null,
       },
+      /* 语音链路（第 6 周）：延迟注入的当前值 + 取消/澄清上下文的规模。
+       * latency_ms=0 表示「没有注入」，任何非 0 值都必须是显式配置进来的。 */
+      voice: {
+        latency_ms: VOICE_LATENCY_MS,
+        cancelled_rids: CANCELLED_RIDS.size,
+        clarify_sessions: CLARIFY.size,
+        clarify_ttl_ms: VOICE_CLARIFY_TTL_MS,
+      },
       hints,
     });
   }
@@ -4026,6 +4191,17 @@ async function handleRequest(req, res) {
     for (const k of ['asr_engine', 'asr_fallback_reason']) {
       if (body[k] !== undefined) patch[k] = body[k] == null ? null : String(body[k]);
     }
+    /* 第 6 周：链路 id 与时序。
+     * request_id 由前端在「一次按键」开始时生成，服务端只用它做两件事：
+     *   ① 登记取消（同 rid 的迟到结果必须丢弃）
+     *   ② 把迟到结果认出来（旧 rid 不许覆盖新任务）
+     * 不做格式强校验：它是关联用的字符串，格式由前端定；超长截断防滥用。 */
+    if (body.request_id != null) {
+      const rid = String(body.request_id).trim();
+      patch.request_id = rid ? rid.slice(0, 80) : null;
+    }
+    const timings = sanitizeTimings(body.timings);
+    if (timings) patch.timings = timings;
     // duration_ms 只在真给了有效正数时才覆盖（Number(null) === 0，必须显式判空）
     if (body.duration_ms != null && String(body.duration_ms).trim() !== '') {
       const d = Number(body.duration_ms);
@@ -4036,9 +4212,43 @@ async function handleRequest(req, res) {
       patch.reason = stage === 'asr_failed' ? '浏览器未能识别出语音内容'
         : (stage === 'silent' ? '没有检测到语音（无声或录音过短）' : '链路等待超时');
     }
+    const ridNow = patch.request_id;
+    /* 已取消的链路不许再往前走（第 6 周当堂验证第一条）。
+     * 取消是终点：同一条链路的后续阶段若还照收，页面就会「取消了还在动」。
+     * 2026-11-18 线上实测就是这样 —— cancel 之后同 rid 推 task_done 被接受，
+     * 状态从 cancelled 变回 task_done，迟到的播报也就跟着来了。 */
+    if (ridNow && stage !== 'cancelled' && isCancelled(ridNow)) {
+      return json(res, 200, {
+        ok: true, ignored: true, reason: 'cancelled_request_id',
+        request_id: ridNow, current_request_id: voice.request_id, voice: publicVoice(),
+      });
+    }
+    /* 旧 request_id 不许覆盖「还在跑」的链路。
+     * 判据从「rid 不同」收紧成「rid 不同 且 当前链路在飞」：
+     * 原写法把「上一条已经终结」也当成在跑，于是新链路必须先补一条 recorded
+     * 才解得开锁 —— 实测新 rid 推 task_running 被当 stale 丢掉，页面卡在
+     * cancelled 不动，用户会以为「点了停止就再也录不进去了」。 */
+    if (ridNow && voice.request_id && ridNow !== voice.request_id
+        && stage !== 'cancelled' && stage !== 'recorded'
+        && VOICE_IN_FLIGHT.has(voice.stage)) {
+      return json(res, 200, {
+        ok: true, ignored: true, reason: 'stale_request_id',
+        request_id: ridNow, current_request_id: voice.request_id, voice: publicVoice(),
+      });
+    }
+    // 取消：登记 rid，之后同一 rid 的迟到结果会被 /api/nl 丢弃并留事件
+    if (stage === 'cancelled' && ridNow) markCancelled(ridNow);
     const r = voiceApply(stage, patch);
     console.log(`[voice] 阶段推进 → ${stage}${patch.transcript ? '：' + patch.transcript : ''}${patch.reason ? '（' + patch.reason + '）' : ''}`);
     return json(res, 200, { ok: true, persisted: r.persisted, voice: r.state });
+  }
+
+  // ---- 语音链路：④c 时序查询（第 6 周）----
+  //   课堂要量的两个时长：到站 → 首次反馈 / 到站 → 任务完成。
+  //   数据来源就是 events.ndjson 里带 timings 的那些事件，这里只做汇总，不另存一份。
+  if (p === '/api/voice/timings' && req.method === 'GET') {
+    const u = new URL(req.url, 'http://x');
+    return json(res, 200, voiceTimingsView(u.searchParams.get('limit')));
   }
 
   // ---- 语音链路：④b 服务端转写（无麦克风机器的识别路径）----
@@ -4184,11 +4394,61 @@ async function handleRequest(req, res) {
   if (p === '/api/nl' && req.method === 'POST') {
     const body = await readJsonBody(req);
     const text = String(body.text || '').trim();
+    const rid = String(body.request_id || '').trim().slice(0, 80) || null;
+    const session = clarifyKey(body.session_id);
     if (!text) return json(res, 400, { error: 'empty text' });
     if (text.length > 200) return json(res, 400, { error: 'text too long (max 200)' });
-    const out = await nlHandle(text);
+
+    /* 迟到结果（第 6 周）：这次链路已经被用户取消。
+     * 丢弃并留证据 —— 回 200 会让页面以为任务成功，回 4xx 又像「指令写错了」，
+     * 两者都会掩盖「取消没生效」这个真问题，所以单独用 cancelled 标记表达。 */
+    if (rid && isCancelled(rid)) {
+      appendVoiceEvent({ ev: 'late_result_dropped', request_id: rid, at: Date.now(),
+        detail: `取消后仍到达的请求已丢弃：「${text.slice(0, 40)}」` });
+      return json(res, 200, {
+        ok: false, cancelled: true, request_id: rid, intent: 'cancelled', reply: null,
+        note: '这次链路已被取消，结果按规则丢弃（不播报、不执行）',
+      });
+    }
+
+    // 延迟注入：只认显式配置，用来稳定复现「任务还在路上」的时序问题
+    if (VOICE_LATENCY_MS > 0) await new Promise((r) => setTimeout(r, VOICE_LATENCY_MS));
+
+    /* 澄清上文：用户只回「第一个」时接上刚才那句反问。
+     * 没有上文却回指代（「第一个」）→ 仍判 ambiguous，不能当成 unknown_intent，
+     * 否则用户会得到「我只能帮你…」而不知道自己漏了说哪一句。 */
+    const picked = takeClarify(session, text);
+    let out;
+    let clarifyUsed = false;
+    if (picked) {
+      out = await nlHandle(picked.text);
+      clarifyUsed = true;
+    } else {
+      out = await nlHandle(text);
+      if (!picked && out.intent === 'other' && CLARIFY_PICK_RE.test(text)) out = await nlHandle('数据');
+    }
+
+    // 执行期间被取消（命令慢 + 用户中途点了停止）→ 结果同样丢弃
+    if (rid && isCancelled(rid)) {
+      appendVoiceEvent({ ev: 'late_result_dropped', request_id: rid, at: Date.now(),
+        detail: '执行期间被取消，结果未采用' });
+      return json(res, 200, {
+        ok: false, cancelled: true, request_id: rid, intent: out.intent || 'cancelled', reply: null,
+        note: '结果在生成期间被取消，未采用',
+      });
+    }
+
     out.ok = true;
     out.text = text;
+    if (rid) out.request_id = rid;
+    if (clarifyUsed) { out.clarify_used = true; out.clarify_from = text; }
+    if (out.intent === 'ambiguous') {
+      /* 候选与 NL_TASKS 保持一致（注册表是唯一真源），并把有效期告诉页面，
+       * 页面据此显示「30 秒内回『第一个』即可」。 */
+      const options = Object.entries(NL_TASKS).map(([intent, t], i) => ({ idx: i + 1, intent, text: t.short }));
+      const bound = rememberClarify(session, options);
+      out.clarify = { options, ttl_ms: VOICE_CLARIFY_TTL_MS, session_bound: !!bound };
+    }
     return json(res, 200, out);
   }
 

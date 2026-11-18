@@ -74,7 +74,7 @@ const els = {
   voiceFailureTitle: $('voiceFailureTitle'), voiceFailureDesc: $('voiceFailureDesc'),
   btnVoiceUseText: $('btnVoiceUseText'), voiceSegments: $('voiceSegments'),
   voiceDurText: $('voiceDurText'), voiceBytesText: $('voiceBytesText'), voiceSrcText: $('voiceSrcText'),
-  btnVoiceRetry: $('btnVoiceRetry'), btnVoiceSpeak: $('btnVoiceSpeak'),
+  btnVoiceRetry: $('btnVoiceRetry'), btnVoiceSpeak: $('btnVoiceSpeak'), btnVoiceStop: $('btnVoiceStop'),
   voiceDownload: $('voiceDownload'), voicePlayer: $('voicePlayer'), voiceNote: $('voiceNote'),
   voiceTextTag: $('voiceTextTag'), voiceTextForm: $('voiceTextForm'),
   voiceTextInput: $('voiceTextInput'), voiceTextSend: $('voiceTextSend'),
@@ -1684,6 +1684,10 @@ const VOICE_EVENT_TEXT = {
   spoken: '浏览器已播报',
   silent: '没有检测到语音（未进入识别）',
   timeout: '链路超时',
+  cancelled: '已取消（用户中途停止）',
+  // 这两条是第 6 周的事件（只有 ev）：漏掉就会在历史里显示成「未知事件」
+  late_result_dropped: '已取消链路的迟到结果（已丢弃，未执行也未播报）',
+  clarify_used: '用上一轮的候选澄清后重跑',
   // 下面这些是「事件记录」（只有 ev，没有 stage），漏掉就会显示成「未知事件」
   transcribed_local: '本机离线识别成功（录音未上传）',
   local_asr_empty: '本机离线识别没听出内容',
@@ -1698,6 +1702,14 @@ const VOICE = {
   hist: [],             // 最近 50 条事件（折叠时只用来算摘要，展开才渲染）
   lastAudioId: null,    // 已接管过的 audio_id：避免轮询把同一段录音反复处理
   busy: false,          // 本机链路正在跑（播放 / 识别 / 任务 / 播报）
+  /* 第 6 周：链路 id 与取消。rid 由本页生成并随每次状态推进上报 ——
+   * 服务端靠它把「已取消的那一次」的迟到结果认出来，页面靠它把
+   * 「上一次的回复晚到」挡在渲染之外（两者缺一，都会出现「取消了还在动」）。 */
+  rid: null,
+  t0: 0,                // 本次链路起点（时序：到站 → 首次反馈 → 任务完成）
+  firstFeedbackMs: null,
+  cancelled: false,
+  cancelReason: '',
   seg: {
     record: { st: 'wait', text: '' },
     asr: { st: 'wait', text: '' },
@@ -1708,6 +1720,36 @@ const VOICE = {
 
 function voiceNote(text) {
   if (els.voiceNote) els.voiceNote.textContent = text;
+}
+
+/* 停止口令（第 6 周）：说出来就等于点了「停止」。
+ * 只匹配开头，避免「取消上次那个任务」这种正常句子被误判成停止指令。 */
+const VOICE_STOP_WORDS = /^(?:停(?:止|下|一下)?|取消|别播了|不用了|安静|闭嘴|够了)/;
+
+/** 生成一次链路的 request_id：vr-YYYYMMDD-HHMMSS-mmm-随机四位数 */
+function voiceNewRequestId() {
+  const d = new Date();
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `vr-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`
+    + `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+    + `-${p(d.getMilliseconds(), 3)}-${p(Math.floor(Math.random() * 10000), 4)}`;
+}
+
+/** 会话标签：澄清上下文按它隔离（一个标签页一份，不串到别人那儿） */
+function voiceSessionId() {
+  try {
+    let s = localStorage.getItem('s3eye.voiceSession');
+    if (!s) {
+      s = 'vs-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36);
+      localStorage.setItem('s3eye.voiceSession', s);
+    }
+    return s;
+  } catch (_) { return null; }   // 隐私模式下 localStorage 可能不可用，降级为「每次都反问」
+}
+
+/** 这次链路还该不该继续：已取消，或已经被新的链路取代 */
+function voiceStale(rid) {
+  return VOICE.cancelled || (!!rid && VOICE.rid !== rid);
 }
 
 function voiceDurLabel(ms) {
@@ -1985,6 +2027,12 @@ const VOICE_FAIL_KIND = {
     title: '任务执行失败（可改用文字输入）',
     desc: (reason) => `${reason || '识别已经成功，但把文本交给 /api/nl 时失败了。'} 处理建议：稍后点「重新识别这段录音」重试；也可以直接把这句话打进下方「文字入口」，任务照样能完成。`,
   },
+  /* 第 6 周：停止不是失败，但同样要让用户一眼看到「这次没走完」，
+   * 并且明确写清「结果已丢弃」，否则他分不清是停了还是还在后台跑。 */
+  cancelled: {
+    title: '已停止（本次结果已丢弃）',
+    desc: (reason) => `${reason || '你在链路中途点了停止。'} 已做的动作：停掉识别/播放/播报、通知服务端登记这次 request_id。要重新来一遍：长按 PLAY 键 2 秒重新录音，或直接用下方「文字入口」。`,
+  },
 };
 
 function renderVoiceFailure(stage, reason) {
@@ -2199,15 +2247,43 @@ async function voicePoll() {
 
 /** 推进阶段：POST /api/voice/state；失败不影响主链路（服务端不可达时页面仍继续走） */
 async function voicePostState(body) {
+  const b = Object.assign({}, body);
+  if (VOICE.rid && b.request_id === undefined) b.request_id = VOICE.rid;
+  /* 已取消：除了「取消」本身与「新录音」之外，任何阶段推进都不再发。
+   * 发了也会被服务端按旧 request_id 拒掉，但少一次无意义的往返与一条误导日志。 */
+  if (VOICE.cancelled && b.stage !== 'cancelled' && b.stage !== 'recorded') return false;
   try {
     const j = await voiceFetchJson('/api/voice/state', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(b),
     }, 6000);
     if (j && j.voice) voiceApplySnapshot(j.voice, false);
     return !!(j && j.ok);
   } catch (_) { return false; }
+}
+
+/* 停止（第 6 周）：立即停掉本页在跑的动作 + 如实上报 cancelled。
+ * 三件必须一起做：① 停本机动作（识别/播放/播报）② 报服务端登记 rid
+ * ③ 把四段状态标成「已停止」—— 只做①②，页面仍显示「正在识别」，用户会以为没停。 */
+async function voiceCancel(reasonText) {
+  const why = reasonText || '用户点了停止';
+  if (VOICE.cancelled) return;
+  const rid = VOICE.rid;
+  VOICE.cancelled = true;
+  VOICE.cancelReason = why;
+  try { if (VOICE.asrObj && typeof VOICE.asrObj.abort === 'function') VOICE.asrObj.abort(); } catch (_) {}
+  try { if (els.voicePlayer && !els.voicePlayer.paused) els.voicePlayer.pause(); } catch (_) {}
+  try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (_) {}
+  for (const k of ['record', 'asr', 'task', 'tts']) {
+    const cur = VOICE.seg[k];
+    if (!cur || cur.st === 'wait') continue;
+    if (cur.st === 'run') voiceSetSeg(k, 'fail', '已停止');
+  }
+  renderVoiceSegments();
+  renderVoiceFailure('cancelled', `${why}。已停在当前这一步：识别、任务与播报都不会再继续，本次结果按规则丢弃。`);
+  voiceNote(`已停止（${why}）。要重新来一遍，长按 PLAY 键 2 秒重新录音，或用下方文字入口。`);
+  await voicePostState({ stage: 'cancelled', reason: why, audio_id: VOICE.lastAudioId || null, request_id: rid });
 }
 
 /* 录音设备判定（纯函数，只依赖入参 —— 便于静态契约测试直接求值验证）。
@@ -2434,11 +2510,22 @@ function voiceSpeak(text) {
  * 否则两条路径的失败语义会各自漂移，同一个问题在两个入口给出不同解释。
  * text 已由上层负责上报 transcribed 阶段。 */
 async function voiceTaskAndSpeak(audioId, text) {
+  const rid = VOICE.rid;
+  /* 停止口令（第 6 周）：说「停止 / 取消 / 别播了」就等于点了停止按钮。
+   * 这一步必须在执行任务之前判 —— 否则「停止」会被当成一条普通指令发给模型。 */
+  if (VOICE_STOP_WORDS.test(String(text || '').trim())) {
+    voiceSetSeg('task', 'wait', '识别到停止口令，未执行任务');
+    voiceSetSeg('tts', 'wait', '未执行');
+    renderVoiceSegments();
+    await voiceCancel(`听到停止口令「${String(text).trim().slice(0, 12)}」`);
+    return;
+  }
   // ---- 任务：复用第 4 周 /api/nl（不另造判定规则）----
   voiceSetSeg('task', 'run', '正在交给 /api/nl…');
   renderVoiceSegments();
   voiceNote('识别成功，正在执行任务（采集类请求会等待设备真实结果，可能需要几秒）。');
   await voicePostState({ stage: 'task_running', audio_id: audioId });
+  if (voiceStale(rid)) return;      // 上一条 POST 期间用户已经点了停止
 
   let nl = null;
   let nlErr = null;
@@ -2446,9 +2533,21 @@ async function voiceTaskAndSpeak(audioId, text) {
     nl = await voiceFetchJson('/api/nl', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, request_id: rid, session_id: voiceSessionId() }),
     }, 25000);
   } catch (e) { nlErr = e; }
+
+  /* 迟到的旧结果：这条回复不属于当前链路（用户已重新录音 / 已取消）。
+   * 直接丢掉，不进渲染、不播报 —— 课程判据「迟到结果不得重新播放或触发动作」。 */
+  if (voiceStale(rid)) return;
+  if (nl && nl.cancelled === true) {
+    voiceSetSeg('task', 'fail', '结果已丢弃（这次链路已取消）');
+    voiceSetSeg('tts', 'wait', '未播报');
+    renderVoiceSegments();
+    renderVoiceFailure('cancelled', nl.note || '这次链路已被取消，晚到的结果按规则丢弃。');
+    voiceNote('这次链路已被取消，服务端把晚到的结果丢掉了（没有执行、也没有播报）。');
+    return;
+  }
 
   if (!nl || nl.ok === false) {
     const isTimeout = !!(nlErr && (nlErr.name === 'AbortError' || nlErr.name === 'TimeoutError'));
@@ -2472,9 +2571,29 @@ async function voiceTaskAndSpeak(audioId, text) {
   const intent = nl.intent || '(未识别意图)';
   const reply = nl.reply || '(服务端没有给出回复)';
   VOICE.reply = reply;
-  voiceSetSeg('task', 'done', `intent=${intent} · ${reply}`);
-  renderVoiceSegments();
-  await voicePostState({ stage: 'task_done', audio_id: audioId, intent, reply });
+  /* 澄清（第 6 周）：服务端反问「你要查数据还是重采一次」时，把候选与有效期写到页面上，
+   * 用户下一句只说「第一个」即可 —— 否则他看不出该回什么。
+   * 上下文按 session 隔离、30 秒过期，这些事实都来自服务端，页面不自己编。 */
+  const clarify = nl.clarify && Array.isArray(nl.clarify.options) ? nl.clarify : null;
+  if (clarify) {
+    const opts = clarify.options.map((o) => `${o.idx}）${o.text}`).join('　');
+    voiceSetSeg('task', 'done', `需要澄清：${opts}（${Math.round((clarify.ttl_ms || 0) / 1000)} 秒内回「第一个」即可）`);
+    renderVoiceSegments();
+    voiceNote(`这句话有歧义。${opts}——直接说或输入「第一个」/「第二个」就能接上，有效期 ${Math.round((clarify.ttl_ms || 0) / 1000)} 秒。`);
+  } else {
+    voiceSetSeg('task', 'done', `intent=${intent} · ${reply}`);
+    renderVoiceSegments();
+  }
+  const toTaskDone = VOICE.t0 ? Math.max(0, Date.now() - VOICE.t0) : null;
+  await voicePostState({
+    stage: 'task_done', audio_id: audioId, intent, reply,
+    timings: {
+      to_first_feedback_ms: VOICE.firstFeedbackMs != null ? VOICE.firstFeedbackMs : null,
+      to_task_done_ms: toTaskDone,
+    },
+  });
+  if (voiceStale(rid)) return;
+  if (clarify) return;      // 澄清不是终点：不播报长串候选，等用户下一句
 
   // ---- 播报：speechSynthesis ----
   voiceSetSeg('tts', 'run', '正在播报…');
@@ -2506,12 +2625,22 @@ async function voiceTaskAndSpeak(audioId, text) {
 async function voiceStartChain(audioId) {
   if (VOICE.busy || !audioId) return;
   VOICE.busy = true;
+  /* 一次按键 = 一条新链路 = 一个新 request_id。旧链路的任何晚到结果都因为
+   * rid 不匹配而被丢弃（下面每个 await 之后都有 voiceStale 判定）。 */
+  VOICE.cancelled = false;
+  VOICE.cancelReason = '';
+  VOICE.rid = voiceNewRequestId();
+  VOICE.t0 = Date.now();
+  VOICE.firstFeedbackMs = null;
+  const rid = VOICE.rid;
   VOICE.lastAudioId = audioId;
   voiceSegReset();
   voiceSetSeg('record', 'run', '正在从服务端读取这段 WAV…');
   renderVoiceSegments();
   renderVoiceFailure(null);
   voiceNote('已发现新录音，正在自动走链路：播放 → 识别 → 任务 → 播报。');
+  // 时序起点：这一刻就是「首次反馈」——用户已经看到页面动了
+  if (VOICE.firstFeedbackMs == null) VOICE.firstFeedbackMs = Math.max(0, Date.now() - VOICE.t0);
 
   try {
     // ---- ① 录音：取服务端实测元信息（时长 / 字节 / 电平，静音判定的事实来源）----
@@ -2553,6 +2682,7 @@ async function voiceStartChain(audioId) {
      * 但 Web Speech API 只报 not-allowed，页面于是把人引向「去地址栏允许权限」——
      * 一个永远解决不了的方向。所以先主动看一眼设备列表，缺设备就直接给准确原因。 */
     const mic = await voiceProbeMic();
+    if (voiceStale(rid)) return;
     if (!mic.ok) {
       /* 没有本机麦克风 → 改走服务端转写。
        * Web Speech API 只能听麦克风；缺设备时「扬声器外放→麦克风听回」物理上不成立，
@@ -2582,6 +2712,7 @@ async function voiceStartChain(audioId) {
         ? '本机没有可用的麦克风，浏览器识别收不到声音，已自动改用' + voiceLocalEngineLabel(asrCfg) + '：WAV 直接在本机转成文字，不联网、不上传。'
         : '本机没有可用的麦克风，浏览器识别收不到声音，已自动改用服务端转写：把这段 WAV 直接交给识别接口，不需要本机声卡。');
       const tr = await voiceTranscribeServer(audioId);
+      if (voiceStale(rid)) return;
       if (!tr.ok) {
         const reason = tr.reason;
         voiceSetSeg('asr', 'fail', '服务端转写未成功');
@@ -2608,6 +2739,7 @@ async function voiceStartChain(audioId) {
     voiceNote('正在播放并识别：请保持扬声器可听见、音量适中，识别期间不要说话。');
 
     const asr = voiceStartAsr(durMs);
+    VOICE.asrObj = asr;
     let played = true;
     let playErr = '';
     try {
@@ -2634,6 +2766,8 @@ async function voiceStartChain(audioId) {
     els.voicePlayer.addEventListener('ended', onEnded, { once: true });
 
     const speech = await asr.promise;
+    VOICE.asrObj = null;
+    if (voiceStale(rid)) return;
     if (!speech.ok) {
       if (speech.timeout) {
         const reason = `识别超时：${speech.reason || ''} 可点「重新识别这段录音」重试；如果一直超时，请直接用下方文字入口输入任务。`;
@@ -2712,6 +2846,18 @@ if (els.voiceTextForm) {
   });
 }
 
+/* 停止按钮（第 6 周）：点一下立刻停 —— 不要求「正在录音」才生效，
+ * 因为真正需要停的往往是「识别/任务/播报正在跑」的时候。 */
+if (els.btnVoiceStop) {
+  els.btnVoiceStop.onclick = () => {
+    if (VOICE.cancelled) { voiceNote('这次链路已经停过了。要重新来一遍：长按 PLAY 键 2 秒重新录音，或用下方文字入口。'); return; }
+    if (!VOICE.busy && !(VOICE.state && ['recorded','transcribed','task_running'].includes(VOICE.state.stage))) {
+      voiceNote('当前没有在跑的链路，不需要停。');
+      return;
+    }
+    voiceCancel('点了页面上的停止');
+  };
+}
 if (els.btnVoiceRetry) {
   els.btnVoiceRetry.onclick = () => {
     const sv = VOICE.state || {};
