@@ -169,6 +169,39 @@ node test/voice-cancel-test.js        # ③d 组即这条
 
 ---
 
+### 验证 8：真人录音的真实时序（并修掉一个「恒为 0」的假数据）
+
+2026-11-18 对着板子说了一句话，服务端完整走完链路：
+
+```
+audio_id   = voice-20261118-094713-649-3b9e
+duration   = 8512 ms / 272428 B / peak -38.6 dBFS
+transcript = 「我的话一路下来吗」
+intent     = other
+reply      = 「我只能帮你：【查看上次数据】、【重新采集一次】。请换一种说法。」
+timings    = { to_first_feedback_ms: 0, to_task_done_ms: 3409 }
+```
+
+`to_task_done_ms = 3409` 是可信的，但 **`to_first_feedback_ms = 0` 是个假数据**：
+原来的基线 `VOICE.t0` 就在首次渲染的前一行赋值，两者必然落在同一毫秒，
+这个数字永远是 0 —— 测了等于没测。
+
+修法（`public/app.js`）：基线改取 **服务端收到这段录音的时刻**（`VOICE.state.received_at`），
+取不到才退回 `t0`；并新增 `VOICE.tArrive` 让「首次反馈」与「任务完成」**共用同一个基线**，
+两个数字才能相减解释。
+
+修正后的语义：
+
+| 字段 | 起点 | 终点 |
+|---|---|---|
+| `to_first_feedback_ms` | 录音到站（服务端写完 WAV） | 页面第一次出现可见反馈 |
+| `to_task_done_ms` | 同一个到站时刻 | `/api/nl` 返回并渲染出文字 |
+
+**仍然缺的一半**：课程的「输入结束」指用户**说完话**的那一刻，板端没有上报，
+只能用「到站」近似。串口上传要 4~6 秒，这个误差与教学要观察的量级相当。
+端侧补 `capture_end_ms` + `boot_id` 才能真正对齐（见第九章需求 2）。
+---
+
 ## 五、★ 真机/线上暴露的两个缺陷与修复（2026-11-18）
 
 ### 现象
@@ -223,8 +256,8 @@ if (ridNow && voice.request_id && ridNow !== voice.request_id
 |---|---|
 | `server.js` | `VOICE_STAGES` +`cancelled`；`VOICE_IN_FLIGHT`；`CANCELLED_RIDS` / `markCancelled` / `isCancelled` / `pruneCancelled`；`CLARIFY` / `rememberClarify` / `takeClarify` / `CLARIFY_PICK_RE` / `CLARIFY_WORDS`；`TIMING_FIELDS` / `sanitizeTimings` / `p50` / `voiceTimingsView`；`VOICE_LATENCY_MS`；`/api/voice/state` 加 rid/timings 与两道守卫；`/api/voice/timings` 新路由；`/api/nl` 加 rid/session/澄清/迟到丢弃/延迟注入；`/api/diag` 加 `voice` 段 |
 | `public/app.js` | `voiceToIdle()`（回到待机：清横幅/四段/取消标记与旧 rid，不动服务端阶段）；`VOICE_STOP_WORDS` / `voiceNewRequestId` / `voiceSessionId` / `voiceStale` / `voiceCancel`；`VOICE` 加 `rid/t0/firstFeedbackMs/cancelled`；`voicePostState` 自动补 rid 且取消后不再推进；`voiceTaskAndSpeak` 全链 `voiceStale` 守卫 + 澄清候选渲染 + `timings` 上报；`VOICE_EVENT_TEXT` 补 `cancelled` / `late_result_dropped` / `clarify_used` |
-| `public/index.html` | 新增 `<button id="btnVoiceStop">停止</button>` 与 `<button id="btnVoiceIdle">回到待机</button>`；`app.js?v=45 → 47` |
-| `test/voice-cancel-test.js` | 新增，**59 项** |
+| `public/index.html` | 新增 `<button id="btnVoiceStop">停止</button>` 与 `<button id="btnVoiceIdle">回到待机</button>`；`app.js?v=45 → 48` |
+| `test/voice-cancel-test.js` | 新增，**62 项** |
 | `test/voice-test.js` | 五处「8 个阶段」→「9 个阶段」 |
 | `test/run-all.js` | SUITES 加 `voice-cancel` |
 | `docs/week6-voice.md` | 本文 |
