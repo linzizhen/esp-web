@@ -292,6 +292,12 @@ const jpost = (port, p, o) => httpReq(port, 'POST', p, o);
   ok(!rec2.timings || (rec2.timings.to_first_feedback_ms >= 0), '负数时序不会原样存下来', JSON.stringify(rec2.timings));
 
   /* ---------- ⑤ 延迟注入（默认关闭） ---------- */
+  ok(/VOICE\.tArrive/.test(appSrc), '时序基线取自「录音到站时刻」，不是链路起点');
+  ok(/Date\.now\(\) - \(VOICE\.tArrive \|\| VOICE\.t0\)/.test(appSrc),
+    '首次反馈用「到站 → 现在」计算（用 t0 会恒得 0，没有信息量）');
+  ok(/const base = VOICE\.tArrive \|\| VOICE\.t0/.test(appSrc),
+    '任务完成与首次反馈共用同一基线');
+
   console.log('\n— ⑤ 延迟注入默认关闭 —');
   const t0 = Date.now();
   await jpost(port, '/api/nl', { text: '查看上次数据' });

@@ -2603,7 +2603,8 @@ async function voiceTaskAndSpeak(audioId, text) {
     voiceSetSeg('task', 'done', `intent=${intent} · ${reply}`);
     renderVoiceSegments();
   }
-  const toTaskDone = VOICE.t0 ? Math.max(0, Date.now() - VOICE.t0) : null;
+  const base = VOICE.tArrive || VOICE.t0;
+  const toTaskDone = base ? Math.max(0, Date.now() - base) : null;
   await voicePostState({
     stage: 'task_done', audio_id: audioId, intent, reply,
     timings: {
@@ -2650,6 +2651,10 @@ async function voiceStartChain(audioId) {
   VOICE.cancelReason = '';
   VOICE.rid = voiceNewRequestId();
   VOICE.t0 = Date.now();
+  /* 时序基线：服务端收到这段录音的时刻（到站）。取不到才退回链路起点 t0。
+   * 这两项必须共用一个基线，否则「首次反馈」与「任务完成」不能相减解释。 */
+  VOICE.tArrive = (VOICE.state && VOICE.state.audio_id === audioId
+    && Number(VOICE.state.received_at) > 0) ? Number(VOICE.state.received_at) : VOICE.t0;
   VOICE.firstFeedbackMs = null;
   const rid = VOICE.rid;
   VOICE.lastAudioId = audioId;
@@ -2658,8 +2663,11 @@ async function voiceStartChain(audioId) {
   renderVoiceSegments();
   renderVoiceFailure(null);
   voiceNote('已发现新录音，正在自动走链路：播放 → 识别 → 任务 → 播报。');
-  // 时序起点：这一刻就是「首次反馈」——用户已经看到页面动了
-  if (VOICE.firstFeedbackMs == null) VOICE.firstFeedbackMs = Math.max(0, Date.now() - VOICE.t0);
+  /* 首次反馈：页面已经动了的那一刻，减去录音到站的时刻。
+   * 用 t0 会恒得 0（同一毫秒），那是个没有信息量的数字 —— 2026-11-18 真机就是这样。 */
+  if (VOICE.firstFeedbackMs == null) {
+    VOICE.firstFeedbackMs = Math.max(0, Date.now() - (VOICE.tArrive || VOICE.t0));
+  }
 
   try {
     // ---- ① 录音：取服务端实测元信息（时长 / 字节 / 电平，静音判定的事实来源）----
