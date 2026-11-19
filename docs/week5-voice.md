@@ -123,7 +123,7 @@ idle → recorded → transcribed → task_running → task_done → spoken
 ### 验证 1：按键 → 录音 → 上传（真机）
 
 ```powershell
-node test/voice-hil.js --speak
+node test/manual/voice-hil.js --speak
 ```
 
 - `--speak` 会在录音前提示你对着板子说话（6 秒）
@@ -134,7 +134,7 @@ node test/voice-hil.js --speak
 ### 验证 2：连续多轮稳定性
 
 ```powershell
-node test/probe-voice-stop.js 5 2
+node test/manual/probe-voice-stop.js 5 2
 ```
 
 5 轮 `start → 2s → stop`，每轮时长应落在 2048–2112 ms。
@@ -152,7 +152,7 @@ node test/voice-mic-preflight-test.js     # 24 项：识别前麦克风自检契
 
 ## 四之二、真机验证踩到的两个测试侧坑与一个产品侧缺口
 
-这一节记录 `test/voice-hil.js` 第一版会**在链路完全正常时报失败**的两个原因，以及一个
+这一节记录 `test/manual/voice-hil.js` 第一版会**在链路完全正常时报失败**的两个原因，以及一个
 **服务端能力缺口**。前两个已修，第三个只登记不修（超出本周范围）。
 
 ### 坑 1：等待预算 12 秒太短
@@ -201,7 +201,7 @@ node test/voice-mic-preflight-test.js     # 24 项：识别前麦克风自检契
 | 正在上传上一段 | `busy`（命令被丢弃） | `ok=true, accepted=true` ← **谎报** |
 
 建议后续在 `sendCommand()` 后等待 ack 再定论，把 `accepted` 改成「板端确认」而非「写出口成功」。
-**本周不修**，已在 `test/voice-hil.js` 第 ⑥ 段登记为已知缺口，不判失败——登记不等于认可。
+**本周不修**，已在 `test/manual/voice-hil.js` 第 ⑥ 段登记为已知缺口，不判失败——登记不等于认可。
 
 > **状态更新（2026-10-26）**：该缺口**服务端侧已修复**，详见下文「修复二：命令下发 ≠ 板端已接受」。
 > ⚠ 但修复只在串口模式生效：固件侧回执双通道代码已就绪、**尚未烧录**，烧录前纯 WiFi 部署仍判 timeout
@@ -508,13 +508,13 @@ Web Speech API 的设计前提是"麦克风实时拾音"，**没有任何接口�
 | `public/app.js` | 语音页：录音回放、Web Speech 识别、`speechSynthesis` 播报 |
 | `public/index.html` | 语音页 DOM（样式全部复用既有类，未新增 CSS） |
 | `test/voice-test.js` | 新增，112 项接口契约 |
-| `test/voice-hil.js` | 新增，真机端到端（需硬件），含板端回执核对与 45 秒等待预算 |
+| `test/manual/voice-hil.js` | 新增，真机端到端（需硬件），含板端回执核对与 45 秒等待预算 |
 | `test/voice-layout-contract-test.js` | 新增，25 项数据布局静态契约 |
 | `test/voice-longpress-test.js` | 新增，26 项按键语义契约：**按下不录、短按松手不录、录音中按键立即停**（2026-11-02） |
 | `test/voice-mic-preflight-test.js` | 新增，24 项识别前麦克风自检契约（2026-10-30） |
 | `test/voice-asr-test.js` | 新增，50 项服务端转写契约（URL 归一化 / 失败分类 / **未启用时零外发**）（2026-10-30） |
 | `test/command-ack-test.js` | 收尾新增，95 项命令 ack 通道契约（accepted/busy/timeout/channel_unavailable/mock） |
-| `test/probe-voice-stop.js` | 新增，真机稳定性探针（需硬件） |
+| `test/manual/probe-voice-stop.js` | 新增，真机稳定性探针（需硬件） |
 | `test/run-all.js` | 登记 `voice` / `voice-layout` / `voice-longpress` / `voice-mic` / `voice-asr` / `command-ack` 套件，并修正「N 项通过」格式的结果计数 |
 
 ---
@@ -607,7 +607,7 @@ Web Speech API 的设计前提是"麦克风实时拾音"，**没有任何接口�
 
 板端 `BSP_CAPS_AUDIO_SPEAKER = 0`，物理上没有扬声器，所以「听到开发板回答」不可能发生在板子上。按项目决定，本轮**不把播报作为验收项**：
 
-- 代码与文档保留（`voiceSpeak()`、失败文案、`stage=spoken` 的写入条件），要验证时在有扬声器的电脑上跑 `node test/voice-hil.js --speak`；
+- 代码与文档保留（`voiceSpeak()`、失败文案、`stage=spoken` 的写入条件），要验证时在有扬声器的电脑上跑 `node test/manual/voice-hil.js --speak`；
 - 页面上「回复」始终以文字形式可见，播报只是附加；
 - 任何「已播报」的判断只看 `speechSynthesis` 的 `onend`，没有真实发声证据时如实写「未实际发声」。
 
@@ -647,7 +647,7 @@ Web Speech API 的设计前提是"麦克风实时拾音"，**没有任何接口�
 
 - 固件：`voice_upload()` 在 `wifi_wait(0)` 为假时转入 `voice_upload_serial()`；
   自带 base64 编码器（`b64_encode`），每块后 `vTaskDelay(1ms)` 让 USB CDC 缓冲排空。
-- 服务端：`voice-serial-rx.js` 只负责拼字节（`no_begin` / `too_large` /
+- 服务端：`lib/voice-serial-rx.js` 只负责拼字节（`no_begin` / `too_large` /
   `overflow` / `too_many_chunks` / `timeout` 一律丢弃），拼完交给
   `ingestVoiceWav()` —— 与 HTTP 上传共用同一段落盘 + 电平分析 + 事件链路，
   录音标 `transport=serial` 并记 `received_via_serial` 事件。
@@ -688,10 +688,10 @@ POST /api/voice/record {"action":"start"} → ack_status=recording  waited_ms=27
 
 ### 实现（第一版：Windows 自带 System.Speech）
 
-- `voice-local-asr.js`：`createLocalAsr()` 暴露 `available()` 与 `transcribe(wavPath)`；
-  内部 `execFile` 调 `scripts/asr-local.ps1`，结果写成 UTF-8 JSON 文件再读回
+- `lib/voice-local-asr.js`：`createLocalAsr()` 暴露 `available()` 与 `transcribe(wavPath)`；
+  内部 `execFile` 调 `scripts/asr/asr-local.ps1`，结果写成 UTF-8 JSON 文件再读回
   （避免 PowerShell 控制台按 GBK 输出把中文弄成乱码 —— 这是踩过的坑）。
-- `scripts/asr-local.ps1`：**必须存成带 BOM 的 UTF-8**，否则 Windows PowerShell 5.1
+- `scripts/asr/asr-local.ps1`：**必须存成带 BOM 的 UTF-8**，否则 Windows PowerShell 5.1
   会把中文当 ANSI 解析、直接语法报错（字符串缺少终止符）。
 - 识别前先做 200 Hz 一阶高通（切掉板载麦克风收到的低频轰鸣）并按有效段峰值归一化
   （跳过开头按键撞击，放大上限 24 dB），再交给识别器；长录音按 10 秒分句识别后拼接。
@@ -733,10 +733,10 @@ D:\workBUDDY\esp32\.asr-venv\Scripts\python.exe -m pip install vosk -i https://p
 
 **接线**
 
-- `voice-vosk-asr.js`：`createVoskAsr({ timeoutMs })` → `{ available(), transcribe(wav), engine:'vosk' }`；
+- `lib/voice-vosk-asr.js`：`createVoskAsr({ timeoutMs })` → `{ available(), transcribe(wav), engine:'vosk' }`；
   解释器默认 `../.asr-venv/Scripts/python.exe`（`ASR_VOSK_PYTHON` 覆盖），
   模型默认 `../.asr-model/vosk-model-small-cn-0.22`（`ASR_VOSK_MODEL` 覆盖）。
-- `scripts/asr-vosk.py`：`wave` 读 PCM，`KaldiRecognizer(model, rate)` + `AcceptWaveform` 循环，
+- `scripts/asr/asr-vosk.py`：`wave` 读 PCM，`KaldiRecognizer(model, rate)` + `AcceptWaveform` 循环，
   `SetWords(True)` 取词级置信度；只接受 16 bit 单声道（否则如实报 `not_pcm16_mono`）。
 - 中间 JSON 写在 `data/.asr-tmp/`（已被 `.gitignore` 覆盖）而**不是系统临时目录**：
   实测系统 TMP 下 Python 子进程报 `PermissionError: [Errno 13]`，换仓库内目录即正常。

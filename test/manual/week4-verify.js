@@ -9,8 +9,8 @@
  *                       逐条跑当堂验证用例并输出结论表 + 关键证据，方便当场演示/截图留证。
  *
  * 用法：
- *   node test/week4-verify.js              # 打 http://127.0.0.1:8080
- *   PORT=8090 node test/week4-verify.js    # 打别的端口
+ *   node test/manual/week4-verify.js              # 打 http://127.0.0.1:8080
+ *   PORT=8090 node test/manual/week4-verify.js    # 打别的端口
  *
  * 说明：本脚本会真的向设备下发一次采集请求（用例 ④），这是真实验证，不是模拟。
  *       设备离线时该用例不会判失败——"如实报未完成"本身就是正确行为，脚本会分开判定。

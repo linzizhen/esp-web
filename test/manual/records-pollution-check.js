@@ -13,18 +13,18 @@
  *        一旦 isolate 失效（DATA_DIR 写错）必然在这里被抓住。
  *
  * 用法：
- *   node test/records-pollution-check.js before      # 记录基线偏移与最大 seq
- *   node test/records-pollution-check.js after       # 校验 only-new-lines
- *   node test/records-pollution-check.js status      # 只看当前基线
+ *   node test/manual/records-pollution-check.js before      # 记录基线偏移与最大 seq
+ *   node test/manual/records-pollution-check.js after       # 校验 only-new-lines
+ *   node test/manual/records-pollution-check.js status      # 只看当前基线
  */
 const fs = require('node:fs');
 const path = require('node:path');
 
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.join(__dirname, '..', '..', '..');
 const FILE = path.join(ROOT, 'data', 'records.ndjson');
 /* 基线文件落在 test/.test-data* 下：该通配已被 .gitignore 覆盖，
  * 否则每次取证都会在 git status 里冒出一个未跟踪文件。 */
-const STATE_DIR = path.join(__dirname, '.test-data-pollution');
+const STATE_DIR = path.join(__dirname, '..', '.test-data-pollution');
 const STATE = path.join(STATE_DIR, 'records-baseline.json');
 
 const scan = () => {
@@ -71,13 +71,13 @@ if (cmd === 'status') {
 }
 
 if (cmd !== 'after') {
-  console.error('用法：node test/records-pollution-check.js before|after|status');
+  console.error('用法：node test/manual/records-pollution-check.js before|after|status');
   process.exit(2);
 }
 
 /* ---- after：逐行审核自基线偏移以来的新增内容 ---- */
 if (!fs.existsSync(STATE)) {
-  console.error('先运行 before 记录基线（node test/records-pollution-check.js before）');
+  console.error('先运行 before 记录基线（node test/manual/records-pollution-check.js before）');
   process.exit(2);
 }
 const base = JSON.parse(fs.readFileSync(STATE, 'utf8'));

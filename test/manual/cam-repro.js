@@ -1,5 +1,5 @@
 /* 摄像头推流复现取证：开启 cam_on，持续采样服务端状态，捕捉重启/帧率塌陷。
- * 用法：node test/cam-repro.js [持续秒数]
+ * 用法：node test/manual/cam-repro.js [持续秒数]
  */
 'use strict';
 const BASE = 'http://127.0.0.1:8080';

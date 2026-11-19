@@ -20,10 +20,10 @@
  *   node test/run-all.js --serial 只跑单元/集成，跳过 e2e（省时）
  *
  * 不在本编排器内的四个测试（需真实硬件，手动跑）：
- *   node test/voice-hil.js             真机端到端：录音 → 上传 → 电平复核
- *   node test/probe-voice-stop.js      真机探针：连续多轮 start/stop 稳定性
- *   node test/fps-baseline-test.js     真机只读：帧率基线（中位上传间隔 + 多窗口）
- *   node test/firmware-backoff-test.js 真机退避回归：要求服务端**停着**才能测
+ *   node test/manual/voice-hil.js             真机端到端：录音 → 上传 → 电平复核
+ *   node test/manual/probe-voice-stop.js      真机探针：连续多轮 start/stop 稳定性
+ *   node test/manual/fps-baseline-test.js     真机只读：帧率基线（中位上传间隔 + 多窗口）
+ *   node test/manual/firmware-backoff-test.js 真机退避回归：要求服务端**停着**才能测
  *
  * 注：后两个从未登记进 SUITES。fps-baseline 默认打 8080 生产实例、
  * firmware-backoff 要求服务端处于停止状态，两者都与「编排器整套隔离 +

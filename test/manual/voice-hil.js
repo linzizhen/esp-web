@@ -23,8 +23,8 @@
  *   3. 板端与电脑在物理世界中：录音时需有人在麦克风附近发声，
  *      否则 silent_hint 为 true，本测试会如实报告「录到静音」而不是失败
  *
- * 用法：node test/voice-hil.js
- *       node test/voice-hil.js --speak   （提示你在 6 秒内对着板子说话）
+ * 用法：node test/manual/voice-hil.js
+ *       node test/manual/voice-hil.js --speak   （提示你在 6 秒内对着板子说话）
  *
  * 【口径已统一（2026-10-28 修复，别按旧印象理解）】第 ② 节拿服务端自报的
  * rms_dbfs 与本地全量解码比对，判据 <2 dB（未放宽）。此前服务端回读路径

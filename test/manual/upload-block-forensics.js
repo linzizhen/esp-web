@@ -6,14 +6,14 @@
  * 因此只要统计「服务端收到的相邻帧间隔分布」，就能反推阻塞情况：
  *   间隔 ≈ 3.0s 的帧 = 经历了一次超时；间隔 ≈ 0.1s 的帧 = 上传正常。
  *
- * 用法：node test/upload-block-forensics.js [采样秒数]
+ * 用法：node test/manual/upload-block-forensics.js [采样秒数]
  */
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
 
 const secs = Number(process.argv[2] || 20);
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.join(__dirname, '..', '..', '..');
 const RECORDS = path.join(ROOT, 'data', 'records.ndjson');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

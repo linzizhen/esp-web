@@ -1,7 +1,7 @@
 /**
  * 串口监听：原样打印开发板发出的每一个字节（不做任何解析/加工）。
- * 用法: node test/listen.js <端口> [秒数] [dtr 1/0] [rts 1/0]
- * 例:   node test/listen.js COM4 25 1 0
+ * 用法: node test/manual/listen.js <端口> [秒数] [dtr 1/0] [rts 1/0]
+ * 例:   node test/manual/listen.js COM4 25 1 0
  */
 const { SerialPort } = require('serialport');
 

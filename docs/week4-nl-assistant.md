@@ -140,7 +140,7 @@ NL_ENDPOINT=... NL_API_KEY=... NL_MODEL=... node server.js
                  2026-09-28T06:32:16.172Z 到达，回执与新观测同一 request_id，证据链完整
 ```
 
-页面截图：[`week4-ask-page.png`](week4-ask-page.png)（导航「自然语言」页，引擎徽章、能力说明、受限声明）。
+页面截图：[`week4-ask-page.png`](assets/week4-ask-page.png)（导航「自然语言」页，引擎徽章、能力说明、受限声明）。
 
 ---
 

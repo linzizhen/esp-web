@@ -34,7 +34,7 @@ function ok(cond, label, detail) {
 /* ------------------------------------------------------------------ */
 console.log('\n① 串口语音组装器 voice-serial-rx.js');
 
-const { createVoiceRx } = require(path.join(ROOT, 'voice-serial-rx.js'));
+const { createVoiceRx } = require(path.join(ROOT, 'lib', 'voice-serial-rx.js'));
 
 function makePayload(n) {
   const b = Buffer.alloc(n);
@@ -112,7 +112,7 @@ console.log('\n② 服务端与固件契约');
 const serverSrc = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
 const fw = fs.readFileSync(path.join(ROOT, 'firmware', 's3eye_imu_idf', 'main', 'voice_record.c'), 'utf8');
 
-ok(/require\(['"]\.\/voice-serial-rx\.js['"]\)/.test(serverSrc), 'server.js 引入 voice-serial-rx.js');
+ok(/require\(['"]\.\/lib\/voice-serial-rx\.js['"]\)/.test(serverSrc), 'server.js 引入 voice-serial-rx.js');
 ok(/voice_begin/.test(serverSrc) && /voice_chunk/.test(serverSrc) && /voice_end/.test(serverSrc),
   'server.js 处理三种串口语音帧');
 ok(/function ingestVoiceWav\(/.test(serverSrc), '存在共享的 ingestVoiceWav()（HTTP 与串口共用落盘链路）');

@@ -1,15 +1,15 @@
 /**
  * 被动串口取证：只读不写，专门用于「板子重启」类问题的现场取证。
  *
- * 与 test/listen.js 的区别：listen.js 会主动发送 CRLF/AT/? 试探固件，
+ * 与 test/manual/listen.js 的区别：listen.js 会主动发送 CRLF/AT/? 试探固件，
  * 那会污染「复位原因」取证（板子可能因收到未知输入而改变行为）。
  * 本脚本严格只读，并额外做两件取证工作：
  *   1) 打时间戳与序号，便于测量两次启动之间的间隔（判断重启频率）；
  *   2) 高亮复位/崩溃特征行（rst:0x… / Guru Meditation / stack overflow /
  *      Brownout / abort / assert），一眼看出是不是重启、哪种重启。
  *
- * 用法: node test/serial-forensics.js [端口] [秒数]
- * 例:   node test/serial-forensics.js COM4 60
+ * 用法: node test/manual/serial-forensics.js [端口] [秒数]
+ * 例:   node test/manual/serial-forensics.js COM4 60
  */
 'use strict';
 const fs = require('node:fs');
@@ -38,7 +38,7 @@ const events = [];
 let total = 0;
 let buf = '';
 
-const logFile = path.join(__dirname, '..', 'serial-forensics.log');
+const logFile = path.join(__dirname, '..', '..', '..', 'serial-forensics.log');
 const out = fs.createWriteStream(logFile, { flags: 'w' });
 const write = (s) => { out.write(s + '\n'); };
 

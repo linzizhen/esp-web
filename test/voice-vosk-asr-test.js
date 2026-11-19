@@ -22,7 +22,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
-const { createVoskAsr } = require(path.join(ROOT, 'voice-vosk-asr.js'));
+const { createVoskAsr } = require(path.join(ROOT, 'lib', 'voice-vosk-asr.js'));
 const SERVER = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
 const APP = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
 
@@ -69,7 +69,7 @@ function synthSpeech(text, file) {
   const asr = createVoskAsr({ timeoutMs: 40000 });
   ok(typeof asr.transcribe === 'function' && typeof asr.available === 'function', '导出 available() / transcribe()');
   ok(asr.engine === 'vosk', 'engine 标为 vosk', asr.engine);
-  ok(fs.existsSync(path.join(ROOT, 'scripts', 'asr-vosk.py')), '识别脚本 scripts/asr-vosk.py 存在');
+  ok(fs.existsSync(path.join(ROOT, 'scripts', 'asr', 'asr-vosk.py')), '识别脚本 scripts/asr/asr-vosk.py 存在');
 
   const info = await asr.available();
   if (info && info.ok) {
@@ -111,7 +111,7 @@ function synthSpeech(text, file) {
   }
 
   console.log('\n③ 服务端接线（Vosk 优先，SAPI 兜底）');
-  ok(/require\('\.\/voice-vosk-asr\.js'\)/.test(SERVER), 'server.js 引入 voice-vosk-asr.js');
+  ok(/require\('\.\/lib\/voice-vosk-asr\.js'\)/.test(SERVER), 'server.js 引入 voice-vosk-asr.js');
   ok(/createVoskAsr\(\{/.test(SERVER), 'server.js 构造 VOSK_ASR');
   ok(/function localAsrEngine\(\)/.test(SERVER), 'server.js 有 localAsrEngine() 统一裁决引擎');
   const engBody = (SERVER.match(/function localAsrEngine\(\) \{[\s\S]*?\n\}/) || [''])[0];

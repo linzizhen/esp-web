@@ -16,7 +16,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
-const { createLocalAsr } = require(path.join(ROOT, 'voice-local-asr.js'));
+const { createLocalAsr } = require(path.join(ROOT, 'lib', 'voice-local-asr.js'));
 
 let pass = 0;
 let fail = 0;
@@ -97,13 +97,13 @@ function synthSpeech(text, file) {
   ok(missing.ok === false && missing.error === 'wav_not_found', '文件不存在时如实报错', JSON.stringify(missing));
 
   console.log('\n②b 录音预处理（高通 + 归一化）：板载麦克风录到的声音很轻，必须先把低频轰鸣切掉再放大');
-  const { normalizeForAsr } = require(path.join(ROOT, 'voice-local-asr.js'));
+  const { normalizeForAsr } = require(path.join(ROOT, 'lib', 'voice-local-asr.js'));
   ok(typeof normalizeForAsr === 'function', '导出 normalizeForAsr()');
-  const rawSrc = fs.readFileSync(path.join(ROOT, 'voice-local-asr.js'), 'utf8');
+  const rawSrc = fs.readFileSync(path.join(ROOT, 'lib', 'voice-local-asr.js'), 'utf8');
   ok(/hpfHz/.test(rawSrc) && /Math\.exp\(-2 \* Math\.PI \* hpfHz/.test(rawSrc), '确实做了一阶高通（系数按 hpfHz 与采样率算）');
   ok(/targetPeak/.test(rawSrc) && /maxGainDb/.test(rawSrc), '归一化有目标峰值与最大增益上限（不会无限放大噪声）');
   ok(/32767/.test(rawSrc) && /-32768/.test(rawSrc), '放大后按 16 bit 上下限夹紧（不产生环绕失真）');
-  const psSrc = fs.readFileSync(path.join(ROOT, 'scripts', 'asr-local.ps1'), 'utf8');
+  const psSrc = fs.readFileSync(path.join(ROOT, 'scripts', 'asr', 'asr-local.ps1'), 'utf8');
   ok(/while\s*\(/.test(psSrc), 'PowerShell 侧循环识别（长录音里有多句话）');
   ok(/parts/.test(psSrc), 'PowerShell 侧把多段结果拼起来返回');
 
@@ -135,7 +135,7 @@ function synthSpeech(text, file) {
   console.log('\n③ 服务端与前端接线契约');
   const serverSrc = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
   const appSrc = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
-  ok(/require\(['"]\.\/voice-local-asr\.js['"]\)/.test(serverSrc), 'server.js 引入 voice-local-asr.js');
+  ok(/require\(['"]\.\/lib\/voice-local-asr\.js['"]\)/.test(serverSrc), 'server.js 引入 voice-local-asr.js');
   ok(/LOCAL_ASR\.available\(\)/.test(serverSrc), 'server.js 探测本机离线识别是否可用');
   ok(/LOCAL_ASR\.transcribe\(/.test(serverSrc), 'server.js 调用本机离线识别');
   ok(/transcribed_local|local_transcribed/.test(serverSrc), '本机识别结果会推进链路并记事件');

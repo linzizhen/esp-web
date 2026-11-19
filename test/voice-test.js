@@ -405,7 +405,7 @@ function staticContract() {
      * 上传路径拿到的是内存里的完整 buf，天然是全量；但 GET /api/voice 走的是
      * readVoiceAudioMeta()，它只从盘上读文件开头 64 KB 再算电平 —— 这才是
      * 2026-10-28 真机实测「服务端 -39.8 dBFS vs 全量 -44.3 dBFS」的来源
-     * （test/voice-hil.js ② 段正是拿这个值和本地全量解码比对）。
+     * （test/manual/voice-hil.js ② 段正是拿这个值和本地全量解码比对）。
      * 所以缺陷必须在这条路径上被照出来，否则测试是假绿。 */
     // 重新上传一次分段 WAV，确保 latest 就是它（前面几个用例已经把它挤下去了）
     const upMix3 = await uploadWav(mixedWav);

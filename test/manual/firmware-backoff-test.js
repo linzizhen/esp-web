@@ -14,8 +14,8 @@
  * 前置条件：通过服务端串口通道（server.js 打开 COM4）读取板子输出，
  *           因此需要 server.js 在 8080 运行；脚本用 /api/state 观察。
  *
- * 用法：node test/firmware-backoff-test.js
- *       node test/firmware-backoff-test.js --offline   （只测「服务端不可达」场景）
+ * 用法：node test/manual/firmware-backoff-test.js
+ *       node test/manual/firmware-backoff-test.js --offline   （只测「服务端不可达」场景）
  */
 'use strict';
 const http = require('node:http');
@@ -90,10 +90,10 @@ const get = (p) => new Promise((resolve, reject) => {
   /* ---------- 2) 退避行为：需要观察「服务端不可达」时的帧间隔分布 ---------- */
   console.log('— 场景：服务端不可达时的退避（需要停止服务端，本脚本无法自动完成）—');
   console.log('  说明：本场景要求先停掉 server.js（否则板子上传成功，不会触发退避），');
-  console.log('        再用 test/serial-forensics.js 被动监听串口，统计帧间隔分布。');
+  console.log('        再用 test/manual/serial-forensics.js 被动监听串口，统计帧间隔分布。');
   console.log('        判定标准：修复后退避生效 → 多数帧间隔 ≈0.1s，少数 ≈3.0s；');
   console.log('                  修复前退避失效 → 帧间隔恒为 ≈3.0s。');
-  console.log('  该场景由 test/backoff-hil.js 自动执行（它会自行停/起服务端）。');
+  console.log('  该场景由 test/manual/backoff-hil.js 自动执行（它会自行停/起服务端）。');
 
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);

@@ -2,13 +2,13 @@
 /* 慢相/快相逐帧对照：帧间隔 vs 本帧上传结果。
  * 目的：判断长间隔是否由「HTTP 上传超时」造成，还是主任务被调度挤占。
  * 只读 data/*.ndjson。
- * 用法：node test/fps-upload-correlate.js <startISO> <endISO>
+ * 用法：node test/manual/fps-upload-correlate.js <startISO> <endISO>
  */
 'use strict';
 const fs = require('fs');
 const path = require('path');
 
-const ROOT = path.resolve(__dirname, '..');
+const ROOT = path.resolve(__dirname, '..', '..');
 const FILES = ['data/records.2026-10-26T02-49-37.ndjson', 'data/records.ndjson'];
 
 function load(p) {

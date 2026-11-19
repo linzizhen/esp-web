@@ -49,8 +49,8 @@
 ## B. 一键自检脚本（推荐日常用）
 
 ```bash
-node test/week4-verify.js              # 打 http://127.0.0.1:8080
-PORT=8090 node test/week4-verify.js    # 换端口
+node test/manual/week4-verify.js              # 打 http://127.0.0.1:8080
+PORT=8090 node test/manual/week4-verify.js    # 换端口
 ```
 
 **它做什么**：先探 `/api/state` 确认设备在线与否，再逐条跑 7 组用例，每条输出 ✔/✘ + 关键证据（时间、seq、request_id），最后给汇总表。
@@ -149,7 +149,7 @@ node test/nl-test.js
 1. **拔掉 USB**（断串口）
 2. **关闭热点 / 让板子断网**（断 WiFi）
 3. `curl -s http://127.0.0.1:8080/api/state` 确认 `connected=false`
-4. `node test/week4-verify.js` → 用例 ③ 自动切成「应如实报未完成」判定（脚本先探 `/api/state`）
+4. `node test/manual/week4-verify.js` → 用例 ③ 自动切成「应如实报未完成」判定（脚本先探 `/api/state`）
 5. 或只问一句：
 
 ```bash

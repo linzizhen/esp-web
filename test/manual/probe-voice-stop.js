@@ -1,7 +1,7 @@
 'use strict';
 /** 探针：连续多轮 start→N 秒→stop，看 stop 是否每次都生效
  *  目的：判断「录音 10000ms 撞上限」是偶发还是稳定复现。
- *  用法：node test/probe-voice-stop.js [轮数] [秒数]
+ *  用法：node test/manual/probe-voice-stop.js [轮数] [秒数]
  */
 const http = require('node:http');
 const BASE = 'http://127.0.0.1:8080';

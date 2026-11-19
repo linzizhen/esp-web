@@ -9,7 +9,7 @@
  *     · 6 秒录音 → 顶到 10000 ms 上限
  *     · 10 秒上限实际只能录 5 秒（缓冲按单声道算）
  *
- * 这些断言不替代 test/voice-hil.js（真机必须实测），但能在改固件时
+ * 这些断言不替代 test/manual/voice-hil.js（真机必须实测），但能在改固件时
  * 立刻发现"有人又把交错数据当单声道用了"——CI 里没有板子，只能靠它兜底。
  */
 const fs = require('node:fs');
@@ -97,5 +97,5 @@ if (fail === 0) {
   console.log(`  ✗ ${fail} 项失败 / ${pass} 项通过`);
 }
 console.log('='.repeat(64));
-console.log('\n  注：静态契约只能防"改回去"，真机行为请跑 node test/voice-hil.js');
+console.log('\n  注：静态契约只能防"改回去"，真机行为请跑 node test/manual/voice-hil.js');
 process.exit(fail === 0 ? 0 : 1);

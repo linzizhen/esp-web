@@ -22,7 +22,7 @@
  * 预热期：必须等板子连续失败 5 次（约 15s）进入退避、并再稳定一段时间，
  *         否则测到的是「过渡期」，不是稳态行为。
  *
- * 用法：node test/backoff-hil.js [端口]
+ * 用法：node test/manual/backoff-hil.js [端口]
  *   ⚠ 运行前必须先停掉 server.js（否则它独占串口，且板子上传会成功）。
  */
 'use strict';

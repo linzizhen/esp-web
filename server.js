@@ -17,9 +17,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { WebSocketServer } = require('ws');
 const { SerialPort } = require('serialport');
-const { createVoiceRx } = require('./voice-serial-rx.js');
-const { createLocalAsr } = require('./voice-local-asr.js');
-const { createVoskAsr } = require('./voice-vosk-asr.js');
+const { createVoiceRx } = require('./lib/voice-serial-rx.js');
+const { createLocalAsr } = require('./lib/voice-local-asr.js');
+const { createVoskAsr } = require('./lib/voice-vosk-asr.js');
 /* 本机离线识别有两条实现，都不联网、不上传，录音不出这台电脑：
  *   1) Vosk small-cn（首选）：Kaldi 系 DNN 模型，对远场/带噪的板载录音明显更稳
  *      实测同一段录音 Vosk 听出「喂喂喂听得到吗…」，Windows 自带只能扒出碎片。

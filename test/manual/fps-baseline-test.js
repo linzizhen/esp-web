@@ -125,8 +125,8 @@
  * 不写任何数据、不注入合成帧、不动 /api/report，不污染真实采集。
  *
  * 用法：
- *   node test/fps-baseline-test.js                       默认 http://127.0.0.1:8080
- *   FPS_PORT=8099 node test/fps-baseline-test.js         指定端口
+ *   node test/manual/fps-baseline-test.js                       默认 http://127.0.0.1:8080
+ *   FPS_PORT=8099 node test/manual/fps-baseline-test.js         指定端口
  *   FPS_BASE=http://192.168.1.10:8080 node ...           指定完整地址（VPS 部署时）
  *   FPS_MAX_MEDIAN_MS=200 node ...                       临时收紧阈值（调试用，默认 250）
  *   FPS_MIN_FRAMES=120 node ...                          要求更多样本（默认 60）
@@ -270,9 +270,9 @@ function printCauses() {
   console.log('    1) 上传路径同步阻塞：固件 send_frame() 里 http_upload() 是同步等待（main.c:1001），');
   console.log('       每帧要等一次 HTTP 往返，帧间隔 ≈ 100ms + k×RTT（实测 k≈2.86）。');
   console.log('       WiFi RTT 一高帧率就塌。2026-10-26 的 9.43 → 2.2 fps 即此类。');
-  console.log('       取证：node test/fps-upload-correlate.js（看 RTT 与间隔的相关性）');
+  console.log('       取证：node test/manual/fps-upload-correlate.js（看 RTT 与间隔的相关性）');
   console.log('    2) WiFi 退避失效：每一帧都撞 HTTP 超时（约 3s），帧间隔恒 ≈3.0s。');
-  console.log('       2026-10-15 的 0.33 fps 即此类。取证：node test/firmware-backoff-test.js');
+  console.log('       2026-10-15 的 0.33 fps 即此类。取证：node test/manual/firmware-backoff-test.js');
   console.log('    3) 退避窗口内跳过上传：连续失败 5 次后每 10s 才重试一次，中间帧只采样不上传。');
   console.log('       表现是 seq 前跳（Δseq 很大）而 ts 间隔同样很大 —— 见上面「上传缺帧」统计。');
   console.log('    4) 主循环被其他任务抢占：摄像头采集/上传、语音上传、LCD 重绘。');
