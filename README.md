@@ -133,10 +133,12 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   ├── week4-test-guide.md                     # 第 4 周：LLM 配置与验收步骤
 │   ├── week5-voice.md                          # 第 5 周：按键录音 → 上传 → 识别与播报（含 I2S 交错缺陷复盘）
 │   ├── week6-voice.md                          # 第 6 周：澄清上下文、任务取消、迟到结果隔离、时序测量
+│   ├── week7-snapshot.md                       # 第 7 周：按需环境图像采集（四态机、采集时间、遮挡判定）
+│   ├── week7-snapshot-design.md                # 第 7 周：采集功能的设计与取舍（先设计后实现）
 │   ├── week3-flash-evidence.txt                # 第 3 周烧录留存证据（整理版）
 │   ├── code-issues-review.md                   # 代码问题评审记录（含历次复查与更正）
 │   ├── course-weeks-review.md                  # 课程周次对照检查
-│   ├── project-structure.md                    # 帧率退化取证：设计缺陷 + 触发条件 + 放大器
+│   ├── project-structure.md                    # 目录职责、命名规范、新文件该放哪的五步判定
 │   ├── fps-degradation-forensics.md            # 帧率退化取证：设计缺陷 + 触发条件 + 放大器
 │   └── assets/                                 # 截图与 UI 原型（文档引用的二进制都放这里）
 │       ├── help-page.png                       # 教学求助页截图
@@ -213,6 +215,8 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── voice-stale-test.js                     # 旧语音快照超过 10 分钟按历史渲染
     ├── voice-hero-contract-test.js             # 语音页决策卡 + 指示灯四档图案与心跳
     ├── voice-cancel-test.js                    # 第 6 周：取消链路、澄清上下文、request_id 防覆盖、时序
+    ├── snapshot-store-test.js                  # 第 7 周：采集记录仓库（四态机、单飞、旧帧拒绝、保留 5 张）
+    ├── snapshot-test.js                        # 第 7 周：按需采集接口与页面契约（本次成功/失败/遮挡）
     ├── command-ack-test.js                     # 第 5 周：命令 ack 五态区分
     ├── diag-hygiene-test.js                    # 诊断口径：日志行不计入无效行、设备路径不被 WiFi 冒充
     ├── firmware-wifi-skip-test.js              # 固件：WiFi 未连不刷屏、upload_skip、断线指数退避
@@ -816,7 +820,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **36 个测试文件、999 项断言**，一条命令：
+全套 **38 个测试文件、1112 项断言**，一条命令：
 
 ```bash
 npm test
