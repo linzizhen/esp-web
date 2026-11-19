@@ -139,6 +139,36 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:8080/api/voice/timings?limit=5' | Conve
 
 ---
 
+### 验证 6：连续两次查询（第二句不被第一句顶掉）
+
+课程要求测「连续两次查询」。关键窗口不是「两次都成功」，而是**第二句还在跑、第一句的结果刚回来**。
+
+```
+node test/voice-cancel-test.js        # ③d 组即这条
+```
+
+实测输出（2026-11-19）：
+
+```
+第一句查询走通                    -> query_last
+第二句查询走通（不用等第一句结束）  -> collect_once
+第二句在跑时，第一句的迟到结果被拒  -> stale_request_id
+状态保留第二句的结果               -> vr-20260101-000007-0007 / 第二次的回复
+```
+
+**判据**：`/api/voice/state` 的 `request_id` 与 `reply` 必须是第二句的；第一句的 `task_done` 回 `ignored:true` 且理由为 `stale_request_id`。
+
+### 验证 7：回到待机
+
+点「停止」之后页面停在「已停止」是必要的（要让人看见结果被丢弃），但**不能停在那儿出不来**。
+「回到待机」按钮调用 `voiceToIdle()`：清掉横幅、四段状态、取消标记与旧 request_id，页面回到
+「待机 · 等你按键」。它**不改服务端阶段** —— 服务端那条 `cancelled` 是真发生过的事实。
+
+清 `VOICE.rid` 是关键：不清的话，旧链路之后回来的任何东西都还有可能被当成当前链路；
+清掉之后 `voiceStale()` 会把它们一律判成过期。
+
+---
+
 ## 五、★ 真机/线上暴露的两个缺陷与修复（2026-11-18）
 
 ### 现象
@@ -192,9 +222,9 @@ if (ridNow && voice.request_id && ridNow !== voice.request_id
 | 文件 | 改动 |
 |---|---|
 | `server.js` | `VOICE_STAGES` +`cancelled`；`VOICE_IN_FLIGHT`；`CANCELLED_RIDS` / `markCancelled` / `isCancelled` / `pruneCancelled`；`CLARIFY` / `rememberClarify` / `takeClarify` / `CLARIFY_PICK_RE` / `CLARIFY_WORDS`；`TIMING_FIELDS` / `sanitizeTimings` / `p50` / `voiceTimingsView`；`VOICE_LATENCY_MS`；`/api/voice/state` 加 rid/timings 与两道守卫；`/api/voice/timings` 新路由；`/api/nl` 加 rid/session/澄清/迟到丢弃/延迟注入；`/api/diag` 加 `voice` 段 |
-| `public/app.js` | `VOICE_STOP_WORDS` / `voiceNewRequestId` / `voiceSessionId` / `voiceStale` / `voiceCancel`；`VOICE` 加 `rid/t0/firstFeedbackMs/cancelled`；`voicePostState` 自动补 rid 且取消后不再推进；`voiceTaskAndSpeak` 全链 `voiceStale` 守卫 + 澄清候选渲染 + `timings` 上报；`VOICE_EVENT_TEXT` 补 `cancelled` / `late_result_dropped` / `clarify_used` |
-| `public/index.html` | 新增 `<button id="btnVoiceStop">停止</button>`；`app.js?v=45 → 46` |
-| `test/voice-cancel-test.js` | 新增，**49 项** |
+| `public/app.js` | `voiceToIdle()`（回到待机：清横幅/四段/取消标记与旧 rid，不动服务端阶段）；`VOICE_STOP_WORDS` / `voiceNewRequestId` / `voiceSessionId` / `voiceStale` / `voiceCancel`；`VOICE` 加 `rid/t0/firstFeedbackMs/cancelled`；`voicePostState` 自动补 rid 且取消后不再推进；`voiceTaskAndSpeak` 全链 `voiceStale` 守卫 + 澄清候选渲染 + `timings` 上报；`VOICE_EVENT_TEXT` 补 `cancelled` / `late_result_dropped` / `clarify_used` |
+| `public/index.html` | 新增 `<button id="btnVoiceStop">停止</button>` 与 `<button id="btnVoiceIdle">回到待机</button>`；`app.js?v=45 → 47` |
+| `test/voice-cancel-test.js` | 新增，**59 项** |
 | `test/voice-test.js` | 五处「8 个阶段」→「9 个阶段」 |
 | `test/run-all.js` | SUITES 加 `voice-cancel` |
 | `docs/week6-voice.md` | 本文 |
@@ -216,3 +246,71 @@ if (ridNow && voice.request_id && ridNow !== voice.request_id
 3. **澄清只支持「二选一」**。候选超过两个时不反问（直接判 `ambiguous` 让用户重说），因为「第三个」这类指代在语音里太容易听错。
 4. **延迟注入是全局的**，不是按请求。它只用于课堂复现，生产必须保持 0（`/api/diag.voice.latency_ms` 可核对）。
 5. **时序只覆盖前端能观测的三段**（到站 → 首次反馈 → 任务完成）。识别与播报各自的内部耗时只有总时长。
+6. **「回到待机」只清页面**，服务端阶段仍是 `cancelled`。取消发生过就是发生过，不因为用户点了「回到待机」而被抹掉 —— 页面显示与服务端记录不能互相矛盾。
+
+---
+
+## 八、迁移：一条「用户反悔后安全恢复」的处理规则
+
+课程要求「迁移一条『用户反悔后安全恢复』的处理规则」。以下是本项目的做法，可以原样搬到别的语音项目。
+
+### 规则正文
+
+> **用户说停、或点了停止，旧链路的一切结果一律作废；页面必须提供一步「回到待机」；
+> 新任务用新的 request_id 直接接管，不必等旧链路收尾。**
+
+### 三个必须同时成立的不变量
+
+| 不变量 | 落地方式 | 少做会怎样 |
+|---|---|---|
+| 一次发起 = 一个 request_id | 前端 `voiceNewRequestId()` 生成，随每次状态上报与 `/api/nl` 一起带 | 没有 rid 就无法区分「这次的结果」和「上一次迟到的结果」，只能靠时间猜 |
+| 取消 = 登记 + 清态 + 停本机 | 服务端 `markCancelled(rid)`；前端 `VOICE.cancelled`、暂停播放、`speechSynthesis.cancel()` | 只停播放不停登记：迟到的 `/api/nl` 照样执行并写 reply，播报跟着来 |
+| 渲染前判 rid，而不是判「有没有结果」 | 每个 `await` 之后 `if (voiceStale(rid)) return;` | 判「有结果就渲染」时，晚到的旧结果会直接盖掉新任务 |
+
+### 迁移到别的项目时的最小改动
+
+1. 给每次用户发起生成 rid，并在**每一条**上报里带上它（前端 → 服务端）。
+2. 服务端维护一个内存 Map：`rid → 取消时刻`，TTL 取「HTTP 超时 + 余量」（这里是 60 秒）；写入路径入口先查这张表。
+3. 前端维护 `cancelled` 与「当前 rid」，任何异步回调回来先比对 rid。
+4. 页面必须有一步「回到待机」—— 取消是终点，但不该是死路。
+
+### 为什么登记表可以只放内存
+
+本项目的 `/api/nl` 客户端超时是 30 秒，`CANCELLED_RIDS` 的 TTL 是 60 秒：超过 60 秒的迟到结果
+在客户端那一侧已经不可能再回来（请求早被放弃）。**用「上游超时」反推 TTL**，就不需要为一张临时表引入持久化。
+
+---
+
+## 九、向端侧课反馈：取消语义与反馈时序需求
+
+课程要求「向端侧课反馈取消语义与反馈时序需求」。以下是这一侧真实需要、但端侧目前给不了的两件事。
+
+### 需求 1：端侧需要能收到「本次请求已作废」
+
+现状：取消只发生在服务端与浏览器之间。服务端把 `/api/nl` 的结果丢掉，但**板子那边仍在继续上传**（录音 WAV 已经发完、帧也照发）。
+真要做到「省算力、省流量」，需要一条下行指令 `cancel(request_id)`，端侧收到后停止后续回传。
+
+本轮没做（见边界第 1 条）：停止不能中断已经发出的 HTTP 请求。
+
+### 需求 2：反馈时序需要一个共同时基
+
+课程要测「输入结束 → 首次反馈」与「→ 任务完成」。现在只能拿到三段：
+
+- 服务端**到站时刻**（`recorded` 事件）
+- 浏览器**首次反馈**（`to_first_feedback_ms`）
+- 浏览器**任务完成**（`to_task_done_ms`）
+
+缺的是「用户**说完话**的那一刻」—— 板端不知道，服务端只能拿「WAV 传完的时刻」近似。串口通道实测约 4~6 秒一帧，
+这个近似的误差就是上传耗时本身，量级和被测时长相当，结论不可用。
+
+**建议端侧上报两个字段**：
+
+```json
+{ "capture_end_ms": 1234567, "boot_id": "3f9a2c81" }
+```
+
+- `capture_end_ms`：板端单调时钟（`esp_timer_get_time()/1000`）在「停止采集」那一刻的读数；
+- `boot_id`：每次启动随机生成，用来把单调时钟换算到墙钟（服务端用收到首帧时的 `Date.now()` 反推）。
+
+有了这两个字段，「输入结束」就能精确到毫秒，与「首次反馈」在同一时基上相减。
+在没有 NTP 的部署里（本板 `iso` 为空的那种情况）这一步是必须的 —— 只靠墙钟会差出几十秒。
