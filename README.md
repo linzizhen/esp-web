@@ -94,6 +94,215 @@ npm run firmware:monitor   # 串口监视（Ctrl+] 退出）
 
 ```
 imu-monitor/                    # ← 本项目即一个自包含文件夹，所有文件都在此目录内
+│   ├── project-structure.md                    # 目录职责、命名规范、「新文件该放哪」的判定顺序
+├── server.js                 # 后端：串口管理 + HTTP + WebSocket 推送 + NDJSON 落盘
+├── config.json               # 配置文件（端口、波特率、超时、字段单位与中文名）
+├── README.md                 # 本文件：运行/接线/验证说明
+├── ASSIGNMENT.md             # 课程作业提交说明（分工/单位时间核对/风险/部署/一人一记录）
+├── package.json
+├── start.bat                 # 一键启动（双击即可）
+├── .gitignore                # 排除构建产物 / 依赖 / 运行时数据
+├── server.js                                   # 后端入口：串口管理 + HTTP + WebSocket 推送 + NDJSON 落盘
+├── lib/                                        # 服务端可复用模块（无入口逻辑，可单独测试）
+│   ├── voice-serial-rx.js                      # 串口语音组装器：voice_begin/chunk/end 三段落 → 完整 WAV
+│   ├── voice-local-asr.js                      # 本机离线识别 A：Windows System.Speech（含高通 + 归一化预处理）
+│   └── voice-vosk-asr.js                       # 本机离线识别 B：Vosk 中文模型（首选，识别质量更好）
+├── config.json                                 # 主配置（端口、波特率、超时、字段单位与中文名）
+├── config.local.json.example                   # 本地私密配置模板（复制成 config.local.json 后填 Key；后者不进库）
+├── config.vps.json                             # VPS 部署用的配置变体
+├── README.md                                   # 本文件：运行 / 接线 / 验证说明
+├── ASSIGNMENT.md                               # 课程作业提交说明（分工 / 单位时间核对 / 风险 / 部署）
+├── package.json                                # 依赖与脚本入口（npm test → test/run-all.js）
+├── start.bat                                   # 一键启动（双击即可）
+├── .gitignore                                  # 排除构建产物 / 依赖 / 运行时数据 / 私密配置
+├── scripts/                                    # 运维与构建脚本（不含产品逻辑）
+│   ├── idfwrap.py                              # ESP-IDF 构建 / 烧录封装（自动注入工具链环境）
+│   ├── set_wifi.py                             # 一键切换板端 WiFi 配置（自动检测本机 IP）
+│   ├── deploy-vps.ps1                          # Windows Server VPS 一键部署（开机自启 + 防火墙 + 探活）
+│   ├── audit-unused.js                         # 代码审计：未使用的函数 / 空 catch / 注释掉的死代码（只读）
+│   ├── audit-api.js                            # 代码审计：前后端接口交叉核对，找潜在 404（只读）
+│   ├── audit-dup.js                            # 代码审计：重复函数体 / ≥85% 相似函数（只读）
+│   └── asr/                                    # 识别引擎脚本（由 lib/ 的适配层调用）
+│       ├── asr-local.ps1                       # System.Speech 封装（★ 必须存成带 BOM 的 UTF-8）
+│       └── asr-vosk.py                         # Vosk / Kaldi 封装（输出 UTF-8 JSON，控制台乱码不影响结果）
+├── docs/                                       # 周次文档、评审记录与素材
+│   ├── vps-deploy.md                           # VPS 部署手册（Windows Server，含编译环境坑与排查表）
+│   ├── week2-remote-collect.md                 # 第 2 周：远程采集协议、状态图、时序图、实测记录
+│   ├── week3-button-feedback.md                # 第 3 周：按键触发与物理反馈闭环
+│   ├── week4-nl-assistant.md                   # 第 4 周：自然语言查询与请求采集（受限工具 + 诚实性回复）
+│   ├── week4-test-guide.md                     # 第 4 周：LLM 配置与验收步骤
+│   ├── week5-voice.md                          # 第 5 周：按键录音 → 上传 → 识别与播报（含 I2S 交错缺陷复盘）
+│   ├── week6-voice.md                          # 第 6 周：澄清上下文、任务取消、迟到结果隔离、时序测量
+│   ├── week3-flash-evidence.txt                # 第 3 周烧录留存证据（整理版）
+│   ├── code-issues-review.md                   # 代码问题评审记录（含历次复查与更正）
+│   ├── course-weeks-review.md                  # 课程周次对照检查
+│   ├── project-structure.md                    # 帧率退化取证：设计缺陷 + 触发条件 + 放大器
+│   ├── fps-degradation-forensics.md            # 帧率退化取证：设计缺陷 + 触发条件 + 放大器
+│   └── assets/                                 # 截图与 UI 原型（文档引用的二进制都放这里）
+│       ├── help-page.png                       # 教学求助页截图
+│       ├── week4-ask-page.png                  # 自然语言页截图
+│       ├── ui-concept.html                     # UI 原型 A：克制极简 + 像素材质
+│       └── ui-concept-pixel.html               # UI 原型 B：纯像素抖动风（Fusion Pixel 点阵中文）
+├── data/                                       # NDJSON 持久化（运行后生成）：records / help / voice 子目录
+├── recordings/                                 # 录制导出的 CSV（运行后生成）
+├── public/                                     # 前端静态资源
+│   ├── index.html                              # 监控页面（实时监控 / 远程采集 / 教学求助 / 记录与设备 / 语音 / LLM 配置）
+│   ├── style.css                               # 全部样式（CSS 变量 token 体系 + 浅色 / 深色双主题）
+│   └── app.js                                  # WebSocket 接收、卡片渲染、Canvas 绘制、记录查询、分页路由、主题切换
+├── firmware/                                   # 固件工程
+│   ├── s3eye_imu_idf/                          # ★ 当前使用：ESP-IDF 工程（QMA7981 三轴 + 10Hz 上报 + 校准）
+│   │   ├── CMakeLists.txt                      # 顶层工程定义
+│   │   ├── sdkconfig.defaults                  # 默认构建配置（含摄像头 JPEG 缓冲 64 KB）
+│   │   ├── tools/gen_font.py                   # LCD 点阵字模生成（输出 lcd_font.h + 预览图）
+│   │   └── main/                               # 组件源码
+│   │       ├── main.c                          # 主程序：IMU / 组帧 / USB-CDC + WiFi 上报 / 按键 / LED / LCD
+│   │       ├── voice_record.c                  # 第 5 周：按键录音 → I2S 去交错 → WAV → 串口 / WiFi 上传
+│   │       ├── lcd_font.h                      # 自动生成的点阵字模（中文 32×32 × 25 字 + ASCII 8×16）
+│   │       └── app_config.h                    # ★ 唯一需要改的配置：WiFi 凭据 / 服务器 IP / 设备 ID
+│   ├── esp32_monitor.ino                       # （旧）Arduino USB 串口版草稿
+│   ├── esp32_monitor_wifi.ino                  # （旧）Arduino 通用 WiFi 版草稿
+│   └── s3eye_imu_wifi/                         # （旧）Arduino S3-EYE 专用草稿
+│       └── s3eye_imu_wifi.ino                  # 同上
+└── test/                                       # 自动化测试与手工脚本
+    ├── run-all.js                              # ★ 全套测试编排器（npm test 入口，自动分配隔离端口）
+    ├── .test-config.json                       # 测试隔离配置夹具（autoDetect:false）—— 必须提交
+    ├── .test-nl-config.json                    # NL 测试夹具 —— 必须提交
+    ├── manual/                                 # 需真机 / 手工执行，不进编排器（每个文件头写了用法）
+    │   ├── voice-hil.js                        # 第 5 周真机端到端：录音 → 上传 → 独立解码复核电平
+    │   ├── probe-voice-stop.js                 # 第 5 周真机探针：多轮 start/stop 时长稳定性
+    │   ├── fps-baseline-test.js                # 帧率基线：相邻帧间隔中位数超阈值即失败（打 8080 实例）
+    │   ├── fps-upload-correlate.js             # 帧率取证：RTT 与上传间隔的相关性
+    │   ├── firmware-backoff-test.js            # 固件退避回归（要求服务端停着）
+    │   ├── backoff-hil.js                      # 硬件在环：退避行为回归（自己停 / 起服务端）
+    │   ├── cam-repro.js                        # 硬件在环：摄像头推流复现（含重启检测）
+    │   ├── serial-forensics.js                 # 硬件在环：被动串口取证（复位 / 崩溃特征，只读）
+    │   ├── upload-block-forensics.js           # 硬件在环：上传阻塞对帧率的量化
+    │   ├── records-pollution-check.js          # 真实 records.ndjson 污染取证（before/after/status）
+    │   ├── week4-verify.js                     # 第 4 周：直连 8080 现网验收自检
+    │   └── listen.js                           # 原样监听某串口 N 秒（调试用，不参与断言）
+    │
+    │   —— 以下 36 个自动化测试由 test/run-all.js 编排 ——
+    ├── theme-contract-test.js                  # 前端主题契约：app.js 读的 CSS 变量三套主题都要有（静态）
+    ├── isolation-contract-test.js              # 测试隔离契约：自建 server 的测试必须隔离 DATA_DIR（静态）
+    ├── help-history-ui-test.js                 # 求助历史展示契约：事件名映射完整、元素 id 一致（静态）
+    ├── cam-ack-contract-test.js                # 摄像头回执契约：ack、no_camera 如实上报、errno 翻译（静态）
+    ├── cam-config-contract-test.js             # 摄像头参数固定为实测最优档（静态）
+    ├── acceptance-test.js                      # 全链路验收：固件帧 → 落盘 → 页面 → 停采（端口 8096）
+    ├── e2e-test.js                             # 链路自检：空状态 / 上报解析 / 停采保留 / 断开清空
+    ├── storage-test.js                         # 持久化 + 查询 + 停采保留（端口 8099）
+    ├── p0-dedup-test.js                        # 请求去重 / 幂等（端口 8097）
+    ├── verify-test.js                          # 本组身份校验：device ↔ expectedDeviceId（端口 8095）
+    ├── feature-test.js                         # 诊断接口 / 录制导出 / CSV（端口 8093）
+    ├── parse-test.js                           # 通用解析：JSON / 键值 / 中文键（端口 8094）
+    ├── ws-test.js                              # WebSocket sample / stale / cleared 推送结构
+    ├── help-test.js                            # 第 3 周：教学求助闭环（端口 8097）
+    ├── help-persist-test.js                    # 第 3 周：求助事件落盘与启动回读（端口 8092）
+    ├── nl-test.js                              # 第 4 周：意图解析与诚实性回复
+    ├── nl-config-test.js                       # 第 4 周：LLM 配置增删改查与降级（端口 8095）
+    ├── handleline-guard-test.js                # 空帧守卫：只含元数据的帧不落盘（端口 8091）
+    ├── voice-test.js                           # 第 5 周：语音链路接口契约 + 合成 WAV（端口 8090）
+    ├── voice-layout-contract-test.js           # 第 5 周：WAV 数据布局静态契约（去交错）
+    ├── voice-longpress-test.js                 # 第 5 周：长按 2 秒录音的静态契约
+    ├── voice-mic-preflight-test.js             # 第 5 周：识别前麦克风自检（无设备须如实说明）
+    ├── voice-asr-test.js                       # 第 5 周：服务端转写接口（URL 归一化 / 失败分类 / 零外发）
+    ├── voice-asr-fallback-test.js              # 云端转写失败自动回退本机（429 场景）
+    ├── voice-serial-upload-test.js             # 录音 WAV 走 USB 串口回传（组装器行为 + 契约）
+    ├── voice-local-asr-test.js                 # 本机离线识别（System.Speech）：真识别 + 静音不瞎猜
+    ├── voice-vosk-asr-test.js                  # 本机离线识别（Vosk）：真识别 + 引擎优先序
+    ├── voice-link-contract-test.js             # 链路自检面板：板端在线 / 上传通道 / 板端 WiFi
+    ├── voice-stale-test.js                     # 旧语音快照超过 10 分钟按历史渲染
+    ├── voice-hero-contract-test.js             # 语音页决策卡 + 指示灯四档图案与心跳
+    ├── voice-cancel-test.js                    # 第 6 周：取消链路、澄清上下文、request_id 防覆盖、时序
+    ├── command-ack-test.js                     # 第 5 周：命令 ack 五态区分
+    ├── diag-hygiene-test.js                    # 诊断口径：日志行不计入无效行、设备路径不被 WiFi 冒充
+    ├── firmware-wifi-skip-test.js              # 固件：WiFi 未连不刷屏、upload_skip、断线指数退避
+    ├── firmware-upload-queue-test.js           # 固件：上传队列与采样解耦
+    └── firmware-keepalive-test.js              # 固件：长连接复用
+```bash
+npm start          # 等价于 node server.js
+```
+
+启动后浏览器访问 <http://localhost:8080>
+
+> **部署到 VPS（可选）**：本项目是单进程 Node.js 服务，无数据库、无构建步骤。
+> Windows Server 上可一键部署为开机自启服务：
+>
+> ```powershell
+> .\scripts\deploy-vps.ps1          # 装依赖 + 注册计划任务 + 防火墙 + 探活
+> .\scripts\deploy-vps.ps1 -Status  # 查状态
+> .\scripts\deploy-vps.ps1 -Uninstall
+> ```
+>
+> 使用 `config.vps.json`（已关闭串口自动探测 —— VPS 上没有开发板）。
+> 完整手册见 [`docs/vps-deploy.md`](docs/vps-deploy.md)。
+> **当前状态：VPS 待补**（本组暂无分配的 VPS，按课程备用路径以本机作服务器）。
+
+### 2. 烧录固件到 ESP32-S3-EYE
+
+本项目当前使用 **ESP-IDF 工程** `firmware/s3eye_imu_idf/`（Arduino 草稿为早期版本，已不用）。
+
+先填配置 —— **WiFi 密码不要写进 `app_config.h`**（该文件会提交到仓库），
+复制模板到本地私密文件（已被 `.gitignore` 忽略）：
+
+```bash
+cd firmware/s3eye_imu_idf/main
+cp app_config.local.h.example app_config.local.h   # 然后编辑它，填 WiFi / 服务器 IP / 设备 ID
+```
+
+然后：
+
+```bash
+npm run firmware:build     # 编译
+npm run firmware:flash     # 编译并烧录到 COM4
+npm run firmware:monitor   # 串口监视（Ctrl+] 退出）
+```
+
+> 烧录前请在网页点「**释放串口**」——Windows 串口是独占的。
+> 这三个脚本走 `scripts/idfwrap.py`，它已处理好 MSYS 与 ESP-IDF Python 环境，无需手动 export。
+
+### 3. 接线（可选）
+
+**各芯片的 ADC 引脚完全不同**，固件已按型号自动切换（不用手动改代码）：
+
+| 芯片 | ADC1 可用引脚 | 固件默认值 |
+|---|---|---|
+| **ESP32-S3** | GPIO1~GPIO10 | **GPIO4、GPIO5** |
+| ESP32（经典款） | GPIO32~GPIO39 | GPIO34、GPIO35 |
+| ESP32-C3 / C6 / H2 | GPIO0~GPIO4（GPIO0 是启动脚，别用） | GPIO3、GPIO4 |
+
+> ESP32-S3 注意：**不要**用 GPIO26~32（Flash/PSRAM）和 GPIO33~37（八线 PSRAM）。
+> DHT22 默认接 GPIO4 —— 若与上面的 ADC0 冲突，改 `DHT_PIN` 或 `ADC_PIN_0` 即可。
+
+信号范围 **0~3.3V，超过会烧 IO**。
+
+### 4. 查看数据
+
+开发板上电后，平台会自动识别串口并连接，页面顶部状态变为绿色「已连接 · 串口」，随后显示实时数值、趋势曲线与原始数据日志。
+
+## 二、断开行为（关键）
+
+平台区分**三种状态**，由 `config.json` 的 `stalePolicy` 控制停采后的行为（默认 `keep`，契合作业「停采后保留旧时间、提示未更新」要求）：
+
+| 状态 | 触发 | 页面表现 |
+|---|---|---|
+| **实时**(live) | 持续收到真实数据 | 绿色「已连接」，数值与曲线实时刷新 |
+| **停采保留**(stale) | 收到过数据但超过 `staleAfterMs`（默认 5s）无新数据 | 黄色「已停采 · 保留末次数据」+「未更新」徽章，**保留最后一次真实值与旧时间** |
+| **离线**(cleared) | 串口 `close`（物理拔线）/ 手动「释放串口」 | 立即清空全部数值与曲线，横幅提示「未检测到开发板」，**无任何模拟数据** |
+
+> `stalePolicy: 'clear'` 时，停采超过 `offlineAfterMs`（默认 15s）会进一步清空（满足"拔线即无数据"的原始要求）。物理拔线/手动释放**在任何策略下都立即清空**。
+
+| 情况 | 页面表现 |
+|---|---|
+| 拔掉 USB（串口 close） | 立即清空全部数值与曲线，横幅提示「未检测到开发板」 |
+| 驱动未上报拔线 | 超过 `offlineAfterMs`（默认 15s）无任何数据 → 判定设备已移除，同样清空 |
+| 上报非 JSON / 无数值 | 只记入「原始数据」日志，**不作为数据显示** |
+
+离线时所有卡片显示占位符，重新插上开发板后自动重连并恢复显示。
+
+## 三、目录结构
+
+```
+imu-monitor/                    # ← 本项目即一个自包含文件夹，所有文件都在此目录内
 ├── server.js                 # 后端：串口管理 + HTTP + WebSocket 推送 + NDJSON 落盘
 ├── config.json               # 配置文件（端口、波特率、超时、字段单位与中文名）
 ├── README.md                 # 本文件：运行/接线/验证说明
@@ -546,8 +755,8 @@ Web 页「**语音**」标签页让佩戴者**按 BOOT 键说一句话**，查�
 ### 当堂验证
 
 ```bash
-node test/voice-hil.js --speak    # 真机：录音 → 上传 → 独立复核 WAV 电平（需硬件）
-node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
+node test/manual/voice-hil.js --speak    # 真机：录音 → 上传 → 独立复核 WAV 电平（需硬件）
+node test/manual/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
 node test/voice-test.js           # 112 项接口契约（隔离实例 + 合成 WAV，无需硬件）
 node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/timeout/mock，无需硬件）
 ```
@@ -628,7 +837,7 @@ npm run test:unit          # 纯静态/解析，无需硬件，快（theme + par
 npm run test:integration   # 服务端链路（storage/p0/verify/ws/help/acceptance）
 npm run test:nl            # 第 4 周自然语言模块（nl + nl-config）
 node test/run-all.js e2e   # 只跑端到端
-node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在发什么（调试用，不算断言）
+node test/manual/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在发什么（调试用，不算断言）
 ```
 
 > 分组脚本只跑一部分；要跑全部 23 个文件请用 `npm test`（= `node test/run-all.js`）。
@@ -636,11 +845,11 @@ node test/listen.js COM4 25   # 原样监听串口 25 秒，看板子到底在�
 需真实开发板在线、**不在**编排器内，手动跑：
 
 ```bash
-node test/voice-hil.js            # 第 5 周真机端到端：录音 → 上传 → 独立复核 WAV 电平
-node test/voice-hil.js --speak    # 同上，并提示你对着板子说话
-node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
-node test/fps-baseline-test.js    # 帧率基线回归：相邻帧间隔中位数 > 250ms 即失败（只读 GET /api/state）
-node test/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
+node test/manual/voice-hil.js            # 第 5 周真机端到端：录音 → 上传 → 独立复核 WAV 电平
+node test/manual/voice-hil.js --speak    # 同上，并提示你对着板子说话
+node test/manual/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
+node test/manual/fps-baseline-test.js    # 帧率基线回归：相邻帧间隔中位数 > 250ms 即失败（只读 GET /api/state）
+node test/manual/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
 ```
 
 `fps-baseline-test.js` 默认打 8080 上的运行实例（要观察真实串口上的板子，自建隔离实例拿不到串口，只会永远 skip），

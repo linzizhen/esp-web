@@ -369,11 +369,11 @@ node test/diag-hygiene-test.js # 13 项  /api/diag 口径：设备日志行单�
 以下需真实开发板在线，**不在**编排器内，手动跑：
 
 ```bash
-node test/voice-hil.js            # 真机端到端：录音 → 上传 → 独立复核 WAV 电平
-node test/voice-hil.js --speak    # 同上，并提示你对着板子说话
-node test/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
-node test/fps-baseline-test.js    # 帧率基线回归：中位帧间隔 > 250ms 即失败（只读 GET /api/state）
-node test/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
+node test/manual/voice-hil.js            # 真机端到端：录音 → 上传 → 独立复核 WAV 电平
+node test/manual/voice-hil.js --speak    # 同上，并提示你对着板子说话
+node test/manual/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
+node test/manual/fps-baseline-test.js    # 帧率基线回归：中位帧间隔 > 250ms 即失败（只读 GET /api/state）
+node test/manual/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
 ```
 
 `fps-baseline-test.js` 判据是**相邻帧间隔的中位数**（不用「快慢帧次数比」—— 2026-10-15 那次用次数比在未修复固件上误报过全绿）。
@@ -801,8 +801,8 @@ BOOT 键 → 板载 MEMS 麦克风 I2S 直采 → WAV(16kHz/16bit/单声道)
 ### 12.4 当堂验证
 
 ```bash
-node test/voice-hil.js --speak            # 真机：录音 → 上传 → 独立复核 WAV 电平
-node test/probe-voice-stop.js 5 2         # 真机探针：5 轮 start → 2s → stop 时长稳定性
+node test/manual/voice-hil.js --speak            # 真机：录音 → 上传 → 独立复核 WAV 电平
+node test/manual/probe-voice-stop.js 5 2         # 真机探针：5 轮 start → 2s → stop 时长稳定性
 node test/voice-test.js                   # 112 项接口契约（隔离实例 + 合成 WAV）
 node test/voice-layout-contract-test.js   # 25 项数据布局静态契约
 node test/voice-asr-test.js               # 50 项服务端转写契约（含「未启用零外发」）
@@ -854,7 +854,7 @@ node test/voice-asr-test.js               # 50 项服务端转写契约（含「
 而服务端仍返回 `ok=true / accepted=true` —— **谎报**。
 
 建议后续在 `sendCommand()` 后等待 ack 再定论，把 `accepted` 改成「板端确认」而非「写出口成功」。
-本周不修（超出范围），已在 `test/voice-hil.js` 第 ⑥ 段登记为已知缺口、不判失败 —— **登记不等于认可**。
+本周不修（超出范围），已在 `test/manual/voice-hil.js` 第 ⑥ 段登记为已知缺口、不判失败 —— **登记不等于认可**。
 
 > 完整说明（架构图、接口清单、失败分支表、取证过程、迁移判据）见
 > [`docs/week5-voice.md`](docs/week5-voice.md)。
