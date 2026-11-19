@@ -52,6 +52,7 @@ const els = {
   btnCamRetry: $('btnCamRetry'),
   camShot: $('camShot'), camShotTag: $('camShotTag'), camShotPlaceholder: $('camShotPlaceholder'),
   camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'),
+  camShotState: $('camShotState'), camShotList: $('camShotList'), camShotKeep: $('camShotKeep'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
   helpHistory: $('helpHistory'), helpHistoryCount: $('helpHistoryCount'),
@@ -1162,7 +1163,10 @@ const CAM = { streaming: false, hasFrame: false, frames: 0, seq: 0, size: null, 
               hasSnapshot: false, snapshotAt: 0, snapshotSize: null, snapshotBytes: 0, timer: null,
               /* 板端自报「摄像头不可用」时的原文（例如 'no_camera 0x105'）。
                * 有值就说明不是网络问题，而是 esp_camera_init 没成功。 */
-              camError: null, boardAck: null };
+              camError: null, boardAck: null,
+              /* 第 7 周：按需采集的记录。shot 是最近一条，shots 是保留的最近 N 条。
+               * 每次请求都有自己的 shot_id 与 state，绝不拿上一张成功图冒充本次结果。 */
+              shot: null, shots: [], snapshotKeep: 5 };
 
 /* 把固件回执翻成人话。errno 对照见
  * firmware/s3eye_imu_idf/main/cam_stream.c 文件头注释。
@@ -1237,6 +1241,9 @@ async function loadCam() {
     CAM.snapshotBytes = d.snapshotBytes || 0;
     CAM.camError      = d.camError || null;
     CAM.boardAck      = d.boardAck || null;
+    CAM.shot          = d.shot || null;
+    CAM.shots         = Array.isArray(d.shots) ? d.shots : [];
+    CAM.snapshotKeep  = d.snapshotKeep || CAM.snapshotKeep;
     renderCam();
     resolveShotPending();
   } catch (_) { /* 网络抖动忽略 */ }
@@ -1269,6 +1276,104 @@ function resolveShotPending() {
     if (els.camNote) {
       els.camNote.textContent =
         `✅ 已抓到一张：${CAM.snapshotSize || '?'} · ${(CAM.snapshotBytes / 1024).toFixed(1)} KB`;
+    }
+  }
+}
+
+/* 采集状态 → 人话。四态都要能一眼分辨：
+ *   requested / capturing → 采集中（还没结果）
+ *   captured              → 已采集（带时间）
+ *   blocked               → 画面不可用（镜头被挡 / 全黑）
+ *   failed                → 采集失败（命令没送到、板端没回帧、超时）
+ * 注意：captured 只在服务端真的收到本次命令对应的一帧之后才会出现，
+ * 所以「上一张成功的图」不可能被标成本次采集成功。 */
+const CAM_SHOT_STATE_TEXT = {
+  requested: '已下发，等板端开始拍',
+  capturing: '板端正在拍，等画面回传',
+  captured:  '已采集',
+  blocked:   '画面不可用',
+  failed:    '采集失败',
+};
+
+function camShotStateClass(state) {
+  if (state === 'captured') return 'tag tag-ok';
+  if (state === 'blocked' || state === 'failed') return 'tag tag-err';
+  if (state === 'requested' || state === 'capturing') return 'tag tag-warn';
+  return 'tag';
+}
+
+function renderCamShot() {
+  const sh = CAM.shot || null;
+  const state = sh ? sh.state : null;
+
+  if (els.camShotTag) {
+    els.camShotTag.textContent = sh
+      ? (CAM_SHOT_STATE_TEXT[state] || state || '未知状态')
+      : '还没有采集';
+    els.camShotTag.className = camShotStateClass(state);
+  }
+
+  /* 只有 captured 才允许显示图，且 URL 必须带本次 shot_id —— 这样浏览器与服务端
+   * 都不可能把上一张成功的图当成本次结果。 */
+  if (els.camShot) {
+    const viewable = sh && state === 'captured' && sh.shot_id;
+    if (viewable) {
+      const url = '/api/cam/snapshot.jpg?shot_id=' + encodeURIComponent(sh.shot_id);
+      if (els.camShot.getAttribute('src') !== url) els.camShot.setAttribute('src', url);
+      els.camShot.classList.remove('hidden');
+      if (els.camShotPlaceholder) els.camShotPlaceholder.classList.add('hidden');
+      if (els.camShotDownload) { els.camShotDownload.setAttribute('href', url); els.camShotDownload.classList.remove('hidden'); }
+      if (els.camShotInfo) {
+        els.camShotInfo.textContent =
+          `${sh.size || '?'} · ${((sh.bytes || 0) / 1024).toFixed(1)} KB · 采集于 ${fmtTime(sh.captured_at)}`;
+      }
+    } else {
+      els.camShot.classList.add('hidden');
+      if (els.camShot.getAttribute('src')) els.camShot.removeAttribute('src');
+      if (els.camShotPlaceholder) els.camShotPlaceholder.classList.remove('hidden');
+      if (els.camShotDownload) els.camShotDownload.classList.add('hidden');
+      if (els.camShotInfo) els.camShotInfo.textContent = '';
+    }
+  }
+
+  /* 状态行：把「这次为什么没有图」写清楚，不留「已抓拍」这种含糊话 */
+  if (els.camShotState) {
+    if (!sh) {
+      els.camShotState.textContent = '还没有发起过采集。点「抓拍一帧」会立刻在这里显示状态。';
+    } else if (state === 'captured') {
+      els.camShotState.textContent =
+        `本次采集成功：${sh.size || '尺寸未知'} · ${((sh.bytes || 0) / 1024).toFixed(1)} KB，采集于 ${fmtTime(sh.captured_at)}` +
+        (sh.board_seq ? `（板端帧号 ${sh.board_seq}）` : '');
+    } else if (state === 'blocked') {
+      els.camShotState.textContent = `本次没有可用画面：${sh.reason || '画面几乎无细节（全黑/纯色/被遮挡）'}`;
+    } else if (state === 'failed') {
+      els.camShotState.textContent = `本次采集失败：${sh.reason || '板端没有回传画面'}`;
+    } else {
+      els.camShotState.textContent = `正在采集：${CAM_SHOT_STATE_TEXT[state] || state}（请求于 ${fmtTime(sh.requested_at)}）`;
+    }
+  }
+
+  if (els.camShotKeep) els.camShotKeep.textContent = String(CAM.snapshotKeep || 5);
+
+  /* 采集记录列表：最近 N 条，每条都带自己的状态与时间 —— 上一张成功图不会因为
+   * 本次失败而被重画成「本次成功」。 */
+  if (els.camShotList) {
+    const list = CAM.shots || [];
+    if (!list.length) {
+      els.camShotList.innerHTML = '<li class="shot-row shot-row-empty">还没有采集记录</li>';
+    } else {
+      els.camShotList.innerHTML = list.slice().reverse().map((r) => {
+        const st = CAM_SHOT_STATE_TEXT[r.state] || r.state || '未知';
+        const when = r.captured_at ? fmtTime(r.captured_at) : fmtTime(r.requested_at);
+        const size = r.bytes ? ` · ${(r.bytes / 1024).toFixed(1)} KB` : '';
+        const why = r.reason ? ` · ${escHtml(r.reason)}` : '';
+        const trig = r.trigger ? ` · 触发：${escHtml(r.trigger)}` : '';
+        return `<li class="shot-row ${r.state === 'captured' ? 'is-ok' : (r.state === 'blocked' || r.state === 'failed') ? 'is-bad' : 'is-busy'}">` +
+          `<span class="shot-when">${escHtml(when)}</span>` +
+          `<span class="shot-st">${escHtml(st)}</span>` +
+          `<span class="shot-meta">${escHtml((r.size || '—') + size + trig)}${why}</span>` +
+          `</li>`;
+      }).join('');
     }
   }
 }
@@ -1312,27 +1417,8 @@ function renderCam() {
   if (els.btnCamStart) els.btnCamStart.disabled = CAM.streaming || broken;
   if (els.btnCamStop)  els.btnCamStop.disabled  = !CAM.streaming;
 
-  // 抓拍快照：与直播流分开展示（带时间戳参数，避免浏览器缓存旧图）
-  if (els.camShot) {
-    if (CAM.hasSnapshot) {
-      const url = '/api/cam/snapshot.jpg?t=' + CAM.snapshotAt;
-      if (els.camShot.getAttribute('src') !== url) els.camShot.setAttribute('src', url);
-      els.camShot.classList.remove('hidden');
-      if (els.camShotPlaceholder) els.camShotPlaceholder.classList.add('hidden');
-      if (els.camShotTag) { els.camShotTag.textContent = CAM.snapshotSize || '已抓拍'; els.camShotTag.className = 'tag tag-ok'; }
-      if (els.camShotDownload) { els.camShotDownload.setAttribute('href', url); els.camShotDownload.classList.remove('hidden'); }
-      if (els.camShotInfo) {
-        els.camShotInfo.textContent =
-          `${CAM.snapshotSize || '?'} · ${(CAM.snapshotBytes / 1024).toFixed(1)} KB · ${fmtTime(CAM.snapshotAt)}`;
-      }
-    } else {
-      els.camShot.classList.add('hidden');
-      if (els.camShotPlaceholder) els.camShotPlaceholder.classList.remove('hidden');
-      if (els.camShotTag) { els.camShotTag.textContent = '还没有抓拍'; els.camShotTag.className = 'tag'; }
-      if (els.camShotDownload) els.camShotDownload.classList.add('hidden');
-      if (els.camShotInfo) els.camShotInfo.textContent = '';
-    }
-  }
+  // 按需采集：每次请求一条独立记录，状态与采集时间都直说
+  renderCamShot();
 
   if (els.camStats) {
     const rows = [
@@ -1351,40 +1437,50 @@ function renderCam() {
 if (els.btnCamStart) els.btnCamStart.onclick = () => camControl('start');
 if (els.btnCamStop)  els.btnCamStop.onclick  = () => camControl('stop');
 if (els.btnCamRetry) els.btnCamRetry.onclick = () => camControl('retry');
+/* 抓拍一帧：服务端会立刻返回一条采集记录（requested 或 capturing），
+ * 之后状态由 GET /api/cam 推进。这里只负责「发起 + 等结果 + 如实显示」，
+ * 绝不在没收到本次帧的情况下显示成功。 */
 if (els.btnCamShot) els.btnCamShot.onclick = async () => {
   if (camShotPending) return;                 // 防重复点击
-  camShotBaseline = CAM.snapshotAt || 0;
-  camShotPending  = true;
-  if (els.camNote) {
-    els.camNote.textContent = '抓拍中…板端会临时切到所选分辨率，拍完自动切回直播分辨率。';
-  }
+  camShotPending = true;
+  if (els.camNote) els.camNote.textContent = '抓拍中…板端会临时切到高分辨率，拍完自动切回直播分辨率。';
   try {
     const d = await (await fetch('/api/cam', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'shot',
-        framesize: CAM_SHOT_FRAMESIZE,
-      }),
+      body: JSON.stringify({ action: 'shot', framesize: CAM_SHOT_FRAMESIZE, trigger: 'ui' }),
     })).json();
+    /* 409 = 上一次采集还没出结果（单飞），这不是失败，要如实说明而不是催用户重试 */
     if (!d.ok) {
       camShotPending = false;
-      if (els.camNote) els.camNote.textContent = '⚠ ' + (d.note || '命令通道不可用，抓拍未送达板端。');
+      const busy = d.error === 'shot_in_progress';
+      if (els.camNote) {
+        els.camNote.textContent = busy
+          ? '上一次采集还没出结果，等它完成或失败再点。'
+          : '⚠ ' + (d.note || d.error || '命令通道不可用，抓拍未送达板端。');
+      }
+      if (d.shot) { CAM.shot = d.shot; renderCamShot(); }
+      await loadCam();
       return;
     }
+    CAM.shot = d.shot || CAM.shot;
+    renderCamShot();
     if (els.camNote) els.camNote.textContent = '已下发抓拍命令，等板端回传…';
-    // 高分辨率帧（VGA 约 13KB、UXGA 更大）经链路回传需要时间，轮询等它
-    camShotTimer = setTimeout(() => {
-      if (!camShotPending) return;
-      camShotPending = false;
-      if (els.camNote) {
-        els.camNote.textContent = '⚠ 超时：板端未回传新帧。请确认命令通道可用、板子在线。';
-      }
-    }, 15000);
-    // 主动多查几次，比等 3 秒定时器更及时
-    for (let i = 0; i < 8 && camShotPending; i++) {
+    /* 轮询到终止态为止：captured / blocked / failed 都算结束。
+     * 超时上限比服务端的采集窗口长一点，保证服务端先给出 failed 原因。 */
+    for (let i = 0; i < 14 && camShotPending; i++) {
       await new Promise((r) => setTimeout(r, 1200));
       await loadCam();
+      const st = CAM.shot && CAM.shot.state;
+      if (st === 'captured' || st === 'blocked' || st === 'failed') break;
+    }
+    camShotPending = false;
+    const st = CAM.shot && CAM.shot.state;
+    if (els.camNote) {
+      if (st === 'captured') els.camNote.textContent = '✅ 已采集到本次画面。';
+      else if (st === 'blocked') els.camNote.textContent = '⚠ 本次没有可用画面：' + ((CAM.shot && CAM.shot.reason) || '画面不可用');
+      else if (st === 'failed') els.camNote.textContent = '⚠ 本次采集失败：' + ((CAM.shot && CAM.shot.reason) || '板端未回传');
+      else els.camNote.textContent = '⚠ 还在等板端回传，稍后可在下方记录里看最终状态。';
     }
   } catch (e) {
     camShotPending = false;

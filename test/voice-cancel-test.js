@@ -155,8 +155,14 @@ const jpost = (port, p, o) => httpReq(port, 'POST', p, o);
   console.log('\n— ① 澄清上下文：第二句只回「第一个」也能接上 —');
   const amb1 = await jpost(port, '/api/nl', { text: '数据', session_id: 'sess-A' });
   ok(amb1.status === 200 && amb1.json.intent === 'ambiguous', '模糊指令判 ambiguous');
-  ok(Array.isArray(amb1.json.clarify && amb1.json.clarify.options)
-    && amb1.json.clarify.options.length === 2, '回复里给出两个候选任务', JSON.stringify((amb1.json.clarify || {}).options));
+  /* 候选来自 NL_TASKS 注册表，任务会随周次增加（第 7 周加了 snapshot）。
+   * 断言锁「至少两个、且含原有的两个」，不锁总数 —— 锁死 2 个会让新增任务变成假失败。 */
+  const opts1 = (amb1.json.clarify && amb1.json.clarify.options) || [];
+  const optIntents = opts1.map((o) => o.intent);
+  ok(Array.isArray(opts1) && opts1.length >= 2
+    && optIntents.includes('query_last') && optIntents.includes('collect_once'),
+    '回复里给出候选任务（至少含查上次数据 / 重新采集一次）', JSON.stringify(opts1));
+  ok(opts1.every((o, i) => Number(o.idx) === i + 1), '候选编号从 1 连续，用户能说「第一个」', JSON.stringify(optIntents));
   ok(((amb1.json.clarify || {}).ttl_ms > 0), '候选带有效期（有限多轮，不会一直追问）', String((amb1.json.clarify || {}).ttl_ms));
 
   const pick1 = await jpost(port, '/api/nl', { text: '第一个', session_id: 'sess-A' });

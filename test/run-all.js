@@ -77,6 +77,8 @@ const SUITES = [
   { name: 'voice-asr',    file: 'voice-asr-test.js',    kind: 'integration' },
   { name: 'voice-asr-fb', file: 'voice-asr-fallback-test.js', kind: 'integration' },
   { name: 'voice-cancel', file: 'voice-cancel-test.js', kind: 'integration' },
+  { name: 'snapshot-store', file: 'snapshot-store-test.js', kind: 'unit' },
+  { name: 'snapshot',     file: 'snapshot-test.js',     kind: 'integration' },
   { name: 'diag-hygiene', file: 'diag-hygiene-test.js', kind: 'integration' },
   { name: 'command-ack',  file: 'command-ack-test.js', kind: 'integration' },
   { name: 'e2e',          file: 'e2e-test.js',         kind: 'e2e', needsServer: false },

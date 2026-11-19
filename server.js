@@ -20,6 +20,9 @@ const { SerialPort } = require('serialport');
 const { createVoiceRx } = require('./lib/voice-serial-rx.js');
 const { createLocalAsr } = require('./lib/voice-local-asr.js');
 const { createVoskAsr } = require('./lib/voice-vosk-asr.js');
+/* 第 7 周：按需采集的采集记录与状态机。放在 lib/ 里是因为它只有状态与字节，
+ * 不碰 HTTP 也不碰串口，能单独做单元测试（见 test/snapshot-store-test.js）。 */
+const { createSnapshotStore, assessFrame } = require('./lib/snapshot-store.js');
 /* 本机离线识别有两条实现，都不联网、不上传，录音不出这台电脑：
  *   1) Vosk small-cn（首选）：Kaldi 系 DNN 模型，对远场/带噪的板载录音明显更稳
  *      实测同一段录音 Vosk 听出「喂喂喂听得到吗…」，Windows 自带只能扒出碎片。
@@ -953,6 +956,31 @@ function helpLog(ev, detail) {
   appendHelpEvent(entry);
 }
 
+/* 求助触发的采集限频：连按求助键不该刷出一串图，也不该把保留额度冲光。 */
+const HELP_SNAPSHOT_MIN_MS = Math.max(0, Number(process.env.HELP_SNAPSHOT_MIN_MS || config.helpSnapshotMinMs) || 60000);
+let lastHelpSnapshotAt = 0;
+
+/* 由求助事件触发一次环境采集。
+ * 这里刻意「不等待结果」：求助事件的响应不能被拍图拖慢（拍图要等板端回帧，
+ * 最长 SNAPSHOT_WINDOW_MS）。拍没拍到由采集记录自己演进，页面查 /api/cam/shots 即可。 */
+function triggerHelpSnapshot() {
+  if (!HELP_SNAPSHOT_MIN_MS) return;
+  const now = Date.now();
+  if (now - lastHelpSnapshotAt < HELP_SNAPSHOT_MIN_MS) return;
+  const began = snapshots.begin({ trigger: 'help', requestId: null });
+  if (!began.ok) return;            // 已有在途采集，跳过（不排队，避免求助风暴积压）
+  lastHelpSnapshotAt = now;
+  const rid = newRequestId();
+  began.record.request_id = rid;
+  cam.shotByRequest.set(rid, began.record.shot_id);
+  const sent = sendCommandEx({ cmd: 'cam_shot', request_id: rid }, state.deviceId || null);
+  if (!sent.ok) {
+    snapshots.fail(began.record.shot_id, '求助触发的采集命令未送达板端（通道不可用）');
+    return;
+  }
+  console.log(`[snapshot] 求助触发采集 ${began.record.shot_id}`);
+}
+
 /** 板端上报的求助事件（request / cancel）—— 这是「远端接收」的唯一证据来源 */
 function onHelpEvent(obj) {
   const ev = obj.event === 'cancel' ? 'cancel' : 'request';
@@ -970,6 +998,10 @@ function onHelpEvent(obj) {
     help.note = '已收到板端求助 —— 这是「远端接收」的证据。等待查看者回应。';
     helpLog('received', obj.help_id);
     console.log(`[help] 收到求助 ${obj.help_id} ← ${help.device_id}`);
+    /* 第 7 周：教学事件也可以触发一次环境采集 —— 有人按键求助时，
+     * 看一眼现场画面对「远端接收」是有价值的证据。
+     * 限频 60 秒：连按求助键不该刷出一串图，也不该把保留额度冲光。 */
+    triggerHelpSnapshot();
   } else {
     help.active = false;
     help.status = 'cancelled';
@@ -2377,6 +2409,14 @@ const NL_TASKS = {
     hint: '让设备立刻采一帧新的，并等待新结果',
     run: () => nlRunCollectOnce(),
   },
+  /* 第 7 周：按需获取一张环境图像（画面，不是 IMU 数值） */
+  snapshot: {
+    promptDesc: '要求看一张画面/拍张照片/看看现在什么样（"看一眼""拍一张""拍个照""看看周围"）',
+    apiDesc: '让设备按需拍一张环境图像，等待真实采集证据（成功/画面不可用/失败）',
+    short: '拍一张看看',
+    hint: '让摄像头拍一张当前画面，并如实说明是否拍到',
+    run: () => nlRunSnapshot(),
+  },
 };
 
 /* 元意图：不执行任务，只做澄清 / 拒绝 / 如实说明 */
@@ -2692,6 +2732,10 @@ function parseIntentByRule(text) {
   }
   // 危险/越界动作
   if (/(删除|清空|删掉|修改|打电话|发短信|报警|拨号|呼叫)/.test(t)) return { intent: 'out_of_scope', device: dev, reason: '规则：含越界/危险动作' };
+  // 按需图像（第 7 周）：画面类动作优先于数值采集，避免「拍一张」被当成 collect_once
+  if (/(看一眼|看下|看看(现在|周围|环境|什么样)|拍一张|拍一张|拍个照|拍照|图像|画面|照片)/.test(t)) {
+    return { intent: 'snapshot', device: dev, reason: '规则：画面类动作' };
+  }
   // 发起采集（动作词优先于查询词）
   if (/(重新|再|重采|新采)/.test(t) && /采/.test(t)) return { intent: 'collect_once', device: dev, reason: '规则：重新+采集' };
   if (/(采一帧|采集一次|采一次|发起采集|立即采集|马上采集|现在采|开始采集)/.test(t)) return { intent: 'collect_once', device: dev, reason: '规则：发起采集' };
@@ -2700,6 +2744,54 @@ function parseIntentByRule(text) {
   // 含糊
   if (/(数据|采集)/.test(t)) return { intent: 'ambiguous', device: dev, reason: '规则：只提到数据/采集，无法判断' };
   return { intent: 'other', device: null, reason: '规则：未识别' };
+}
+
+/* ---- 受限工具 3：snapshot —— 按需获取一张环境图像 ----
+ * 与 collect_once 的区别：那个取的是 IMU 数值，这个取的是画面。
+ * 同样不许「发个命令就算成功」：必须等采集记录走到 captured 才算拍到，
+ * 失败/画面不可用都如实回报原因。 */
+function nlRunSnapshot() {
+  return new Promise((resolve) => {
+    const began = snapshots.begin({ trigger: 'voice', requestId: null });
+    if (!began.ok) {
+      return resolve({
+        reply: '上一次采集还没出结果，等它完成（或失败）再让我看。',
+        shot_id: (began.current && began.current.shot_id) || null,
+        evidence: { status: 'busy', current: began.current || null },
+      });
+    }
+    const rec = began.record;
+    const rid = newRequestId();
+    rec.request_id = rid;
+    cam.shotByRequest.set(rid, rec.shot_id);
+    sendCommandEx({ cmd: 'cam_shot', request_id: rid }, state.deviceId || null);
+
+    const deadline = Date.now() + SNAPSHOT_WINDOW_MS + 3000;
+    const iv = setInterval(() => {
+      const cur = snapshots.get(rec.shot_id);
+      const finished = !cur || ['captured', 'blocked', 'failed'].includes(cur.state);
+      const timedOut = Date.now() > deadline;
+      if (!finished && !timedOut) return;
+      clearInterval(iv);
+      if (!finished) {
+        snapshots.fail(rec.shot_id, `板端在 ${Math.round(SNAPSHOT_WINDOW_MS / 1000)} 秒内没有回传抓拍帧`);
+      }
+      const fin = snapshots.get(rec.shot_id) || cur;
+      if (fin && fin.state === 'captured') {
+        return resolve({
+          reply: `已拍到一张画面（${fin.size || '尺寸未知'}，${(fin.bytes / 1024).toFixed(1)} KB），采集于 ${new Date(fin.captured_at).toISOString()}。`,
+          /* shot_id 放在顶层：页面拿它取图，失败时也需要它来查原因。 */
+          shot_id: fin.shot_id,
+          evidence: { status: 'captured', shot_id: fin.shot_id, captured_at: fin.captured_at, bytes: fin.bytes, size: fin.size, board_seq: fin.board_seq },
+        });
+      }
+      return resolve({
+        reply: `这次没拍到可用的画面：${(fin && fin.reason) || '未知原因'}。`,
+        shot_id: rec.shot_id,
+        evidence: { status: (fin && fin.state) || 'failed', shot_id: rec.shot_id, reason: (fin && fin.reason) || null },
+      });
+    }, 150);
+  });
 }
 
 /* ---- 设备范围校验（工具执行前的统一闸门） ---- */
@@ -2980,9 +3072,33 @@ const cam = {
    * 用户只能看黑屏干等。现在把板端回的 ack 记下来并原样透出。 */
   lastAck: null,     // { status, at, request_id }
   error: null,       // 例如 'no_camera 0x105'；板端确认可用后清空
+  /* 第 7 周：当前在途/最近的采集记录由 snapshotStore 持有，这里只留映射关系。
+   * shotByRequest：采集命令的 request_id → shot_id。板端回执里带 request_id，
+   * 据此才知道「这条 ack 属于哪一次采集」，而不是拿「有没有 ack」当成功。 */
+  shotByRequest: new Map(),
 };
 
-/* 记录摄像头类回执。只有摄像头相关的 status 才进这里，
+/* 第 7 周的采集记录仓库。
+ * 为什么不再用「snapshotAt 变没变」判断成功：2026-11-19 实测，抓拍失败后
+ * /api/cam/snapshot.jpg 仍返回 200 + 旧图，页面据此显示「已抓拍」——
+ * 上次的成功图像被当成了本次成功。现在每次采集有独立 shot_id，
+ * 状态只能沿 requested → capturing → captured 前进，终止态不可逆。 */
+const SNAPSHOT_DIR = path.join(DATA_DIR, 'snapshots');
+const SNAPSHOT_KEEP = Math.max(1, Number(process.env.SNAPSHOT_KEEP || config.snapshotKeep) || 5);
+const SNAPSHOT_WINDOW_MS = Math.max(1000, Number(process.env.SNAPSHOT_WINDOW_MS || config.snapshotWindowMs) || 15000);
+const snapshots = createSnapshotStore({
+  dir: SNAPSHOT_DIR,
+  keep: SNAPSHOT_KEEP,
+  windowMs: SNAPSHOT_WINDOW_MS,
+});
+
+/** 最近一次采集记录（含状态与原因）。前端据此判成败，不看 hasSnapshot。 */
+function recentShot() {
+  const list = snapshots.list();
+  return list.length ? list[list.length - 1] : null;
+}
+
+/** 记录摄像头类回执。只有摄像头相关的 status 才进这里，
  * 避免把采集/语音的 ack 混进摄像头状态。 */
 function noteCamAck(status, requestId) {
   if (!status || typeof status !== 'string') return;
@@ -2991,6 +3107,18 @@ function noteCamAck(status, requestId) {
     /^QVGA|^CIF|^VGA|^SVGA|^XGA|^HD|^SXGA|^UXGA/i.test(s);   // cam_set 成功时回的是分辨率名
   if (!isCam) return;
   cam.lastAck = { status: s, at: Date.now(), request_id: requestId || null };
+  /* 第 7 周：把回执关联到具体那次采集。
+   * 板端回 'shot' 只表示「命令收到了」，所以这里只推进到 capturing，
+   * 真正的 captured 必须等收到帧并且通过序号/时间窗/画面可用性检查。 */
+  if (requestId && cam.shotByRequest.has(requestId)) {
+    const sid = cam.shotByRequest.get(requestId);
+    cam.shotByRequest.delete(requestId);
+    if (/^shot\b/i.test(s)) {
+      snapshots.markCapturing(sid, { boardAck: s });
+    } else if (/^no_camera/i.test(s)) {
+      snapshots.fail(sid, `板端报告摄像头不可用（${s}）：esp_camera_init 未成功，检查排线 / PSRAM / SCCB 与 IMU 共用总线`);
+    }
+  }
   if (/^no_camera/i.test(s)) {
     cam.error = s;                 // 保留 errno 原文，供页面显示
     state.camStreaming = false;    // 板端没有摄像头，就不可能正在直播
@@ -3037,12 +3165,35 @@ function onCameraFrame(obj) {
   cam.bytes     = buf.length;
   cam.frames++;
 
-  // 手动抓拍：单独存一份快照，页面上与直播流分开展示（可下载）
+  // 手动抓拍：交给采集记录仓库判定归属与有效性，不再无条件覆盖「当前快照」
   if (obj.shot === 1 || obj.shot === true) {
-    cam.snapshot      = buf;
-    cam.snapshotAt    = Date.now();
-    cam.snapshotSize  = cam.size;
-    cam.snapshotBytes = buf.length;
+    const cur = snapshots.inFlight();
+    if (cur) {
+      /* ★ 这里的三道关卡就是本周第一条当堂验证的落点：
+       *   ① 状态必须是 capturing（板端已回执），否则这帧不知属于谁；
+       *   ② 序号必须比上次抓拍帧更大（否则就是上一张）；
+       *   ③ 必须在命令发出后的时间窗内。
+       * 任一不满足 → 记录保持原状并写明原因，绝不把上次的图当本次成功。 */
+      const r = snapshots.complete(cur.shot_id, {
+        jpeg: buf,
+        size: cam.size,
+        boardSeq: typeof obj.seq === 'number' ? obj.seq : null,
+        boardTs: typeof obj.ts === 'number' ? obj.ts : null,
+      });
+      if (r.ok) {
+        cam.lastShotId = cur.shot_id;
+        cam.snapshot      = buf;
+        cam.snapshotAt    = r.record.captured_at;
+        cam.snapshotSize  = r.record.size || cam.size;
+        cam.snapshotBytes = buf.length;
+        console.log(`[snapshot] 采集成功 ${cur.shot_id} ${buf.length} 字节 seq=${r.record.board_seq}`);
+      } else {
+        console.warn(`[snapshot] 采集未成功 ${cur.shot_id}：${r.error} ${r.reason || ''}`);
+      }
+    } else {
+      // 没有在途采集却来了抓拍帧：可能是超时之后才到，只记日志不改任何状态
+      console.warn(`[snapshot] 收到抓拍帧但没有在途采集（seq=${obj.seq}），按迟到帧丢弃`);
+    }
   }
 
   // 推给所有正在观看的浏览器（直播流不含快照帧，避免抓拍瞬间画面尺寸突变）
@@ -3970,25 +4121,70 @@ async function handleRequest(req, res) {
        * 显示原因 + 「重试初始化摄像头」按钮，而不是让用户对着黑屏等。 */
       camError: cam.error || null,
       boardAck: cam.lastAck || null,
-      // 手动抓拍快照
+      // 手动抓拍快照（兼容旧字段；判定成功请用 shot.state，不要看 hasSnapshot）
       hasSnapshot: cam.snapshot != null,
       snapshotAt: cam.snapshotAt || null,
       snapshotSize: cam.snapshotSize || null,
       snapshotBytes: cam.snapshotBytes || 0,
+      /* ★ 第 7 周：最近一次采集记录。前端必须看 shot.state 判成败，
+       * 不能再用 hasSnapshot —— 上一次的图还在，不代表这一次成功。 */
+      shot: recentShot(),
+      shots: snapshots.list(),
+      snapshotKeep: SNAPSHOT_KEEP,
     });
   }
 
-  // 手动抓拍的那一张（与直播流分开）
+  /* 手动抓拍的那一张（与直播流分开）。
+   * ★ 2026-11-19 第 7 周：必须带 shot_id。
+   *   原来无条件返回「当前快照」—— 抓拍失败时它仍是上一张成功的图，
+   *   页面据此显示「已抓拍」，正是课程禁止的「上次图像被标为本次成功」。
+   *   现在：缺 shot_id → 400；不存在 → 404；该次未成功 → 409。 */
   if (p === '/api/cam/snapshot.jpg') {
-    if (!cam.snapshot) return json(res, 404, { error: '还没有抓拍过' });
-    const fn = `snapshot-${new Date(cam.snapshotAt).toISOString().replace(/[:.]/g, '-')}.jpg`;
+    const shotId = (url.searchParams.get('shot_id') || '').trim();
+    if (!shotId) {
+      return json(res, 400, {
+        error: 'shot_id_required',
+        message: '取图必须带 ?shot_id=（每次采集都有自己的 id，避免把上一张当成这一次）',
+        latest: recentShot(),
+      });
+    }
+    const rec = snapshots.get(shotId);
+    if (!rec) return json(res, 404, { error: 'shot_not_found', shot_id: shotId });
+    if (rec.state !== 'captured') {
+      return json(res, 409, {
+        error: 'shot_not_captured',
+        shot_id: shotId,
+        state: rec.state,
+        reason: rec.reason || null,
+        message: '这次采集没有成功，没有图像可取（不会拿上一次的图充数）',
+      });
+    }
+    const file = snapshots.fileFor(shotId);
+    if (!fs.existsSync(file)) {
+      return json(res, 404, { error: 'shot_file_missing', shot_id: shotId });
+    }
+    const buf = fs.readFileSync(file);
+    const fn = `snapshot-${shotId}.jpg`;
     res.writeHead(200, {
       'Content-Type': 'image/jpeg',
-      'Content-Length': cam.snapshot.length,
+      'Content-Length': buf.length,
       'Cache-Control': 'no-store',
+      'X-Shot-Id': shotId,
+      'X-Captured-At': String(rec.captured_at || ''),
       'Content-Disposition': `inline; filename="${fn}"`,
     });
-    return res.end(cam.snapshot);
+    return res.end(buf);
+  }
+
+  // 采集记录列表（含状态与原因，供页面展示与排查）
+  if (p === '/api/cam/shots' && req.method === 'GET') {
+    return json(res, 200, {
+      ok: true,
+      keep: SNAPSHOT_KEEP,
+      window_ms: SNAPSHOT_WINDOW_MS,
+      inflight: snapshots.inFlight(),
+      shots: snapshots.list(),
+    });
   }
 
   if (p === '/api/cam' && req.method === 'POST') {
@@ -4014,11 +4210,60 @@ async function handleRequest(req, res) {
      * 置 true。实测板端同时回 status:"no_camera"（摄像头初始化失败），
      * 网页却显示「正在直播」，用户只能看黑屏等到超时。
      * 现在等板端回执，把真实结局透出去。 */
+    /* ★ 第 7 周：shot 不是「发个命令就算成功」。
+     * 先在采集记录仓库里登记一次采集（拿到 shot_id 与 requested_at），
+     * 再下发命令；成功与否由后续到达的帧决定（captured / blocked / failed）。
+     * 单飞：已有在途采集时直接 409，避免两次采集的帧互相冒充。 */
+    let shotRec = null;
+    if (action === 'shot') {
+      const began = snapshots.begin({
+        trigger: ['ui', 'voice', 'help'].includes(body.trigger) ? body.trigger : 'ui',
+        requestId: null,     // 命令 id 在下面生成后回填
+      });
+      if (!began.ok) {
+        return json(res, 409, {
+          ok: false,
+          error: began.error,
+          message: '上一次采集还没结束，请等它出结果（成功/失败/画面不可用）后再抓拍',
+          current: began.current,
+        });
+      }
+      shotRec = began.record;
+    }
+
     cmdObj.request_id = newRequestId();
+    if (shotRec) {
+      shotRec.request_id = cmdObj.request_id;
+      cam.shotByRequest.set(cmdObj.request_id, shotRec.shot_id);
+    }
     const r = await sendCommandAndWaitAck(cmdObj, state.deviceId || null);
     const ackStatus = r.ack_status || null;
     const boardRejected = !!ackStatus && /^no_camera/i.test(ackStatus);
-    const ok = !!r.dispatched && !!r.accepted && !boardRejected;
+    /* 模拟模式下没有真实通道，dispatched 必然为 false；但采集命令确实被「受理」了，
+     * 否则保留策略、多轮采集在模拟环境里完全跑不动（实测：每次都被当成失败，
+     * 一个文件也留不下）。这里只把 ok 理解为「命令被受理」，是否真拍到仍然看
+     * shot.state —— 模拟下它停在 capturing，绝不谎报 captured。 */
+    const ok = r.simulated && action === 'shot'
+      ? true
+      : (!!r.dispatched && !!r.accepted && !boardRejected);
+
+    /* 命令层面就没走通（通道不可用 / 板端明确拒绝）时，采集记录也要如实失败，
+     * 否则它会一直挂在 requested 上，把后续抓拍全挡住（单飞）。
+     * ★ 模拟模式例外：那时根本没有真实通道，帧是由外部（测试/回放）注入的，
+     *   所以推进到 capturing 等帧，并在记录里如实标 simulated=true ——
+     *   不能因为「模拟」就假装已经拍到了（captured 仍必须由真实帧触发）。 */
+    if (shotRec) {
+      if (r.simulated) {
+        snapshots.markCapturing(shotRec.shot_id, { boardAck: 'mock' });
+        const cur = snapshots.get(shotRec.shot_id);
+        if (cur) cur.simulated = true;
+      } else if (!ok && !/^shot\b/i.test(ackStatus || '')) {
+        snapshots.fail(shotRec.shot_id, r.message || (boardRejected
+          ? `板端报告摄像头不可用（${ackStatus}）`
+          : '抓拍命令未送达板端（通道不可用）'));
+      }
+      shotRec = snapshots.get(shotRec.shot_id) || shotRec;
+    }
 
     // streaming 只反映「板端确认可用且已开启」，不再由服务端自己假设
     if (action === 'start') state.camStreaming = ok;
@@ -4037,6 +4282,9 @@ async function handleRequest(req, res) {
       channel: r.channel || null,
       waited_ms: r.waited_ms != null ? r.waited_ms : null,
       camError: cam.error || null,
+      /* ★ 本次采集的身份与状态。注意 ok 只代表「命令走通了」，
+       * 是否真拍到要看 shot.state 变成 captured。 */
+      shot: shotRec ? snapshots.get(shotRec.shot_id) || shotRec : recentShot(),
       note: ok ? null
         : boardRejected ? `板端报告摄像头不可用（${ackStatus}）：esp_camera_init 未成功，检查排线 / PSRAM / SCCB 与 IMU 共用总线后点「重试初始化摄像头」`
         : (r.message || (config.mockDevice ? '模拟模式：未走真实通道'
