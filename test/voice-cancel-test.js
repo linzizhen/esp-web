@@ -137,7 +137,13 @@ const jpost = (port, p, o) => httpReq(port, 'POST', p, o);
   ok(/VOICE_STOP_WORDS|STOP_WORDS/.test(appSrc), '前端有停止口令词表');
   ok(/voiceNewRequestId|newVoiceRequestId/.test(appSrc), '前端能生成链路 request_id');
   ok(/id="btnVoiceStop"/.test(htmlSrc), '页面有文字「停止」按钮');
-  ok(Number((/app\.js\?v=(\d+)/.exec(htmlSrc) || [])[1]) >= 46, 'app.js 版本号已推进');
+  ok(/id="btnVoiceIdle"/.test(htmlSrc), '页面有「回到待机」按钮（取消之后能重新开始）');
+  ok(/function voiceToIdle/.test(appSrc), '前端有 voiceToIdle()');
+  ok(/VOICE\.cancelled = false/.test(appSrc), '回到待机清掉取消标记（否则重来一次被「已经停过了」挡住）');
+  ok(/VOICE\.rid = null/.test(appSrc), '回到待机清掉旧 request_id（旧链路回来的东西一律判过期）');
+  ok(/btnVoiceIdle:\s*\$\('btnVoiceIdle'\)/.test(appSrc), '回到待机按钮已注册到 els');
+  ok(/els\.btnVoiceIdle\.onclick/.test(appSrc), '回到待机按钮已接线');
+  ok(Number((/app\.js\?v=(\d+)/.exec(htmlSrc) || [])[1]) >= 47, 'app.js 版本号已推进到 47');
 
   /* ---------- 启动隔离实例 ---------- */
   const port = await pickPort();
@@ -243,6 +249,29 @@ const jpost = (port, p, o) => httpReq(port, 'POST', p, o);
   const backOld = await jpost(port, '/api/voice/state', { stage: 'spoken', request_id: ridCancel });
   ok(backOld.status === 200 && backOld.json.ignored === true,
     '旧链路仍推不进来（它已取消）', JSON.stringify(backOld.json.reason));
+
+  /* ③d 连续两次查询：课程明确要测的场景。
+   * 关键窗口是「第二句还在跑、第一句的结果刚回来」—— 这时第一句绝不能写进去，
+   * 否则页面会把第一次的答案当成第二次的结论播出来。 */
+  console.log('\n— ③d 连续两次查询：第一句的迟到结果不能顶掉第二句 —');
+  await jpost(port, '/api/voice/state', { stage: 'cancelled', request_id: ridNext, reason: '收尾上一个用例' });
+  const qA = 'vr-20260101-000006-0006';
+  const qB = 'vr-20260101-000007-0007';
+  const recA = await jpost(port, '/api/nl', { text: '查看上次数据', request_id: qA, session_id: 'sess-Q' });
+  ok(recA.status === 200 && recA.json.intent === 'query_last', '第一句查询走通', recA.json.intent);
+  await jpost(port, '/api/voice/state', { stage: 'recorded', request_id: qA, audio_id: 'voice-20260101-000003-003-0003' });
+  await jpost(port, '/api/voice/state', { stage: 'task_done', request_id: qA, intent: 'query_last', reply: '第一次的回复' });
+  const recB = await jpost(port, '/api/nl', { text: '重新采集一次', request_id: qB, session_id: 'sess-Q' });
+  ok(recB.status === 200 && recB.json.intent === 'collect_once', '第二句查询走通（不用等第一句结束）', recB.json.intent);
+  await jpost(port, '/api/voice/state', { stage: 'recorded', request_id: qB, audio_id: 'voice-20260101-000004-004-0004' });
+  await jpost(port, '/api/voice/state', { stage: 'task_running', request_id: qB });
+  const lateFirst = await jpost(port, '/api/voice/state', { stage: 'task_done', request_id: qA, intent: 'query_last', reply: '第一次的回复' });
+  ok(lateFirst.status === 200 && lateFirst.json.ignored === true,
+    '第二句在跑时，第一句的迟到结果被拒（不顶掉新任务）', String(lateFirst.json.reason));
+  await jpost(port, '/api/voice/state', { stage: 'task_done', request_id: qB, intent: 'collect_once', reply: '第二次的回复' });
+  const svTwo = await jget(port, '/api/voice/state');
+  ok(svTwo.json.request_id === qB && svTwo.json.reply === '第二次的回复',
+    '状态保留第二句的结果', String(svTwo.json.request_id) + ' / ' + String(svTwo.json.reply));
 
   /* ---------- ④ 时序落盘与查询 ---------- */
   console.log('\n— ④ 时序：到站 → 首次反馈 → 任务完成 —');

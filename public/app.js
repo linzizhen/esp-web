@@ -75,6 +75,7 @@ const els = {
   btnVoiceUseText: $('btnVoiceUseText'), voiceSegments: $('voiceSegments'),
   voiceDurText: $('voiceDurText'), voiceBytesText: $('voiceBytesText'), voiceSrcText: $('voiceSrcText'),
   btnVoiceRetry: $('btnVoiceRetry'), btnVoiceSpeak: $('btnVoiceSpeak'), btnVoiceStop: $('btnVoiceStop'),
+  btnVoiceIdle: $('btnVoiceIdle'),
   voiceDownload: $('voiceDownload'), voicePlayer: $('voicePlayer'), voiceNote: $('voiceNote'),
   voiceTextTag: $('voiceTextTag'), voiceTextForm: $('voiceTextForm'),
   voiceTextInput: $('voiceTextInput'), voiceTextSend: $('voiceTextSend'),
@@ -2286,6 +2287,24 @@ async function voiceCancel(reasonText) {
   await voicePostState({ stage: 'cancelled', reason: why, audio_id: VOICE.lastAudioId || null, request_id: rid });
 }
 
+/** 回到待机（第 6 周）：把「已停止 / 失败」的页面痕迹清干净，让用户能立刻再试一次。
+ * 只改前端状态 —— 服务端那条 cancelled 是真发生过的事实，不回头改写它。
+ * 清 rid 是必要的：旧链路之后回来的任何东西都会被 voiceStale() 判成过期。 */
+function voiceToIdle() {
+  VOICE.cancelled = false;
+  VOICE.cancelReason = null;
+  VOICE.rid = null;
+  VOICE.t0 = 0;
+  VOICE.firstFeedbackMs = null;
+  VOICE.busy = false;
+  VOICE.asrObj = null;
+  voiceSegReset();
+  renderVoiceSegments();
+  renderVoiceFailure(null);
+  voiceNote('已回到待机。长按 PLAY 键 2 秒开始录音，或用下方文字入口。');
+  renderVoiceHero();
+}
+
 /* 录音设备判定（纯函数，只依赖入参 —— 便于静态契约测试直接求值验证）。
  *
  * 为什么需要它：Web Speech API 在「没有麦克风」和「权限被拒」两种情况下报的都是
@@ -2857,6 +2876,12 @@ if (els.btnVoiceStop) {
     }
     voiceCancel('点了页面上的停止');
   };
+}
+
+/* 回到待机（第 6 周）：取消是终点，但页面不能一直停在「已停止」——
+ * 用户还要能马上重来一次。这个动作不动服务端阶段。 */
+if (els.btnVoiceIdle) {
+  els.btnVoiceIdle.onclick = () => voiceToIdle();
 }
 if (els.btnVoiceRetry) {
   els.btnVoiceRetry.onclick = () => {

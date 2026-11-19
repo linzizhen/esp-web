@@ -587,7 +587,8 @@
           </div>
 
           <div class="collect-actions">
-            <button id="btnVoiceStop" class="btn btn-warn" type="button" title="立刻停止本页正在进行的识别/任务/播报">停止</button>
+            <button id="btnVoiceStop" class="btn btn-danger" type="button" title="立刻停止本页正在进行的识别/任务/播报">停止</button>
+          <button id="btnVoiceIdle" class="btn btn-ghost" type="button" title="清掉本次提示，回到待机（不改服务端记录）">回到待机</button>
             <button id="btnVoiceRetry" class="btn btn-ghost" type="button">重新识别这段录音</button>
             <button id="btnVoiceSpeak" class="btn btn-ghost" type="button">再播报一次</button>
             <a id="voiceDownload" class="btn btn-ghost hidden" download="voice.wav">下载这段 WAV</a>
@@ -665,6 +666,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=46"></script>
+<script src="/app.js?v=47"></script>
 </body>
 </html>
