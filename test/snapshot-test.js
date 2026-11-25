@@ -412,6 +412,65 @@ const jpost = (port, p, o) => httpReq(port, 'POST', p, o);
         .map((l) => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean)
       : [];
     ok(evs9.some((e) => e.ev === 'board_reboot'), '重启事件写入流水（事后可对表）');
+
+    /* ---------- ⑩ 备用路径：用获授权的历史图像练习，必须标为「回放」 ---------- */
+    console.log('\n— ⑩ 备用路径：历史图像可回放，但不能冒充本次 —');
+    /* 课程要求：真实采集不可用时，用获授权的真实历史图像练习，标为回放。
+     * 关键判据两条：
+     *   1) 按旧 shot_id 取到的必须是那张旧图（字节与它自己一致），不是最新那张；
+     *   2) 回放不改变「本次采集」的状态 —— /api/cam 的 shot 仍是最新那条。 */
+    const shotA = await jpost(port, '/api/cam', { action: 'shot', trigger: 'ui' });
+    shotA.json = shotA.json || {};
+    const idA = (shotOf(shotA) || {}).shot_id || null;
+    const jpegA = goodJpeg(6000);
+    await injectFrame(port, jpegA, { shot: true, seq: 11 });
+    await sleep(350);
+
+    const shotB = await jpost(port, '/api/cam', { action: 'shot', trigger: 'ui' });
+    shotB.json = shotB.json || {};
+    const idB = (shotOf(shotB) || {}).shot_id || null;
+    const jpegB = goodJpeg(7000);
+    await injectFrame(port, jpegB, { shot: true, seq: 12 });
+    await sleep(350);
+
+    ok(!!idA && !!idB && idA !== idB, '两次采集各有独立 shot_id', idA + ' / ' + idB);
+
+    // ① 回放旧图：字节必须与 A 自己一致
+    const rpA = idA ? await jget(port, `/api/cam/snapshot.jpg?shot_id=${idA}`) : { status: 0 };
+    ok(rpA.status === 200, '历史图像可按自己的 shot_id 取到（回放可行）', String(rpA.status));
+    ok(!!rpA.buf && Buffer.compare(rpA.buf, jpegA) === 0,
+      '回放取到的是那张旧图本身（不是最新那张）',
+      rpA.buf ? rpA.buf.length + ' vs ' + jpegA.length : 'no body');
+    ok(!!rpA.headers && rpA.headers['x-captured-at'],
+      '回放响应带采集时间（X-Captured-At），页面能显示「这是哪一时刻的画面」',
+      rpA.headers ? String(rpA.headers['x-captured-at']) : '');
+
+    // ② 回放不能把「本次」改成旧那条
+    const camAfterReplay = await jget(port, '/api/cam');
+    camAfterReplay.json = camAfterReplay.json || {};
+    ok((camAfterReplay.json.shot || {}).shot_id === idB,
+      '回放旧图不改变「本次采集」指向（仍是最新那条）',
+      ((camAfterReplay.json.shot || {}).shot_id) + ' vs ' + idB);
+
+    // ③ 前端必须把回放标出来，不能让用户以为这是刚拍的
+    ok(appSrc.includes('CAM.replay'), '前端有回放状态字段（CAM.replay）');
+    ok(/function setCamReplay/.test(appSrc), '前端有 setCamReplay() 入口');
+    ok(htmlSrc.includes('回放'), '页面文案里出现「回放」字样');
+    ok(/id="camShotReplay"/.test(htmlSrc), '页面有回放提示位（#camShotReplay）');
+    ok(Number((/app\.js\?v=(\d+)/.exec(htmlSrc) || [])[1]) >= 50,
+      'app.js 版本号已推进到 50（含回放）',
+      String((/app\.js\?v=(\d+)/.exec(htmlSrc) || [])[1]));
+
+    // ④ 回放必须一眼可辨（样式与可点性）
+    const cssSrc = fs.readFileSync(path.join(ROOT, 'public', 'style.css'), 'utf8');
+    ok(/\.cam-replay\s*\{/.test(cssSrc), '有回放提示位样式（.cam-replay）');
+    ok(/\.cam-replay-tag\s*\{/.test(cssSrc), '回放有醒目标签样式（.cam-replay-tag）');
+    ok(/\.shot-row\.is-replay/.test(cssSrc), '正在回放的那一行有高亮（.is-replay）');
+    ok(/\.shot-row\[data-shot-id\]\s*\{[^}]*cursor:\s*pointer/.test(cssSrc),
+      '记录行可点（cursor: pointer），用户能发现能回放');
+    ok(/style\.css\?v=(\d+)/.test(htmlSrc) && Number(/style\.css\?v=(\d+)/.exec(htmlSrc)[1]) >= 16,
+      'style.css 版本号已推进到 16（回放样式生效）',
+      String((/style\.css\?v=(\d+)/.exec(htmlSrc) || [])[1]));
   } finally {
     cleanup();
     await sleep(300);

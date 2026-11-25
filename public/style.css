@@ -963,3 +963,17 @@ select.inp { cursor: pointer; font-family: var(--sans); }
   .shot-meta { grid-column: 1 / -1; }
   .shot-list { max-height: 180px; }
 }
+
+/* 第 7 周备用路径：回放提示。回放必须一眼可辨，否则用户会以为这是刚拍的。
+   颜色用 --warn（提醒而非错误），并带「回放」小标签。 */
+.cam-replay { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 10px 0 0; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.cam-replay-tag { flex: none; padding: 1px 7px; border-radius: 4px; font-size: 12px; font-weight: 700;
+  color: #1b1300; background: var(--warn); letter-spacing: .04em; }
+.cam-replay-text { flex: 1 1 200px; font-size: 13px; color: var(--ink-2); }
+.shot-row.is-replay { background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.shot-row[data-shot-id] { cursor: pointer; }
+.shot-row[data-shot-id]:hover { background: color-mix(in srgb, var(--ink) 5%, transparent); }
+.shot-row[data-shot-id]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn-xs { padding: 3px 9px; font-size: 12px; }

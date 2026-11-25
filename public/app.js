@@ -53,6 +53,7 @@ const els = {
   camShot: $('camShot'), camShotTag: $('camShotTag'), camShotPlaceholder: $('camShotPlaceholder'),
   camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'),
   camShotState: $('camShotState'), camShotList: $('camShotList'), camShotKeep: $('camShotKeep'),
+  camShotReplay: $('camShotReplay'), camShotReplayText: $('camShotReplayText'), btnCamShotLive: $('btnCamShotLive'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
   helpHistory: $('helpHistory'), helpHistoryCount: $('helpHistoryCount'),
@@ -1166,7 +1167,9 @@ const CAM = { streaming: false, hasFrame: false, frames: 0, seq: 0, size: null, 
               camError: null, boardAck: null,
               /* 第 7 周：按需采集的记录。shot 是最近一条，shots 是保留的最近 N 条。
                * 每次请求都有自己的 shot_id 与 state，绝不拿上一张成功图冒充本次结果。 */
-              shot: null, shots: [], snapshotKeep: 5 };
+              shot: null,
+  /** 正在回放的历史采集（null = 显示本次结果）；回放绝不影响「本次」指向 */
+  replay: null, shots: [], snapshotKeep: 5 };
 
 /* 把固件回执翻成人话。errno 对照见
  * firmware/s3eye_imu_idf/main/cam_stream.c 文件头注释。
@@ -1302,8 +1305,25 @@ function camShotStateClass(state) {
   return 'tag';
 }
 
+/* 回放一张历史采集。
+ * 用途（课程「备用路径」）：真实采集不可用时，用获授权的历史图像练习。
+ * 铁律：回放只改「这一屏显示哪一张」，绝不动 CAM.shot —— 否则「上次图像冒充
+ * 本次成功」就回来了。所以这里只写 CAM.replay，renderCamShot() 里单独判。 */
+function setCamReplay(shotId) {
+  if (!shotId) { CAM.replay = null; renderCamShot(); return; }
+  const rec = (CAM.shots || []).find((x) => x.shot_id === shotId) || null;
+  if (!rec || rec.state !== 'captured') {
+    if (els.camShotState) els.camShotState.textContent = '这条记录没有可用画面，不能回放';
+    return;
+  }
+  CAM.replay = rec;
+  renderCamShot();
+}
+
 function renderCamShot() {
-  const sh = CAM.shot || null;
+  const replay = CAM.replay || null;
+  /* 回放时显示历史那张，但「本次」仍是 CAM.shot —— 两者分开，互不覆盖 */
+  const sh = replay || CAM.shot || null;
   const state = sh ? sh.state : null;
 
   if (els.camShotTag) {
@@ -1353,6 +1373,20 @@ function renderCamShot() {
     }
   }
 
+  /* 回放提示：只要在回放就显示，并写清是哪一时刻的画面 */
+  if (els.camShotReplay) {
+    if (replay) {
+      els.camShotReplay.classList.remove('hidden');
+      if (els.camShotReplayText) {
+        els.camShotReplayText.textContent = '正在回放历史图像：' +
+          `${fmtTime(replay.captured_at)} · ${((replay.bytes || 0) / 1024).toFixed(1)} KB · 不是本次采集`;
+      }
+    } else {
+      els.camShotReplay.classList.add('hidden');
+      if (els.camShotReplayText) els.camShotReplayText.textContent = '';
+    }
+  }
+
   if (els.camShotKeep) els.camShotKeep.textContent = String(CAM.snapshotKeep || 5);
 
   /* 采集记录列表：最近 N 条，每条都带自己的状态与时间 —— 上一张成功图不会因为
@@ -1368,7 +1402,8 @@ function renderCamShot() {
         const size = r.bytes ? ` · ${(r.bytes / 1024).toFixed(1)} KB` : '';
         const why = r.reason ? ` · ${escHtml(r.reason)}` : '';
         const trig = r.trigger ? ` · 触发：${escHtml(r.trigger)}` : '';
-        return `<li class="shot-row ${r.state === 'captured' ? 'is-ok' : (r.state === 'blocked' || r.state === 'failed') ? 'is-bad' : 'is-busy'}">` +
+        const isReplay = !!replay && replay.shot_id === r.shot_id;
+        return `<li class="shot-row ${isReplay ? 'is-replay' : ''} ${r.state === 'captured' ? 'is-ok' : (r.state === 'blocked' || r.state === 'failed') ? 'is-bad' : 'is-busy'}" data-shot-id="${escHtml(r.shot_id || '')}">` +
           `<span class="shot-when">${escHtml(when)}</span>` +
           `<span class="shot-st">${escHtml(st)}</span>` +
           `<span class="shot-meta">${escHtml((r.size || '—') + size + trig)}${why}</span>` +
@@ -1376,6 +1411,19 @@ function renderCamShot() {
       }).join('');
     }
   }
+}
+
+/* 记录行点击 = 回放那张；「回到本次」清掉回放。事件委托，列表重画也不用重绑。 */
+if (els.camShotList) {
+  els.camShotList.addEventListener('click', (ev) => {
+    const row = ev.target && ev.target.closest ? ev.target.closest('li.shot-row') : null;
+    if (!row) return;
+    const id = row.getAttribute('data-shot-id');
+    if (id) setCamReplay(id);
+  });
+}
+if (els.btnCamShotLive) {
+  els.btnCamShotLive.onclick = () => setCamReplay(null);
 }
 
 function renderCam() {

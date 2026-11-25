@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-<link rel="stylesheet" href="/style.css?v=15" />
+<link rel="stylesheet" href="/style.css?v=16" />
 <script>
 /* 主题防闪烁：样式生效前先把用户选择写到 <html data-theme>，
    否则深色用户每次刷新都会看到一帧浅色底闪一下。
@@ -327,13 +327,19 @@
             <span id="camShotInfo" class="ctrl-note"></span>
           </div>
           <!-- 采集状态：用文字直说「采集中 / 已采集 / 画面不可用 / 采集失败」，不靠图标猜 -->
+                    <!-- 备用路径：历史图像可回放练习，但必须标成「回放」，绝不冒充本次采集 -->
+          <div id="camShotReplay" class="cam-replay hidden">
+            <span class="cam-replay-tag">回放</span>
+            <span id="camShotReplayText" class="cam-replay-text"></span>
+            <button id="btnCamShotLive" class="btn btn-ghost btn-xs" type="button">回到本次</button>
+          </div>
           <div id="camShotState" class="ctrl-note"></div>
           <ol id="camShotList" class="shot-list"></ol>
           <p class="hint">
             最近保留 <b id="camShotKeep">5</b> 张。<code>captured_at</code> 是
             <b>JPEG 到达服务端的时刻</b>，不是传感器曝光的瞬间（板端时间戳另存为 <code>board_ts</code>）。
             遮挡判定用的是<b>字节熵 + 帧大小</b>启发式：只能识别全黑 / 全白 / 纯色，
-            <b>判不出「纸巾挡住但画面仍有纹理」</b>。
+            <b>判不出「纸巾挡住但画面仍有纹理」</b>。<br>点下方任一条记录可以<b>回放那张历史图像</b>（用于真实采集不可用时练习）；回放会明确标注，<b>不会把旧图当成刚拍的结果</b>。
           </p>
         </section>
 
@@ -676,6 +682,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=49"></script>
+<script src="/app.js?v=50"></script>
 </body>
 </html>
