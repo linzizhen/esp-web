@@ -1,12 +1,30 @@
 'use strict';
-/* LLM 自定义配置管理专项测试（隔离实例 8095 + 独立 NL_CONFIG_PATH，不碰真实密钥文件）
+/* LLM 自定义配置管理专项测试（隔离实例 + 动态空闲端口 + 独立 NL_CONFIG_PATH，不碰真实密钥文件）
  * 覆盖：查看（脱敏）/保存（校验+落盘）/测试连接（成功+失败分类）/删除/推理接入/密钥不泄漏 */
 const http = require('node:http');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const PORT = 8095;
+/* 端口动态挑：8090-8099 内按 pid 错开起点。
+ * 原来写死 8095，全套跑时与其它套件/残留实例撞车会 ECONNREFUSED。 */
+let PORT = 8095;
+function portFree(p) {
+  return new Promise((resolve) => {
+    const srv = require('node:net').createServer();
+    srv.once('error', () => resolve(false));
+    srv.once('listening', () => srv.close(() => resolve(true)));
+    srv.listen(p, '127.0.0.1');
+  });
+}
+async function pickPort() {
+  const start = 8090 + (process.pid % 10);
+  for (let i = 0; i < 10; i++) {
+    const p = 8090 + ((start - 8090 + i) % 10);
+    if (await portFree(p)) return p;
+  }
+  throw new Error('8090-8099 全被占用');
+}
 const ROOT = path.join(__dirname, '..');
 const TEST_DATA = path.join(__dirname, '.test-data-nlcfg');
 const NL_CFG_PATH = path.join(__dirname, '.test-nl-local.json');
@@ -69,6 +87,7 @@ const llmMock = http.createServer((req2, res2) => {
 (async () => {
   try { fs.mkdirSync(TEST_DATA, { recursive: true }); } catch (_) {}
   for (const f of [NL_CFG_PATH]) { try { fs.unlinkSync(f); } catch (_) {} }
+  PORT = await pickPort();
   await new Promise((r) => llmMock.listen(0, '127.0.0.1', r));
   const llmPort = llmMock.address().port;
 
@@ -83,7 +102,17 @@ const llmMock = http.createServer((req2, res2) => {
     }),
     stdio: 'ignore',
   });
-  await sleep(1300);
+  /* 轮询就绪：固定 sleep 在负载高时不够，会得到 ECONNREFUSED。
+   * 判定标准是「接口真的能响应」，不是「进程已 spawn」。 */
+  let ready = false;
+  for (let i = 0; i < 120; i++) {
+    try {
+      const r = await req('GET', '/api/nl/config');
+      if (r.status === 200) { ready = true; break; }
+    } catch (_) { /* 还没 listen */ }
+    await sleep(150);
+  }
+  if (!ready) throw new Error(`隔离实例未就绪（端口 ${PORT}，等了 18 秒）`);
 
   try {
     // ---- 1. 初始：未配置 ----
@@ -201,6 +230,6 @@ const llmMock = http.createServer((req2, res2) => {
     llmMock.close();
     try { fs.unlinkSync(NL_CFG_PATH); } catch (_) {}
   }
-  console.log(`\nLLM 配置管理验证：通过 ${pass} / 失败 ${fail}`);
+  console.log(`\nLLM 配置管理验证（端口 ${PORT}）：通过 ${pass} / 失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })();

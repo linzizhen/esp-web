@@ -209,6 +209,28 @@ async function waitReady(port, timeoutMs = 15000) {
   return false;
 }
 
+/* 等本机离线引擎探测结束。
+ *
+ * 为什么必须等：Vosk / System.Speech 是启动时【异步】探测的（要拉起 python 加载模型，
+ * 约 1~3 秒）。探测完成前 localAsrEngine() 返回 null，此时「没配云端」的实例会回
+ * 503 asr_not_configured；探测完成后同一个请求会走本机识别回 200 no_speech。
+ * 不等就会得到「有时 503 有时 200」的偶发失败 —— 那是测试的竞态，不是产品行为。
+ * 返回探测结论（asr 视图对象）供断言分流。 */
+async function waitLocalAsr(port, timeoutMs = 40000) {
+  const t0 = Date.now();
+  let last = null;
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      const r = await httpReq(port, 'GET', '/api/voice/state', undefined, 3000);
+      const asr = (r.json && r.json.asr) || {};
+      last = asr;
+      if (asr.local_available === true || asr.local_available === false) return asr;
+    } catch (_) { /* 忽略 */ }
+    await sleep(200);
+  }
+  return last;
+}
+
 /* 传一段 WAV 进隔离实例，返回 audio_id。duration_ms 用请求头自报，
  * 方便造「超时长」用例而不必真生成 31 秒音频。 */
 async function uploadWav(port, wav, durationMs) {
@@ -367,6 +389,8 @@ async function uploadWav(port, wav, durationMs) {
     const srvB = startServer(PORT2, { asr: false, asrMaxBytes: 1000, dataDir: DATA_DIR_B });
     procs.push(srvB);
     const readyB = await waitReady(PORT2);
+    /* 先等本机引擎探测出结论，否则 503/200 取决于时序（见 waitLocalAsr 注释） */
+    const asrB = readyB ? await waitLocalAsr(PORT2) : null;
     ok(readyB, `第二个隔离实例已就绪（端口 ${PORT2}，ASR_MAX_BYTES=1000，未配 ASR）`);
     if (readyB) {
       const upBig = await uploadWav(PORT2, makeWav(1000));   // 约 32KB > 1KB 上限
@@ -376,11 +400,27 @@ async function uploadWav(port, wav, durationMs) {
 
       const upSmall = await uploadWav(PORT2, makeWav(20));    // ~684 字节 < 1KB
       r = await httpReq(PORT2, 'POST', '/api/voice/transcribe', { audio_id: upSmall.id });
-      ok(r.status === 503 && r.json && r.json.error === 'asr_not_configured',
-        '没配 endpoint/key → 503 asr_not_configured（绝不假装成功）', `${r.status} ${r.json && r.json.error}`);
-      ok(String((r.json && r.json.message) || '').includes('智谱')
-        || String((r.json && r.json.message) || '').includes('ASR'),
-        '提示里说清要去配什么', r.json && r.json.message);
+      /* 两种都是如实结果，取决于本机引擎在不在：
+       *   · 本机引擎不可用 → 503 asr_not_configured（提示去配 endpoint/key）
+       *   · 本机引擎可用   → 200 走本机识别；这段是 440Hz 正弦，识别不出字 → no_speech
+       * 都不许是「假装成功」。 */
+      const localOn = !!(asrB && asrB.local_available);
+      if (localOn) {
+        ok(r.status === 200 && r.json && r.json.ok === false
+          && (r.json.error === 'no_speech' || r.json.reason === 'no_speech'),
+          '没配云端但本机引擎可用 → 走本机识别，听不出就如实报 no_speech',
+          `${r.status} ${r.json && (r.json.error || r.json.reason)}`);
+        ok(String((r.json && (r.json.message || r.json.reason)) || '').length > 0,
+          '听不出时给出可操作说明（靠近麦克风 / 改用文字输入）',
+          r.json && (r.json.message || r.json.reason));
+      } else {
+        ok(r.status === 503 && r.json && r.json.error === 'asr_not_configured',
+          '没配 endpoint/key 且本机引擎不可用 → 503 asr_not_configured（绝不假装成功）',
+          `${r.status} ${r.json && r.json.error}`);
+        ok(String((r.json && r.json.message) || '').includes('智谱')
+          || String((r.json && r.json.message) || '').includes('ASR'),
+          '提示里说清要去配什么', r.json && r.json.message);
+      }
     }
 
     /* ============ ⑦b 默认关闭：没显式开启就一条请求都不许发 ============ */
