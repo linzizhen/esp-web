@@ -69,6 +69,19 @@ const gitignore = fs.readFileSync(path.join(TEST_DIR, '..', '.gitignore'), 'utf8
 check('.gitignore 覆盖 test/.test-data*', /test\/\.test-data\*/.test(gitignore),
   '漏掉会让 git add . 把测试数据带进仓库');
 
+/* 运行时产生的用户资产目录也必须被忽略（2026-11-25 新增）。
+ *
+ * 存在理由：data/*.ndjson 只覆盖 data 根目录，管不到子目录。第 5 周新增
+ * data/voice/（录音）、第 7 周新增 data/snapshots/（环境图像）时都漏过一次，
+ * 表现为 git status 里冒出未跟踪的 jpg / ndjson —— 而 `git add -A` 会把它们
+ * 直接带走。录音可能含人声、图像可能拍到房间与人员，都属于用户资产。
+ * 这里逐个断言，新增子目录时必须同步补 .gitignore，否则本条会红。 */
+for (const dir of ['data/voice/', 'data/snapshots/', 'data/.asr-tmp/']) {
+  const re = new RegExp('^' + dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'm');
+  check(`.gitignore 覆盖 ${dir}`, re.test(gitignore),
+    `${dir} 未被忽略：跑起来后 git add -A 会把用户资产（录音/图像）带进仓库`);
+}
+
 /* 编排器端口隔离契约（2026-10-28 新增）。
  *
  * 存在理由：run-all.js 里曾写成 `env.E2E_PORT = env.E2E_PORT || '8099'`（尊重外部显式值），

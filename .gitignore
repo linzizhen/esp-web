@@ -23,6 +23,10 @@ data/voice/
 # Vosk 识别的中间文件（归一化后的临时 WAV / 结果 JSON）。放在仓库内是因为
 # 系统临时目录下 Python 子进程写文件会 PermissionError（2026-11-13 实测）。
 data/.asr-tmp/
+# 第 7 周按需采集：环境图像 + 采集记录。画面可能拍到真实房间/人员，属用户资产，
+# 绝不入库。上面 data/*.ndjson 只覆盖 data 根目录，管不到子目录（2026-11-19 漏过
+# 一次：两个 jpg 与 events.ndjson 出现在 git status 里，差点被 git add -A 带走）。
+data/snapshots/
 
 # ---- 临时/调试文件 ----
 *.log
