@@ -3488,6 +3488,14 @@ function handleLine(line, source) {
   if (typeof meta.ts === 'number') { state.boardTs = meta.ts; state.boardIso = meta.iso || null; }
   if (typeof meta.seq === 'number') state.seq = meta.seq;
 
+  /* 板子重启检测（2026-11-25 真机实测的缺陷）：固件里 s_seq 与 s_cam_seq 都是
+   * RAM 变量，上电归零。抓拍帧序号不能跨重启比较，但主帧序号掉头就说明换了
+   * 一次上电 —— 此时必须重建抓拍序号基准，否则重启后第一张抓拍帧会被当成
+   * 「上一张的帧」，页面报「板端没有回传抓拍帧」而板端日志明明说拍成功了。 */
+  if (typeof meta.seq === 'number' && snapshots.observeBootSeq(meta.seq)) {
+    console.log(`[snapshot] 检测到板子重启（主帧序号 ${meta.seq}），已重建抓拍序号基准`);
+  }
+
   // 双通道去重：同一帧的串口副本与 WiFi 副本 (device, seq) 相同，只认第一份。
   // 必须在任何副作用（状态更新 / 原始日志 / 落盘 / WebSocket 推送）之前返回。
   if (isDuplicateFrame(meta.device || state.deviceId, meta.seq)) {

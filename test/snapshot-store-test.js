@@ -275,6 +275,113 @@ console.log('\n— ⑫ 非法迁移一律拒绝（不许悄悄改成成功） �
   ok(store.markCapturing(a.record.shot_id, {}).ok === false, 'captured 之后不能再回到 capturing');
 }
 
+console.log('\n— ⑬ ★ 板子重启后序号归零，采集不能被永久判旧 —');
+{
+  /* 真机实测（2026-11-25）：板子重启后固件里的 s_cam_seq 从 0 重新计数，
+   * 而服务端的 lastSeq 来自上一次运行的历史记录（当时是 2）。于是重启后
+   * 第一次抓拍的帧 seq=1 < lastSeq=2，被判成「这是上一张的帧」→ stale_frame
+   * → 15 秒后 failed。页面看到的是「板端在 15 秒内没有回传抓拍帧」，而板端
+   * 日志明明写着「抓拍命令执行完毕：成功（耗时 194 ms）」—— 两边都在说真话，
+   * 错的是「跨重启沿用序号」这个假设。
+   *
+   * 序号只在一次上电内单调，重启后必须重新建立基准。 */
+  const dir = path.join(TMP, 'c13'); fs.mkdirSync(dir, { recursive: true });
+  const store = createSnapshotStore({ dir, keep: 5 });
+
+  // 重启前：板端序号已经涨到 100
+  const a = store.begin({ trigger: 'ui', requestId: 'req-1' });
+  store.markCapturing(a.record.shot_id, {});
+  const first = store.complete(a.record.shot_id, { jpeg: texturedJpeg(), boardSeq: 100 });
+  ok(first.ok === true, '重启前 seq=100 采集成功');
+
+  // 重启后：板端序号归零，第一张是 seq=1
+  const b = store.begin({ trigger: 'ui', requestId: 'req-2' });
+  store.markCapturing(b.record.shot_id, {});
+  const before = store.complete(b.record.shot_id, { jpeg: texturedJpeg(), boardSeq: 1 });
+  ok(before.ok === false && before.error === 'stale_frame',
+    '未重置基准时，重启后的 seq=1 会被判旧（这就是那个缺陷）', before.error);
+
+  // 服务端察觉重启后调用 resetSeq()，重新建立基准
+  const hasReset = typeof store.resetSeq === 'function';
+  ok(hasReset, 'store 提供 resetSeq()（重启后重建序号基准）');
+  if (hasReset) store.resetSeq();
+  const after = hasReset
+    ? store.complete(b.record.shot_id, { jpeg: texturedJpeg(), boardSeq: 1 })
+    : { ok: false, error: 'no_resetSeq' };
+  ok(after.ok === true && after.record && after.record.state === 'captured',
+    '★ 重置基准后，重启后的 seq=1 被正常接受', after.error || (after.record && after.record.state));
+  ok(after.record && after.record.board_seq === 1, '记录的 board_seq 是真实的 1（不篡改板端数据）');
+
+  // 重置不能抹掉历史记录
+  ok(store.get(a.record.shot_id).state === 'captured', '重置序号基准不影响已有记录');
+  ok(store.list().length === 2, '两条记录都在（重置不是清空）');
+}
+
+console.log('\n— ⑭ ★ 用主帧序号识别板子重启（observeBootSeq） —');
+{
+  /* 抓拍帧序号没有参照物，单看它分不清「上一张的帧迟到」与「重启后从头计数」。
+   * 主帧序号（固件 s_seq，约 10Hz）一直在跑，掉头就是重启。 */
+  const dir = path.join(TMP, 'c14'); fs.mkdirSync(dir, { recursive: true });
+  const store = createSnapshotStore({ dir, keep: 5 });
+  ok(typeof store.observeBootSeq === 'function', 'store 提供 observeBootSeq()');
+
+  if (typeof store.observeBootSeq === 'function') {
+    // 重启前：抓拍序号已经跑到 400000
+    const a = store.begin({ trigger: 'ui' });
+    store.markCapturing(a.record.shot_id, {});
+    store.complete(a.record.shot_id, { jpeg: texturedJpeg(), boardSeq: 400000 });
+
+    ok(store.observeBootSeq(500000) === false, '第一次观察不算重启（还没有基准）');
+    ok(store.observeBootSeq(500100) === false, '序号正常前进不算重启');
+    ok(store.observeBootSeq(500050) === false, '小幅回退（双通道/乱序）不算重启');
+    ok(store.observeBootSeq(12) === true, '★ 序号大幅回退 → 判定重启');
+
+    // 重启后抓拍序号归零，应被正常接受
+    const b = store.begin({ trigger: 'ui' });
+    store.markCapturing(b.record.shot_id, {});
+    const after = store.complete(b.record.shot_id, { jpeg: texturedJpeg(), boardSeq: 1 });
+    ok(after.ok === true, '★ 重启后抓拍序号从 1 开始也被接受', after.error || after.record.state);
+
+    // 重启要留痕
+    const evs = fs.existsSync(store.eventsFile)
+      ? fs.readFileSync(store.eventsFile, 'utf8').split('\n').filter(Boolean)
+        .map((l) => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean)
+      : [];
+    const rb = evs.filter((e) => e.ev === 'board_reboot');
+    ok(rb.length === 1, '重启事件写入流水（可事后对表）', String(rb.length));
+    ok(rb[0] && rb[0].prev_boot_seq === 500100 && rb[0].boot_seq === 12,
+      '留痕写清了重启前后的主帧序号',
+      rb[0] ? `${rb[0].prev_boot_seq} → ${rb[0].boot_seq}` : '');
+    ok(store.list().length === 2, '重启不影响已有记录');
+  }
+}
+
+console.log('\n— ⑮ ★ 服务端重启后也要能认出「板子在那期间重启过」 —');
+{
+  /* 更隐蔽的一种：服务端自己重启了，lastSeq 从历史记录恢复；而板子是在服务端
+   * 停着的那段时间里重启的。此时内存里的 lastBootSeq 是空的，光靠「本次进程内
+   * 的序号回退」发现不了 —— 但历史记录里存着当时的 boot_seq，一比就知道。 */
+  const dir = path.join(TMP, 'c15'); fs.mkdirSync(dir, { recursive: true });
+  const s1 = createSnapshotStore({ dir, keep: 5 });
+  s1.observeBootSeq(700000);                        // 板子当时主帧在 70 万
+  const a = s1.begin({ trigger: 'ui' });
+  s1.markCapturing(a.record.shot_id, {});
+  const done = s1.complete(a.record.shot_id, { jpeg: texturedJpeg(), boardSeq: 500 });
+  ok(done.ok === true, '重启前采集成功');
+  ok(done.record.boot_seq === 700000, '采集记录里留下当时的板端主帧序号', String(done.record.boot_seq));
+
+  // 服务端重启（新实例从 events.ndjson 恢复），板子在那期间也重启了
+  const s2 = createSnapshotStore({ dir, keep: 5 });
+  ok(s2.list().length === 1, '新实例恢复了历史记录');
+  const rebooted = s2.observeBootSeq(30);           // 板子重启后主帧只有 30
+  ok(rebooted === true, '★ 服务端重启后，仍能凭历史 boot_seq 认出板子重启过');
+
+  const b = s2.begin({ trigger: 'ui' });
+  s2.markCapturing(b.record.shot_id, {});
+  const after = s2.complete(b.record.shot_id, { jpeg: texturedJpeg(), boardSeq: 2 });
+  ok(after.ok === true, '★ 板子重启后的第一张抓拍帧被接受', after.error || after.record.state);
+}
+
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log(`\n结果：${pass} 项通过，${fail} 项失败`);
 process.exit(fail ? 1 : 0);

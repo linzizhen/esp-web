@@ -373,6 +373,45 @@ const jpost = (port, p, o) => httpReq(port, 'POST', p, o);
       '模拟设备下没有直播流，但采集仍能成功', String(st.json.streaming));
     ok(st.json.shots === undefined || Array.isArray(st.json.shots),
       'GET /api/cam 可带回历史列表（可选）');
+
+    /* ---------- ⑨ ★ 板子重启后序号归零，采集不能永远判旧 ---------- */
+    console.log('\n— ⑨ ★ 板子重启后序号归零，按需采集仍要能用 —');
+    /* 真机实测（2026-11-25）：固件里 s_seq（主帧，约 10Hz）与 s_cam_seq（抓拍帧）
+     * 都是 RAM 变量，上电归零。抓拍帧序号没有参照物，单看它分不清「上一张的帧
+     * 迟到」与「重启后从头计数」；主帧序号一直在跑，掉头就是重启。
+     * 这里必须注入主帧（普通数据帧），因为板端真实行为就是 10Hz 主帧 + 偶发抓拍帧。 */
+    const sensorFrame = (seq) => httpReq(port, 'POST', '/api/data', {
+      device: 'S3EYE-GROUP01', seq, acc_x_g: -0.33, acc_y_g: -0.50, acc_z_g: -0.77,
+    });
+
+    await sensorFrame(900000);                       // 重启前主帧已经跑到 90 万
+    await sleep(120);
+    const b9 = await jpost(port, '/api/cam', { action: 'shot', trigger: 'ui' });
+    b9.json = b9.json || {};
+    const shot9 = (shotOf(b9) || {}).shot_id || null;
+    ok(!!shot9, '重启场景下抓拍命令仍被接受', String(b9.status));
+
+    await sensorFrame(12);                           // ★ 主帧序号归零 = 板子重启
+    await sleep(120);
+    await injectFrame(port, goodJpeg(), { shot: true, seq: 1 });   // 重启后第一张抓拍帧
+    await sleep(350);
+
+    const c9 = await jget(port, '/api/cam');
+    c9.json = c9.json || {};
+    const rec9 = (c9.json.shots || []).find((s) => s.shot_id === shot9) || {};
+    ok(rec9.state === 'captured',
+      '★ 重启后 seq=1 的帧被接受（不再被当成上一张的帧）', rec9.state + ' ' + (rec9.reason || ''));
+    ok(rec9.board_seq === 1, '记录里如实写下 board_seq=1（不篡改板端数据）', String(rec9.board_seq));
+    const img9 = shot9 ? await jget(port, `/api/cam/snapshot.jpg?shot_id=${shot9}`) : { status: 0 };
+    ok(img9.status === 200, '重启后采集的图能按 shot_id 取到', String(img9.status));
+
+    // 重启留痕：events.ndjson 里要有 board_reboot
+    const evs9 = fs.existsSync(path.join(DATA_DIR, 'snapshots', 'events.ndjson'))
+      ? fs.readFileSync(path.join(DATA_DIR, 'snapshots', 'events.ndjson'), 'utf8')
+        .split('\n').filter(Boolean)
+        .map((l) => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean)
+      : [];
+    ok(evs9.some((e) => e.ev === 'board_reboot'), '重启事件写入流水（事后可对表）');
   } finally {
     cleanup();
     await sleep(300);
