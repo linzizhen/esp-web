@@ -224,9 +224,9 @@ curl.exe -s -o NUL -w "%{http_code}" "http://127.0.0.1:8080/api/cam/snapshot.jpg
 | 文件 | 项数 | 类型 | 说明 |
 |---|---|---|---|
 | `test/snapshot-store-test.js` | 79 | 单元 | 仓库本身：状态机、单飞、旧帧、保留、回读 |
-| `test/snapshot-test.js` | 59 | 集成 | 隔离实例 + 注入帧，覆盖接口与页面契约 |
+| `test/snapshot-test.js` | 74 | 集成 | 隔离实例 + 注入帧，覆盖接口、页面契约、重启回归与回放 |
 
-全套：**38 个测试文件 / 1141 项断言**。
+全套：**38 个测试文件 / 1156 项断言**。
 
 ### 单元测试里踩到的坑（值得记）
 
@@ -250,17 +250,100 @@ x = (x * 1103515245 + 12345) & 0x7fffffff;  // 取低 8 位
 |---|---|
 | `lib/snapshot-store.js` | 新建。采集记录仓库：状态机、单飞、序号/时间窗校验、保留策略、事件流水 |
 | `server.js` | 接线：`snapshots` 实例、`noteCamAck` 认领回执、`onCameraFrame` 只认本次、取图接口强制 shot_id、`POST /api/cam` 返回记录、NL 意图 `snapshot`、求助触发 |
-| `public/app.js` | `renderCamShot()`：状态行、采集记录列表、按 shot_id 取图 |
-| `public/index.html` | 「按需采集」卡：`#camShotState` / `#camShotList` / `#camShotKeep`，`app.js?v=49` |
-| `public/style.css` | `.shot-*` 列表样式（语义色、等宽时间、移动端两列） |
+| `public/app.js` | `renderCamShot()`：状态行、采集记录列表、按 shot_id 取图；`setCamReplay()` 回放历史图（不动「本次」指向） |
+| `public/index.html` | 「按需采集」卡：`#camShotState` / `#camShotList` / `#camShotKeep` + 回放提示位 `#camShotReplay`，`app.js?v=50` |
+| `public/style.css` | `.shot-*` 列表样式（语义色、等宽时间、移动端两列）+ `.cam-replay*` 回放提示，`style.css?v=16` |
 | `test/snapshot-store-test.js` | 新建，79 项（含「重启后序号归零」两组） |
-| `test/snapshot-test.js` | 新建，59 项（含 ⑨ 真机场景回归） |
+| `test/snapshot-test.js` | 新建，74 项（含 ⑨ 重启回归、⑩ 回放） |
 | `test/run-all.js` | 登记两个新套件 |
 | `docs/week7-snapshot.md` | 本文 |
 
 ---
 
-## 十、边界（写清楚，不掩盖）
+## 十、采集权限（课程「提交与迁移」要求：采集权限与失败记录）
+
+这一节回答「谁允许拍、拍到的东西去哪、出事怎么查」。
+
+### 授权边界
+
+| 项目 | 事实 |
+|---|---|
+| 谁能发起采集 | 只有**本机页面**（`http://127.0.0.1:8080`）与**本机语音入口**；服务端不监听公网，也没有对外的采集 API |
+| 板端是否需要授权 | 不需要单独授权：`cam_shot` 是既有的下行命令，板子只接受来自已配对服务端的命令（`expectedDeviceId` 校验） |
+| 图像存在哪 | 只存本机 `data/snapshots/`（`<shot_id>.jpg` + `events.ndjson`），**不上传任何第三方**，与云端 ASR 的「默认关闭」同一原则 |
+| 谁可能看到 | 能访问本机 8080 的人。这是个人项目的现实边界，不假装它是多租户系统 |
+| 采集到人像怎么办 | 画面里可能有人。保留上限 5 张 + 自动淘汰，降低长期留存风险；`.gitignore` 已忽略 `data/snapshots/`（2026-11-19 漏过一次，已加断言防回归） |
+
+### 失败记录（可追溯）
+
+每次采集的每一次状态迁移都写进 `data/snapshots/events.ndjson`，一行一个事件：
+
+| 事件 | 何时写 | 里面有什么 |
+|---|---|---|
+| `requested` | 发起时 | `shot_id` / `trigger` / `requested_at` / `request_id` |
+| `capturing` | 板端回 `shot` 回执 | `board_ack` / `capturing_at` |
+| `captured` | 帧通过全部校验 | `captured_at` / `bytes` / `board_seq` / `boot_seq` / `size` |
+| `blocked` | 画面不可用 | `reason`（如「画面几乎无细节」）/ `entropy` |
+| `failed` | 超时或板端报错 | `reason`（如「板端在 15 秒内没有回传抓拍帧」） |
+| `stale_frame` | 收到旧帧 | `reason`（含实际序号与上次序号）—— **只记录，不改变状态** |
+| `board_reboot` | 主帧序号大幅回退 | `prev_boot_seq` / `boot_seq` |
+| `pruned` | 超出保留上限 | 被淘汰的 `shot_id` |
+
+**为什么这些都要留**：2026-11-25 那次「板端说成功、服务端说没收到」，就是靠 `stale_frame` 那行的 `reason`（「帧序号 1 不大于上次的 2」）一眼定位到根因的。没有这条流水，只能猜。
+
+---
+
+## 十一、备用路径：用历史图像练习，标为回放
+
+课程要求：真实采集不可用时，用**获授权的真实历史图像**练习，标为回放；随后补验一次真实按需采集。
+
+### 怎么做
+
+1. 摄像头页的「采集记录」列表里，**任意一条 `captured` 记录都可以点**（`cursor: pointer`，悬停有底色）。
+2. 点下去后，上方画面切到那张历史图，并出现醒目的**「回放」标签**：
+
+   ```
+   [回放] 正在回放历史图像：2026-11-25 09:57:47 · 3.9 KB · 不是本次采集   [回到本次]
+   ```
+
+3. 点「回到本次」回到当前采集结果。
+
+### 三条不许破的规矩
+
+| 规矩 | 为什么 | 怎么保证 |
+|---|---|---|
+| 回放**不改** `CAM.shot` | 否则「上次图像冒充本次成功」就回来了 | `setCamReplay()` 只写 `CAM.replay`；`renderCamShot()` 用 `replay \|\| CAM.shot` 显示，两者分开 |
+| 回放**必须标出来** | 用户不能以为这是刚拍的 | `#camShotReplay` 提示位 + `.cam-replay-tag` 标签 + 文案「不是本次采集」 |
+| 回放**只读本地文件** | 不走网络、不重新采集 | 取图仍是 `GET /api/cam/snapshot.jpg?shot_id=<历史 id>`，服务端按 id 读盘 |
+
+### 实测（`test/snapshot-test.js` 第 ⑩ 组，10 项）
+
+```
+✓ 两次采集各有独立 shot_id
+✓ 历史图像可按自己的 shot_id 取到（回放可行）
+✓ 回放取到的是那张旧图本身（不是最新那张）   -> 6000 vs 6000 字节逐字节相同
+✓ 回放响应带采集时间（X-Captured-At）
+✓ 回放旧图不改变「本次采集」指向（仍是最新那条）
+✓ 前端有回放状态字段（CAM.replay）
+✓ 前端有 setCamReplay() 入口
+✓ 页面文案里出现「回放」字样
+✓ 页面有回放提示位（#camShotReplay）
+✓ 有回放提示位样式 / 醒目标签 / 行高亮 / 可点（cursor: pointer）
+```
+
+### 回放之后必须补验一次真实采集
+
+回放只是练习手段，**不能替代真机验证**。真机复验记录见第七节「验证 1 / 验证 2」，以及 2026-11-25 重启场景的实测：
+
+```
+POST /api/cam {action:"shot"} → shot-20261125-095747-679-0000  state=capturing
+终止态                        → state=captured  bytes=4041  board_seq=2  boot_seq=842545
+取图                          → 200  4041 字节  X-Shot-Id 正确
+```
+
+---
+
+## 十二、边界（写清楚，不掩盖）
 
 1. **`captured_at` 不是曝光时刻**，是 JPEG 到达服务端的时刻。串口链路下误差可达数秒；`board_ts` 是板端 SNTP 时间，可作对照。
 2. **遮挡判定是启发式**，只认全黑/全白/纯色，认不出「有纹理的遮挡物」。
