@@ -138,6 +138,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   ├── week6-voice.md                          # 第 6 周：澄清上下文、任务取消、迟到结果隔离、时序测量
 │   ├── week7-snapshot.md                       # 第 7 周：按需环境图像采集（四态机、采集时间、遮挡判定）
 │   ├── week7-snapshot-design.md                # 第 7 周：采集功能的设计与取舍（先设计后实现）
+│   ├── week8-vision-design.md                  # 第 8 周：视觉推理反馈的设计规格（先设计后实现）
 │   ├── week3-flash-evidence.txt                # 第 3 周烧录留存证据（整理版）
 │   ├── code-issues-review.md                   # 代码问题评审记录（含历次复查与更正）
 │   ├── course-weeks-review.md                  # 课程周次对照检查
