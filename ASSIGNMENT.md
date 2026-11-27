@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（38 个测试文件、1156 项断言，全部通过）
+## 7. 自检脚本（40 个测试文件、1182 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -356,12 +356,14 @@ node test/voice-link-contract-test.js  # 22 项  链路自检面板静态契约�
 node test/voice-stale-test.js  #  9 项  旧语音快照超过 10 分钟按历史渲染，不再冒充当前状态
 node test/firmware-wifi-skip-test.js  # 16 项  固件静态契约：WiFi 未连不刷屏、upload_skip 上报、断线指数退避
 node test/firmware-keepalive-test.js # 20 项  固件静态契约：帧上传复用长连接（热路径不建连、失败即销毁重试、复用上限）
+node test/firmware-ntp-resync-test.js # 14 项  固件静态契约：开机没对成时，拿到 IP 后补做一次 NTP（不阻塞事件循环、只补一次、任务函数用 vTaskDelete 而非 return）
+node test/board-time-test.js # 12 项  板端时间三列落盘：board_ts / board_iso / skew_ms 都要有值，且 iso 不许混进 fields
 node test/firmware-upload-queue-test.js # 24 项  固件静态契约：上传移出采样循环（队列非阻塞、退避随任务搬迁、upload_drop 如实上报）
 node test/voice-serial-upload-test.js # 23 项  录音 WAV 走 USB 串口回传：组装器二进制往返 + 服务端/固件契约
 node test/voice-local-asr-test.js # 23 项  本机离线识别（Windows System.Speech）：真识别合成语音、静音不瞎猜、接线契约
 node test/voice-vosk-asr-test.js # 30 项  本机离线识别（Vosk 中文模型）：真识别合成语音、静音不瞎猜、引擎优先序契约
 node test/voice-asr-fallback-test.js # 47 项  云端转写失败自动回退本机（429 实测：回退出文字、两边都没文字时如实报错、开关可关闭）
-node test/voice-cancel-test.js       # 62 项  第 6 周：取消（迟到结果丢弃、新任务不被旧结果覆盖）、澄清上下文、时序采集
+node test/voice-cancel-test.js       # 63 项  第 6 周：取消（迟到结果丢弃、新任务不被旧结果覆盖）、澄清上下文、时序采集
 node test/snapshot-store-test.js     # 79 项  第 7 周：采集记录仓库（四态机、单飞、旧帧拒绝、保留最近 5 张、回读）
 node test/snapshot-test.js           # 74 项  第 7 周：按需采集接口与页面契约（本次成功/失败/遮挡、必须带 shot_id 取图）
 node test/voice-hero-contract-test.js # 68 项  语音页「现在在做什么」决策卡与大字文字卡契约 + 指示灯心跳/四档状态契约
@@ -408,8 +410,8 @@ npm run audit                 # 未使用函数 / 接口交叉核对 / 重复函
 - [x] **（第 3 周）实体按键与反馈**：板端 `btn_task`（ADC 自适应校准）+ `ui_task`（LED 快闪/慢闪 + ST7789 中文状态）+ `lcd_font.h`（自动生成字模）
 - [x] **（第 3 周）双向交互与取消**：`#help` 页 + `GET/POST /api/help` + 板端 `viewer_ack` / `help_cancel`
 - [x] **（第 3 周）任务说明、走查与改进记录**：§10 + [`docs/week3-button-feedback.md`](docs/week3-button-feedback.md)（状态图/时序图/实测/迁移）
-- [x] **（第 5 周）按键录音与语音链路**：板端 `voice_record.c`（I2S 去交错 + WAV）+ `#voice` 页 + `/api/voice*`（§12）
-- [x] **（第 5 周）运行位置与失败反馈说明**：§12.2（分工硬约束）+ §12.4（无声/识别失败/超时均有中文原因）
+- [x] **（第 5 周）按键录音与语音链路**：板端 `voice_record.c`（I2S 去交错 + WAV）+ `#voice` 页 + `/api/voice*`（§13）
+- [x] **（第 5 周）运行位置与失败反馈说明**：§13.2（分工硬约束）+ §13.4（无声/识别失败/超时均有中文原因）
 
 > 提交前只需完成 **§0.1 的三处个人必改项**（WiFi、`SERVER_HOST`、`DEVICE_ID` ↔ `expectedDeviceId`），其余代码开箱即用。
 
@@ -755,9 +757,70 @@ cam_obj->fb_size   = cam_obj->recv_size;
 
 ---
 
-## 12. 第 5 周：按键说话与语音播报
+## 12. 第 4 周：用自然语言查询与请求采集
 
 ### 12.1 本周问题的答案
+
+> 用户说「查看上次数据」和「重新采集一次」，系统怎样区分这两件事，并如实告诉用户数据从哪来？
+
+**先分类意图，再按白名单执行，只回复真实结果。** 「查看上次数据」读历史记录并**明确标注不是新采集**；「重新采集一次」才下发采集；含糊的话术返回**候选清单**让用户选，**不擅自执行**；识别不了就如实说「我只能帮你这三件事」。全程用 `engine` 字段标明这句话是 LLM 解析还是规则解析。
+
+### 12.2 意图分类与工具白名单
+
+工具注册表 `NL_TASKS`（`server.js`）把每个能力登记为受限工具，每项含 `promptDesc / apiDesc / short / hint / run` 五个字段，`NL_SYSTEM_PROMPT` 由注册表**自动生成**，不在两处各写一份。
+
+| 意图 | 触发说法 | 行为 |
+|------|----------|------|
+| `query_last` | 查看上次数据 / 最近一次 | 读历史记录，**标注为历史数据** |
+| `collect_once` | 重新采集一次 / 采一次 | 下发一次新采集，等本次结果 |
+| `snapshot` | 拍一张看看 / 看一眼 | 触发一次按需图像采集 |
+| `location_query` | 我在哪 / 我的位置 | 如实说明**不提供位置**，回复无经纬度 |
+| `ambiguous` | 数据（可指三者） | 返回候选，**不执行** |
+| `other` | 把温度调高一点 | 列出可用能力，请用户换说法 |
+
+### 12.3 两级解析：LLM 优先、规则兜底
+
+- 已接入授权语言服务：`glm-4.5-flash`（智谱，OpenAI 兼容接口），密钥只放在 `config.local.json`（已 gitignore，**全仓跟踪文件中 0 处出现**）
+- `/api/nl/config/test` 实测返回 `{"ok":true,"latencyMs":1326}`
+- 解析顺序：**LLM 优先 → 规则兜底**；响应里的 `engine` 字段如实标注是 `llm` 还是 `rule`
+- 缺密钥、超时或返回不合法时自动落到规则解析，链路不因外部服务不可用而中断
+
+### 12.4 参数校验与设备范围
+
+- 设备白名单闸门 `nlValidateDevice`：**白名单之外的设备一律拒绝**，不接受任意设备号；只有通过校验的意图才进入 `run`，参数进入执行前核对类型与范围
+- 密钥、模型名、端点留在**服务端**，不下发浏览器，也不进模型提示词；**不训练模型**，只把一句话解析成结构化意图
+- **位置不生成坐标**：`location_query` 只说明不提供位置，回复里**没有经纬度**，并有测试断言守住
+
+### 12.5 歧义与三类意图实测（2026-11-27 在线取）
+
+| 请求 | 实测结果 |
+|------|----------|
+| `POST /api/nl {"text":"查看上次数据"}` | `intent=query_last`、`engine=rule`，回复「上次记录（历史数据，不是新采集）：接收于 2026-11-27T01:24:09.260Z，距今约 0 秒。三轴 ac…」 |
+| `POST /api/nl {"text":"数据"}` | `intent=ambiguous`，候选 3 个（`query_last` / `collect_once` / `snapshot`），**不执行** |
+| `POST /api/nl {"text":"把温度调高一点"}` | `intent=other`，回复「我只能帮你：【查看上次数据】、【重新采集一次】、【拍一张看看】。请换一种说法。」 |
+
+> 回复里的时间与数值都取自**真实记录**；`query_last` 明确写「历史数据，不是新采集」，杜绝把旧值当新采集。
+
+### 12.6 无证据不谎报成功
+
+- **没有设备完成证据时不回复「已采集成功」**；采集复用第 2 周的 `request_id` 回环，只有带本次 id 的观测才算完成
+- 超时或失败如实说「本次未收到新观测」，不回退显示旧值；语言服务只是入口，**是否采到仍由设备回执判定**
+
+### 12.7 验证与交付物
+
+```bash
+node test/nl-test.js          # 37 项：意图分类、歧义、位置、白名单
+node test/nl-config-test.js   # 44 项：语言服务配置与模式切换
+```
+
+- **查询 / 采集接口**：`POST /api/nl` + 受限工具白名单
+- **说明文档**：[`docs/week4-nl-assistant.md`](docs/week4-nl-assistant.md)（127 行）、[`docs/week4-test-guide.md`](docs/week4-test-guide.md)（146 行）
+
+---
+
+## 13. 第 5 周：按键说话与语音播报
+
+### 13.1 本周问题的答案
 
 > 佩戴者按下按键说一句话，查看者能读到这句说了什么吗？
 
@@ -769,7 +832,7 @@ BOOT 键 → 板载 MEMS 麦克风 I2S 直采 → WAV(16kHz/16bit/单声道)
    → 复用第 4 周 /api/nl 查询 → speechSynthesis 播报
 ```
 
-### 12.2 分工是硬约束（不是设计选择）
+### 13.2 分工是硬约束（不是设计选择）
 
 | 环节 | 位置 | 为什么不能换 |
 |------|------|-------------|
@@ -791,7 +854,7 @@ BOOT 键 → 板载 MEMS 麦克风 I2S 直采 → WAV(16kHz/16bit/单声道)
 （录音不出本机，`test/voice-asr-test.js` 用假 ASR 服务的零命中来证明这一点）。
 ④ 播报在无扬声器时改为屏幕大字 + 复制，并明确标注「未实际发声」。详见 `docs/week5-voice.md` §五「修复四」。
 
-### 12.3 链路状态机
+### 13.3 链路状态机
 
 `idle → recorded → transcribed → task_running → task_done → spoken`，
 失败分支 `silent`（没检测到语音）/ `asr_failed`（浏览器没识别出内容）/ `timeout`（链路超时）。
@@ -800,7 +863,7 @@ BOOT 键 → 板载 MEMS 麦克风 I2S 直采 → WAV(16kHz/16bit/单声道)
 - 三类失败若前端没给 `reason`，服务端补一条中文原因；进入新阶段时清掉上一轮失败原因
 - 全链状态可 `GET /api/voice/state` 读到，`stage_text` 是给人看的中文说明
 
-### 12.4 当堂验证
+### 13.4 当堂验证
 
 ```bash
 node test/manual/voice-hil.js --speak            # 真机：录音 → 上传 → 独立复核 WAV 电平
@@ -813,7 +876,7 @@ node test/voice-asr-test.js               # 50 项服务端转写契约（含「
 `voice-hil.js` **自己重新下载 WAV 并解码算 RMS**，不信服务端自报 —— 服务端说「录到声音」不算证据。
 静音时如实报「录到静音」并提示加 `--speak` 复验，不判通过。
 
-### 12.5 ★ 真机暴露的缺陷与修复（2026-10-26）
+### 13.5 ★ 真机暴露的缺陷与修复（2026-10-26）
 
 **现象**：请求录 3 秒，服务端显示 **6144 ms**；请求 6 秒，显示 **10000 ms**（撞上限）。
 连续 3 轮结果完全一致 —— 确定性缺陷，不是偶发。
@@ -849,7 +912,7 @@ node test/voice-asr-test.js               # 50 项服务端转写契约（含「
 **防回归**：`test/voice-layout-contract-test.js` 25 项静态契约（断言 `i2s_channel_read` 必须写
 `s_raw` 而**绝不能写 `s_pcm`**），CI 里没板子也能拦住「有人又把交错数据当单声道用」。
 
-### 12.6 遗留缺口（登记未修）
+### 13.6 遗留缺口（登记未修）
 
 `POST /api/voice/record` 的 `ok=true` **只表示命令写进了串口**，不代表板端接受：
 固件 `voice_record_toggle()` 在 `s_uploading` 时直接拒绝并回 `cmd_ack(rid, "busy")`，
@@ -860,3 +923,155 @@ node test/voice-asr-test.js               # 50 项服务端转写契约（含「
 
 > 完整说明（架构图、接口清单、失败分支表、取证过程、迁移判据）见
 > [`docs/week5-voice.md`](docs/week5-voice.md)。
+
+---
+
+## 14. 第 6 周：让语音任务可以澄清与停止
+
+### 14.1 本周问题的答案
+
+> 用户说了一句含糊的话，或说到一半反悔，语音任务能不能停下来、能不能澄清，迟到的结果会不会突然冒出来？
+
+**能，而且迟到结果一律丢弃。** 三条语义约定把这件事钉死：**一次发起 = 一个 `request_id`；取消即登记并清态；渲染前判 rid 不判「有没有结果」**。于是「取消后迟到的结果不得重新播放或触发动作」「新任务不被旧任务结果覆盖」两条当堂验证都能成立。
+
+### 14.2 九阶段状态机
+
+`recorded → transcribed → task_running → task_done → spoken`，终止 / 异常态 `asr_failed / silent / timeout / cancelled`。
+
+- 状态可 `GET /api/voice/state` 读取，每次进入新阶段清掉上一轮失败原因
+- `cancelled` 是**终点**：登记后任何同 rid 的后续结果都不再推进链路
+
+### 14.3 取消、停止与迟到结果隔离
+
+```
+POST /api/voice/state {"stage":"cancelled"}   → {"stage":"cancelled","reason":"…"}
+GET  /api/nl（同一 rid）                       → {"ok":false,"cancelled":true,"intent":"cancelled","reply":null,
+                                                 "note":"这次链路已被取消，结果按规则丢弃（不播报、不执行）"}
+```
+
+服务端两条守卫（都是**线上验收抓出来的真缺陷**）：
+
+```js
+// ① 取消是终点：迟到的结果一律忽略
+if (ridNow && stage !== 'cancelled' && isCancelled(ridNow)) {
+  return { ok: true, ignored: true, reason: 'cancelled_request_id' };
+}
+// ② 只有当前链路还在进行中才拒绝新 rid；已终结的链路不能挡住新任务
+const VOICE_IN_FLIGHT = new Set(['recorded','transcribed','task_running']);
+```
+
+- 停止口令：`VOICE_STOP_WORDS = /^(?:停(?:止|下|一下)?|取消|别播了|不用了|安静|闭嘴|够了)/`
+- **备用路径**：页面保留文字停止按钮 `#btnVoiceStop` 与「回到待机」`#btnVoiceIdle`；喊停后进入 `cancelled`，未播完的内容不再播报
+
+> ① 管迟到隔离，② 管新任务不被旧结果覆盖——两条缺一不可。
+
+### 14.4 澄清：有限多轮上下文
+
+| 步骤 | 实测 |
+|------|------|
+| 用户说「数据」 | `intent=ambiguous`，`clarify.options=[{1,query_last,查看上次数据},{2,collect_once,重新采集一次},{3,snapshot,拍一张看看}]`，`ttl_ms=30000` |
+| 同一 session 回「第一个」 | `intent=query_last`、`clarify_used=true` |
+| 换一个 session 回「第一个」 | 仍 `ambiguous`，不继承别的会话上下文 |
+
+- 上下文 **30 秒 TTL**、**用一次即清**、按 `session_id` 绑定（存 localStorage），不做无限多轮
+
+### 14.5 时序测量与如实缺口
+
+`GET /api/voice/timings` → `{ok:true, count:1, recent:[…], p50:{to_first_feedback_ms:0, to_task_done_ms:3409}, inject_ms:0, cancelled_rids, clarify_sessions}`。
+
+**如实说明**：`to_first_feedback_ms` 曾经**恒为 0**（`VOICE.t0` 与首次渲染同毫秒），已修为以「录音到站时刻」`received_at` 为基线。但课程要的「输入结束」是**用户说完话那一刻**，板端尚未上报 `capture_end_ms`，只能用「到站」近似——**串口 4~6 秒的误差与观测量级相当**。**这是仍未补齐的一半**，如实登记，不当作已达成。
+
+### 14.6 语言交互版本 `lang-interaction v1`
+
+| 项目 | 内容 |
+|------|------|
+| 版本号 | `lang-interaction v1`（第 6 周，2026-11-18 起） |
+| 能力清单 | 澄清 / 取消 / 回到空闲 / 迟到结果丢弃 / 时序采集 |
+| 语义约定 | 一次发起 = 一个 `request_id`；取消即登记并清态；渲染前判 rid 不判「有没有结果」 |
+
+### 14.7 当堂验证、测试与交付物
+
+| # | 当堂验证 | 保证 |
+|---|----------|------|
+| ① | 取消后迟到的结果**不得重新播放或触发动作** | `isCancelled(ridNow)` 守卫直接 `ignored:true` |
+| ② | **新任务不被旧任务结果覆盖** | `VOICE_IN_FLIGHT` 只拦进行中的 rid，终结链路不挡新任务 |
+
+- 延迟注入复现状态错误：`VOICE_LATENCY_MS` 环境变量或 `config.voiceLatencyMs`，**默认 0**（生产误碰不了）
+- 测试：`test/voice-cancel-test.js`（63 项）；交付物另含正常 / 异常时序记录与语言交互版本说明
+- 完整说明：[`docs/week6-voice.md`](docs/week6-voice.md)（249 行）
+
+---
+
+## 15. 第 7 周：按需获取一张环境图像
+
+### 15.1 本周问题的答案
+
+> 用户说「看一眼」，系统怎么证明这张图是**这一次**采到的，而不是上一次的旧图？
+
+**只有真采到、且带本次 `shot_id` 的图像才算成功。** 改造前有真实缺陷：`POST /api/cam {action:"shot"}` 返回 `ok=true, ack_status="shot"` —— 这只表示「命令写进了串口」，**不表示拍到了**；抓拍失败时 `GET /api/cam/snapshot.jpg` 仍返回 `200 + 3525 字节旧图`，页面据此显示「已抓拍」。本周把「命令已发出」与「图像已采到」彻底分开。
+
+### 15.2 四态状态机与采集记录
+
+`requested → capturing → captured`，终止态 `blocked`（画面不可用）/ `failed`；**失败与遮挡必须清空画面**，不留旧帧冒充。
+
+- 采集记录 `shot_id = shot-YYYYMMDD-HHMMSS-mmm-<4hex>`，落盘 `data/snapshots/events.ndjson` + `data/snapshots/<shot_id>.jpg`；`.gitignore` 已忽略快照目录，属**用户资产**，不进仓库
+- 时间口径：`captured_at` 是 JPEG **到达服务端**的时刻，**不是传感器曝光时刻**；板端 `ts` 存为 `board_ts`，**2026-11-27 修复后已恢复非空**（见 §7 与 `docs/week7-snapshot.md`）
+
+### 15.3 帧关联三条件与真机缺陷修复
+
+不烧固件的前提下，用三条把「这一帧属于本次」钉死：
+
+| 条件 | 实现 |
+|------|------|
+| 单飞 | 并发请求返回 `409 shot_in_progress` |
+| 序号单调 | 板端帧序号必须递增 |
+| 时间窗 | 15 秒内的帧才算本次 |
+
+★ **真机抓到的真实缺陷（2026-11-25）**：板子重启后抓拍**永远失败**。`s_cam_seq` 是 RAM 变量，上电归零；服务端 `lastSeq` 从历史恢复为 2 → 重启后第一帧 `seq=1 <= 2` 被判 `stale_frame`，15 秒后 `failed`，而板端日志说「抓拍命令执行完毕：成功（耗时 194 ms）」。
+
+**修复**：`observeBootSeq()` + `BOOT_SEQ_DROP = 1000` + `boot_seq` 持久化 + `lastSeqEpoch` 三态。**不能干脆关掉序号比较**，否则「上次图像不得冒充本次」就失守，只能**放过一次**。修后真机复验 `board_seq=2 boot_seq=842545` 正常 `captured`。
+
+### 15.4 遮挡与有效性判定（如实写局限）
+
+启发式用**字节熵 + 帧大小**。标定实测：
+
+| 样本 | 字节 | 熵 |
+|------|------|----|
+| 实时帧 | 3636 | 7.485 |
+| 全黑 | — | 0.000 |
+| 全白 | — | 0.000 |
+| 真实帧截断 | 1000 | 7.365 |
+| 随机 | — | 7.968 |
+
+阈值 `MIN_ENTROPY = 2.0`、`MIN_BYTES = 1500`。**局限如实写**：只能识别全黑 / 全白 / 纯噪点，**判不出「纸巾挡住但有纹理」或「拍到天花板」**。
+
+### 15.5 触发条件与停止条件
+
+| 触发 | 来源 |
+|------|------|
+| 页面按钮 | `trigger:'ui'` |
+| 语音口令「看一眼」「拍一张」 | `intent='snapshot'` |
+| 教学求助事件 | `trigger:'help'`，限频 60 秒 |
+
+**停止条件**：离开摄像头页 60 秒无观众即停流；失败 3 次不自动重试；求助触发每 60 秒最多一次；**图像只存本机，不上传第三方**。
+
+### 15.6 保留、接口与回放
+
+- 保留：`SNAPSHOT_KEEP = 5`（`config.snapshotKeep` 可覆盖），超出删最旧并记 `pruned`
+- `GET /api/cam/snapshot.jpg` **必须带 `?shot_id=`**：缺失 `400 shot_id_required`、不存在 `404 shot_not_found`、非 captured `409 shot_not_captured`；`GET /api/cam/shots` 列记录
+
+**回放（备用路径）**三条规矩：回放**不改** `CAM.shot`（「本次」指向）、**必须标出**「正在回放历史图像…不是本次采集」、只读本地文件。真机验证回放前后 `CAM.shot` 不变。
+
+### 15.7 当堂验证、测试与交付物
+
+| # | 当堂验证 | 保证 |
+|---|----------|------|
+| ① | 上次成功图像**不得被标为本次采集成功** | 取图必须带本次 `shot_id`，非 captured 一律 409 |
+| ② | 采集失败保持明确状态 | `blocked / failed` 清空画面，不显示旧图 |
+
+- 真机实测（2026-11-25）：`shot-20261125-095747-679-0000` `captured` 4041B `board_seq=2 boot_seq=842545`；不带 `shot_id` 取图返回 `400 shot_id_required`
+- 测试：`test/snapshot-store-test.js`（79 项）+ `test/snapshot-test.js`（74 项）
+- 交付物：按需环境快照 + 带采集时间的输入样例 + 采集权限与失败记录
+- 文档：[`docs/week7-snapshot.md`](docs/week7-snapshot.md)（355 行，含采集权限与失败记录表、回放章节）、[`docs/week7-snapshot-design.md`](docs/week7-snapshot-design.md)（94 行）
+
+---

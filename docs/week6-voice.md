@@ -347,3 +347,50 @@ if (ridNow && voice.request_id && ridNow !== voice.request_id
 
 有了这两个字段，「输入结束」就能精确到毫秒，与「首次反馈」在同一时基上相减。
 在没有 NTP 的部署里（本板 `iso` 为空的那种情况）这一步是必须的 —— 只靠墙钟会差出几十秒。
+
+---
+
+## 十、语言交互版本（课程「提交与迁移」要求）
+
+课程要求提交物里含「语言交互版本」。本项目把「语音 → 文本任务 → 澄清/取消 → 播报」这一层交互
+按版本号管理，改动语义就升版本，避免「行为变了但没人知道变了哪一版」。
+
+### 10.1 版本定义
+
+| 项 | 值 |
+|---|---|
+| 版本号 | `lang-interaction v1` |
+| 起始日期 | 2026-11-18（第 6 周落地） |
+| 上一状态 | 第 5 周的「一问一答」链路（无上下文、不可取消、迟到结果照样播报），未编号 |
+| 载体 | `server.js` 的 `VOICE_STAGES` / `CANCELLED_RIDS` / `CLARIFY` 与 `public/app.js` 的 `VOICE` 状态对象 |
+| 兼容性 | 阶段名只增不改（第 6 周新增 `cancelled`，8 → 9 个阶段）；`/api/voice/state` 的旧字段语义不变 |
+
+### 10.2 v1 的能力清单
+
+| 能力 | 语义 | 实现锚点 |
+|---|---|---|
+| 澄清 | 意图不唯一时反问，候选来自 `NL_TASKS` 注册表；用户回「第一个 / 2 / 二」即选用 | `CLARIFY` + `CLARIFY_PICK_RE` + `takeClarify()` |
+| 上下文有效期 | 30 秒（`VOICE_CLARIFY_TTL_MS`），按 `session_id` 绑定，**用一次即清** | `rememberClarify()` / `takeClarify()` |
+| 取消 | 文字按钮 `#btnVoiceStop` 或语音口令（停止 / 取消 / 别播了 / 不用了 / 安静 / 闭嘴 / 够了） | `voiceCancel()` + `VOICE_STOP_WORDS` |
+| 回到空闲 | 一步清掉本次页面状态，不改服务端已发生的 `cancelled` 事实 | `voiceToIdle()` + `#btnVoiceIdle` |
+| 迟到结果隔离 | 取消后旧 `rid` 的一切结果一律丢弃，记 `late_result_dropped`，不播报不执行 | `CANCELLED_RIDS` + `isCancelled()` |
+| 新任务接管 | 旧链路已终结时，新 `rid` 直接接管，不被挡住 | `VOICE_IN_FLIGHT` 三阶段集合 |
+| 时序采集 | 每次链路记录 `to_first_feedback_ms` / `to_task_done_ms`，可查 p50 | `TIMING_FIELDS` + `/api/voice/timings` |
+| 延迟注入 | 复现慢响应与状态错误，默认关闭 | `VOICE_LATENCY_MS` / `config.voiceLatencyMs` |
+
+### 10.3 v1 的三条语义约定（改动它们就要升版本）
+
+1. **一次发起 = 一个 `request_id`**。同一个 `rid` 贯穿录音、识别、任务、播报四段；跨段核对身份只认 `rid`，不认「最新的一条」。
+2. **取消是终点**。`cancelled` 一旦写入，同 `rid` 的任何后续阶段推进都被服务端拒绝（`reason: 'cancelled_request_id'`），不是「先记下再让后面的覆盖」。
+3. **渲染前判 `rid`，不判「有没有结果」**。前端每个 `await` 之后都过一遍 `voiceStale(rid)`；只要 `rid` 不是当前值就丢弃，避免旧链路的结果画到新链路的界面上。
+
+### 10.4 升版本时该改什么
+
+| 若改动 | 是否升版本 | 同步更新 |
+|---|---|---|
+| 新增阶段名 | 升（`v2`） | `VOICE_STAGES` + `VOICE_EVENT_TEXT` + `test/voice-test.js` 的阶段数断言 |
+| 改澄清 TTL 或匹配规则 | 升 | 本文 10.2 + `test/voice-cancel-test.js` ④ 组 |
+| 只改文案、日志措辞 | 不升 | 无需 |
+| 只改时序字段名 | 升 | `TIMING_FIELDS` + `/api/voice/timings` + 本文 10.2 |
+
+> 版本号写在本文与 `ASSIGNMENT.md` §14.6 两处，**两处必须一致**。

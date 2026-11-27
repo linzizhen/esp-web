@@ -127,6 +127,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │       └── asr-vosk.py                         # Vosk / Kaldi 封装（输出 UTF-8 JSON，控制台乱码不影响结果）
 ├── docs/                                       # 周次文档、评审记录与素材
 │   ├── vps-deploy.md                           # VPS 部署手册（Windows Server，含编译环境坑与排查表）
+│   ├── week1-sensing-web.md                    # 第 1 周：真实传感数据的采集、上送与验证（三方分工、单位与时间核对）
 │   ├── week2-remote-collect.md                 # 第 2 周：远程采集协议、状态图、时序图、实测记录
 │   ├── week3-button-feedback.md                # 第 3 周：按键触发与物理反馈闭环
 │   ├── week4-nl-assistant.md                   # 第 4 周：自然语言查询与请求采集（受限工具 + 诚实性回复）
@@ -221,7 +222,9 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── diag-hygiene-test.js                    # 诊断口径：日志行不计入无效行、设备路径不被 WiFi 冒充
     ├── firmware-wifi-skip-test.js              # 固件：WiFi 未连不刷屏、upload_skip、断线指数退避
     ├── firmware-upload-queue-test.js           # 固件：上传队列与采样解耦
-    └── firmware-keepalive-test.js              # 固件：长连接复用
+    ├── firmware-keepalive-test.js              # 固件：长连接复用
+    ├── firmware-ntp-resync-test.js             # 固件：开机没对成时拿到 IP 补做一次 NTP（14 项）
+    └── board-time-test.js                      # 板端时间三列（board_ts / board_iso / skew_ms）落盘（12 项）
 ```bash
 npm start          # 等价于 node server.js
 ```
@@ -820,7 +823,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **38 个测试文件、1156 项断言**，一条命令：
+全套 **40 个测试文件、1182 项断言**，一条命令：
 
 ```bash
 npm test

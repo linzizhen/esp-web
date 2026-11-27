@@ -226,7 +226,7 @@ curl.exe -s -o NUL -w "%{http_code}" "http://127.0.0.1:8080/api/cam/snapshot.jpg
 | `test/snapshot-store-test.js` | 79 | 单元 | 仓库本身：状态机、单飞、旧帧、保留、回读 |
 | `test/snapshot-test.js` | 74 | 集成 | 隔离实例 + 注入帧，覆盖接口、页面契约、重启回归与回放 |
 
-全套：**38 个测试文件 / 1156 项断言**。
+全套：**40 个测试文件 / 1182 项断言**。
 
 ### 单元测试里踩到的坑（值得记）
 
