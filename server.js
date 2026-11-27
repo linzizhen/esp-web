@@ -46,7 +46,10 @@ const RECORDS_FILE = path.join(DATA_DIR, 'records.ndjson');
 const HELP_FILE = path.join(DATA_DIR, 'help.ndjson');
 
 // 设备身份元数据键：出现在数据帧里、但不作为传感器数值展示
-const META_KEYS = new Set(['device', 'mac', 'src', 'ver', 'ver_', 'fw', 'id',
+// ★ `iso` 必须在这里（2026-11-27 真机实测的缺陷）：固件帧带 `"iso":"…Z"`，
+//   早期只收了 ts 没收 iso，于是 meta.iso 恒 undefined → state.boardIso 恒 null
+//   → 落盘记录 board_iso 全为 null，而 iso 混进 fields 被页面当成一个传感器卡片。
+const META_KEYS = new Set(['device', 'mac', 'src', 'ver', 'ver_', 'fw', 'id', 'iso',
   'imu_ok', 'imu_id', 'imu_scan']); // 板端诊断字段，仅记录不展示
 // 这些键是"板端时间戳/序号"，属于元数据，不画成传感器卡片
 const META_NUMERIC_KEYS = new Set(['ts', 'seq', 'uptime_ms', 'boot_ms']);

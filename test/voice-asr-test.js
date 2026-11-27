@@ -438,11 +438,14 @@ async function uploadWav(port, wav, durationMs) {
       r = await httpReq(PORT3, 'POST', '/api/voice/transcribe', { audio_id: upC.id });
       /* 云端关闭时的正确行为有两种，都算合格：
        *   ① 本机没有离线识别器 → 503 asr_disabled；
-       *   ② 本机有离线识别器（Windows System.Speech）→ 200，engine=local_windows_asr，
-       *      且 uploaded=false —— 录音只在本机转文字，绝不外发。
+       *   ② 本机有离线识别器 → 200，uploaded=false —— 录音只在本机转文字，绝不外发。
+       *      本机引擎可能是 vosk（首选）或 local_windows_asr（兜底），
+       *      而且这段夹具是 440Hz 正弦、多半听不出字（error=no_speech），
+       *      所以不能把「必须出文字」写进断言 —— 那是在测夹具，不是测隐私。
        * 真正的隐私判据是「假 ASR 服务一次都没被调用」（下一项断言），不是状态码。 */
-      const localOnly = r.status === 200 && r.json && r.json.engine === 'local_windows_asr'
-        && r.json.uploaded !== true && stub.hits.length === hitsBefore;
+      const LOCAL_ENGINES = new Set(['vosk', 'local_windows_asr']);
+      const localOnly = r.status === 200 && r.json && r.json.uploaded !== true
+        && (LOCAL_ENGINES.has(r.json.engine) || r.json.error === 'no_speech');
       const hardDisabled = r.status === 503 && r.json && r.json.error === 'asr_disabled';
       ok(localOnly || hardDisabled,
         '未开启 asrEnabled → 不假装云端成功（503 asr_disabled 或 200 本机离线识别且 uploaded=false）',
