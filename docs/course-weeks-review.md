@@ -1,7 +1,7 @@
-# 七周课程目标核对报告
+# 八周课程目标核对报告
 
 > 核对日期：2026-11-27（第 6、7 周为当次补核）　项目：ESP32-S3-EYE 三轴 IMU 监控平台（`imu-monitor`）
-> 核对方式：代码审查（server.js / 固件 main.c / 前端）+ 测试套件实跑（1182 项断言全过）+ 实物验证记录
+> 核对方式：代码审查（server.js / 固件 main.c / 前端）+ 测试套件实跑（1284 项断言全过）+ 实物验证记录
 > 测试现状：`voice 112 / command-ack 95 / voice-hero 68 / voice-asr 50 / voice-cancel 63 / snapshot-store 79 / snapshot 74 / voice-asr-fallback 47 / nl-config 44 / nl 37 / cam-ack 36 / voice-vosk-asr 30 / voice-longpress 26 / help 26 / voice-layout 25 / voice-mic 24 / fw-upload-q 24 / guard 23 / voice-serial 23 / voice-local-asr 23 / voice-link 22 / fw-keepalive 20 / help-persist 17 / fw-wifi-skip 16 / fw-ntp 11 / diag-hygiene 13 / storage 19 / p0-dedup 14 / e2e 14 / feature 14 / acceptance 12 / cam-config 10 / parse 10 / voice-stale 9 / ws 9 / theme 6 / help-ui 6 / verify 6 / isolation 10` 全过（入口 `npm test`，编排器 `test/run-all.js`；**所有**测试都自建隔离实例，`e2e` 也不例外 —— 默认在 `8090-8099` 内自选空闲端口，连生产须显式 `E2E_PORT=8080` / `--production`）。
 
 ---
@@ -168,11 +168,29 @@ imu-monitor/
 
 **★ 真机抓到的真缺陷（2026-11-25，已修）**：板子重启后抓拍永远失败。`s_cam_seq` 是 RAM 变量、上电归零；服务端 `lastSeq` 从历史恢复为 2 → 重启后第一帧 `seq=1 <= 2` 被判 `stale_frame`，15 秒后 `failed`，而板端日志说「抓拍命令执行完毕：成功（耗时 194 ms）」——两边都在说真话。修：`observeBootSeq()` + `BOOT_SEQ_DROP = 1000` + `boot_seq` 持久化 + `lastSeqEpoch` 三态（不能干脆关掉序号比较，否则「上次图像不得冒充本次」失守，只能放过一次）。修后真机复验 `board_seq=2 boot_seq=842545` 正常 captured。
 
+### 第 8 周：把视觉推理结果变成可理解反馈 —— ✅ 已完成
+
+| 要求 | 状态 | 证据 |
+|---|---|---|
+| 讲标签、分数、拒识、模型版本 | ✅ | 记录含 `model_label / scene / score / score_calibrated(false) / model_version`；拒识=低分/未知/解析失败/超时 |
+| 保底：画面可用性 / 遮挡 | ✅ | 本地指标四态（usable/blocked/overexposed/blurred），确定性、可解释、不联网 |
+| 拓展：场景粗分类 | ✅ | 真实模型 `glm-4v-flash` 返回 `scene` 四枚举（真机图实得「室内」） |
+| 接入真实模型推理 | ✅ | `test/manual/vision-live-check.js` 真机快照真调模型，`outcome=ok`、标签非空 |
+| 结构化解析 + 低分/未知反馈 | ✅ | `parseModelOutput` 容错 + 字段裁剪；outcome 分支各有文案 |
+| 重新采集 + 人工纠正 | ✅ | 页面「重新采集」；`/api/vision/correct` 写 `human_label`，不覆盖 `model_*` |
+| 输入/结果/反馈三者对应 | ✅ | `inference_id` 绑定 `shot_id`，纠正指向同一条 |
+| 当堂验证①：未校准分数不写正确率 | ✅ | `score_calibrated` 恒 false；页面「未校准」且禁「准确率」 |
+| 当堂验证②：场景不转坐标/人身安全 | ✅ | 前端无 latitude/longitude；scene 仅四枚举；接口裁越界字段 |
+| 备用路径：模型未就绪 | ✅ | 云端关闭/失败明确「仅本地可用性判定」；历史图像可「回放推理」标 `replay` |
+| 迁移：为个人项目补纠错入口 | ✅ | 人工纠正记录 `human_label` 与 `model_label` 并列留证 |
+
+**★ 关键实测（2026-11-27，决定架构）**：真实模型 `glm-4v-flash` 对纯黑图会幻觉（「白色杯子」）且 `score` 恒为 1/0.5，**不能用来判可用性**；故可用性交本地可解释指标，模型只做场景分类并标未校准。云端默认关闭，需显式开启才上传画面。详见 `docs/week8-vision.md`。
+
 ---
 
 ## 三、测试与文档覆盖
 
-- **测试**：40 个测试文件 1182 项断言全过（含 `voice-test.js` 112、`command-ack-test.js` 95、`snapshot-store-test.js` 79、`snapshot-test.js` 74、`voice-hero-contract-test.js` 68、`voice-cancel-test.js` 63、`voice-asr-test.js` 50、`voice-asr-fallback-test.js` 47、`nl-config-test.js` 44、`nl-test.js` 37、`cam-ack-contract-test.js` 36、`voice-vosk-asr-test.js` 30、`voice-longpress-test.js` 26、`help-test.js` 26、`voice-layout-contract-test.js` 25、`voice-mic-preflight-test.js` 24、`firmware-upload-queue-test.js` 24、`handleline-guard-test.js` 23、`voice-serial-upload-test.js` 23、`voice-local-asr-test.js` 23、`voice-link-contract-test.js` 22、`firmware-keepalive-test.js` 20、`help-persist-test.js` 17、`firmware-wifi-skip-test.js` 16、`diag-hygiene-test.js` 13、`firmware-ntp-resync-test.js` 11、`cam-config-contract-test.js` 10、`isolation-contract-test.js` 10、`voice-stale-test.js` 9、`theme-contract-test.js` 6），入口 `npm test`（编排器 `test/run-all.js`）。**所有**测试都自建隔离实例（端口 `8090-8099` + 独立 `DATA_DIR`），`e2e` 也不例外：直接 `node test/e2e-test.js` 默认起隔离实例，只有显式 `E2E_PORT=8080` / `--production` 才连生产。测试纪律见 §5.6（隔离实例防真实设备污染）。需开发板在线的真机测试不进编排器：`voice-hil.js` / `probe-voice-stop.js` / `fps-baseline-test.js`（帧率基线回归，相邻帧间隔中位数 > 250 ms 即失败，只读 `GET /api/state`，无设备时明确「跳过 ≠ 通过」） / `firmware-backoff-test.js`（要求服务端停着）。
+- **测试**：43 个测试文件 1284 项断言全过（含 `vision-infer-test.js` 46、`vision-api-test.js` 28、`vision-ui-contract-test.js` 28、`voice-test.js` 112、`command-ack-test.js` 95、`snapshot-store-test.js` 79、`snapshot-test.js` 74、`voice-hero-contract-test.js` 68、`voice-cancel-test.js` 63、`voice-asr-test.js` 50、`voice-asr-fallback-test.js` 47、`nl-config-test.js` 44、`nl-test.js` 37、`cam-ack-contract-test.js` 36、`voice-vosk-asr-test.js` 30、`voice-longpress-test.js` 26、`help-test.js` 26、`voice-layout-contract-test.js` 25、`voice-mic-preflight-test.js` 24、`firmware-upload-queue-test.js` 24、`handleline-guard-test.js` 23、`voice-serial-upload-test.js` 23、`voice-local-asr-test.js` 23、`voice-link-contract-test.js` 22、`firmware-keepalive-test.js` 20、`help-persist-test.js` 17、`firmware-wifi-skip-test.js` 16、`diag-hygiene-test.js` 13、`firmware-ntp-resync-test.js` 11、`cam-config-contract-test.js` 10、`isolation-contract-test.js` 10、`voice-stale-test.js` 9、`theme-contract-test.js` 6），入口 `npm test`（编排器 `test/run-all.js`）。**所有**测试都自建隔离实例（端口 `8090-8099` + 独立 `DATA_DIR`），`e2e` 也不例外：直接 `node test/e2e-test.js` 默认起隔离实例，只有显式 `E2E_PORT=8080` / `--production` 才连生产。测试纪律见 §5.6（隔离实例防真实设备污染）。需开发板在线的真机测试不进编排器：`voice-hil.js` / `probe-voice-stop.js` / `fps-baseline-test.js`（帧率基线回归，相邻帧间隔中位数 > 250 ms 即失败，只读 `GET /api/state`，无设备时明确「跳过 ≠ 通过」） / `firmware-backoff-test.js`（要求服务端停着） / `vision-live-check.js`（第 8 周：真实板载快照 + 真实 glm-4v-flash 受控验证，需联网 + Key）。
 - **文档**：`week1-sensing-web.md`、`week2-remote-collect.md`、`week3-button-feedback.md`、`week4-nl-assistant.md`、`week4-test-guide.md`、`week5-voice.md`、`week6-voice.md`、`week7-snapshot.md`、`week7-snapshot-design.md`、`vps-deploy.md`、`project-structure.md`、`git-flow.md`、`code-issues-review.md`、`fps-degradation-forensics.md` + 截图（`docs/assets/`）。
 
 ---
@@ -249,8 +267,9 @@ imu-monitor/
 | 第 5 周 | ✅ 已完成（真机录音、上传、识别、播报全链跑通；I2S 交错缺陷已修复） |
 | 第 6 周 | ✅ 已完成（澄清 / 取消 / 迟到结果隔离 / 回到空闲全通；线上验收抓出并修掉两个真缺陷） |
 | 第 7 周 | ✅ 已完成（按需采集四态 + 独立记录 + 强制 `shot_id` 取图 + 回放；真机抓出并修掉重启序号归零缺陷） |
+| 第 8 周 | ✅ 已完成（本地可用性 + 真实模型场景分类 + 未校准声明 + 三对应 + 纠错；真机快照真调模型验证） |
 
-七周课程目标**全部达成**，核心功能均有代码证据、测试断言与实物验证记录。
+八周课程目标**全部达成**，核心功能均有代码证据、测试断言与实物验证记录。
 
 ### 5.1 仍需用户/后续补齐的一项
 

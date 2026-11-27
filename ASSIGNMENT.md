@@ -311,7 +311,7 @@ curl -s http://127.0.0.1:8080/api/state        # transport 仍为 wifi，seq 继
 
 ---
 
-## 7. 自检脚本（40 个测试文件、1182 项断言，全部通过）
+## 7. 自检脚本（43 个测试文件、1284 项断言，全部通过）
 
 > **跑自检前不必拔开发板**：测试实例统一使用 `test/.test-config.json` 隔离配置
 > （`autoDetect:false`）。若让测试实例连上真实板子，板子持续上报会使
@@ -366,6 +366,9 @@ node test/voice-asr-fallback-test.js # 47 项  云端转写失败自动回退本
 node test/voice-cancel-test.js       # 63 项  第 6 周：取消（迟到结果丢弃、新任务不被旧结果覆盖）、澄清上下文、时序采集
 node test/snapshot-store-test.js     # 79 项  第 7 周：采集记录仓库（四态机、单飞、旧帧拒绝、保留最近 5 张、回读）
 node test/snapshot-test.js           # 74 项  第 7 周：按需采集接口与页面契约（本次成功/失败/遮挡、必须带 shot_id 取图）
+node test/vision-infer-test.js       # 46 项  第 8 周：视觉推理核心（本地可用性四态、场景收敛、越界裁剪、outcome 分支、纠正、三对应）
+node test/vision-api-test.js         # 28 项  第 8 周：视觉接口（隔离实例、cloud_disabled 隐私闸门、缺 id/404/409、纠正、落盘）
+node test/vision-ui-contract-test.js # 28 项  第 8 周：前端契约（未校准声明、禁「准确率」、无坐标字段、接口接线）
 node test/voice-hero-contract-test.js # 68 项  语音页「现在在做什么」决策卡与大字文字卡契约 + 指示灯心跳/四档状态契约
 node test/diag-hygiene-test.js # 13 项  /api/diag 口径：设备日志行单独计数、不再算「无效行」；设备路径不被 WiFi 标签冒充
 ```

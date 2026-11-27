@@ -139,6 +139,7 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   ├── week7-snapshot.md                       # 第 7 周：按需环境图像采集（四态机、采集时间、遮挡判定）
 │   ├── week7-snapshot-design.md                # 第 7 周：采集功能的设计与取舍（先设计后实现）
 │   ├── week8-vision-design.md                  # 第 8 周：视觉推理反馈的设计规格（先设计后实现）
+│   ├── week8-vision.md                         # 第 8 周：视觉识别反馈闭环（双层判定、未校准、三对应、真实验证）
 │   ├── week3-flash-evidence.txt                # 第 3 周烧录留存证据（整理版）
 │   ├── code-issues-review.md                   # 代码问题评审记录（含历次复查与更正）
 │   ├── course-weeks-review.md                  # 课程周次对照检查
@@ -221,6 +222,9 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
     ├── voice-cancel-test.js                    # 第 6 周：取消链路、澄清上下文、request_id 防覆盖、时序
     ├── snapshot-store-test.js                  # 第 7 周：采集记录仓库（四态机、单飞、旧帧拒绝、保留 5 张）
     ├── snapshot-test.js                        # 第 7 周：按需采集接口与页面契约（本次成功/失败/遮挡）
+    ├── vision-infer-test.js                    # 第 8 周：视觉推理核心（本地可用性、场景收敛、越界裁剪、outcome 分支、纠正）
+    ├── vision-api-test.js                      # 第 8 周：视觉接口（隔离实例、cloud_disabled 隐私闸门、三对应、纠正）
+    ├── vision-ui-contract-test.js              # 第 8 周：前端契约（未校准声明、禁准确率、无坐标字段）
     ├── command-ack-test.js                     # 第 5 周：命令 ack 五态区分
     ├── diag-hygiene-test.js                    # 诊断口径：日志行不计入无效行、设备路径不被 WiFi 冒充
     ├── firmware-wifi-skip-test.js              # 固件：WiFi 未连不刷屏、upload_skip、断线指数退避
@@ -826,7 +830,7 @@ node test/command-ack-test.js     # 95 项：命令 ack 通道（accepted/busy/t
 
 ### 跑测试
 
-全套 **40 个测试文件、1182 项断言**，一条命令：
+全套 **43 个测试文件、1284 项断言**，一条命令：
 
 ```bash
 npm test
@@ -860,6 +864,7 @@ node test/manual/voice-hil.js --speak    # 同上，并提示你对着板子说�
 node test/manual/probe-voice-stop.js 5 2 # 真机探针：5 轮 start → 2s → stop 的时长稳定性
 node test/manual/fps-baseline-test.js    # 帧率基线回归：相邻帧间隔中位数 > 250ms 即失败（只读 GET /api/state）
 node test/manual/records-pollution-check.js before|after   # 真实 data/records.ndjson 污染取证
+node test/manual/vision-live-check.js    # 第 8 周：真实板载快照 + 真实 glm-4v-flash 受控验证（需联网 + Key + .asr-venv）
 ```
 
 `fps-baseline-test.js` 默认打 8080 上的运行实例（要观察真实串口上的板子，自建隔离实例拿不到串口，只会永远 skip），
