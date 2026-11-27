@@ -54,6 +54,11 @@ const els = {
   camShotDownload: $('camShotDownload'), camShotInfo: $('camShotInfo'),
   camShotState: $('camShotState'), camShotList: $('camShotList'), camShotKeep: $('camShotKeep'),
   camShotReplay: $('camShotReplay'), camShotReplayText: $('camShotReplayText'), btnCamShotLive: $('btnCamShotLive'),
+  // 第 8 周：视觉识别反馈
+  visTag: $('visTag'), visState: $('visState'), visUsability: $('visUsability'),
+  visScene: $('visScene'), visLabel: $('visLabel'), visScore: $('visScore'), visPriv: $('visPriv'),
+  visHumanLabel: $('visHumanLabel'), btnVisionInfer: $('btnVisionInfer'),
+  btnVisionRecapture: $('btnVisionRecapture'), btnVisionCorrect: $('btnVisionCorrect'), visList: $('visList'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
   helpHistory: $('helpHistory'), helpHistoryCount: $('helpHistoryCount'),
@@ -1543,6 +1548,131 @@ if (els.btnCamShot) els.btnCamShot.onclick = async () => {
 
 // 停在摄像头页时定时刷新状态（画面本身由 MJPEG 推送，无需轮询）
 setInterval(() => { if (S.page === 'cam') loadCam(); }, 3000);
+
+/* ---------------- 第 8 周：视觉识别反馈 ----------------
+ * 保底层（可用性/遮挡）由本地指标判定；拓展层（场景分类）来自真实模型。
+ * 分数一律「未校准」，页面绝不写正确率，也不把场景换算成坐标/安全结论。 */
+const VIS = { config: null, records: [], last: null };
+
+const VIS_OUTCOME_TEXT = {
+  ok: '已识别',
+  low_score: '模型把握较低，建议重新采集',
+  unknown: '模型无法判断这张画面',
+  parse_failed: '模型输出无法解析，未采用',
+  model_unavailable: '视觉模型不可用，仅显示本地可用性判定',
+  cloud_disabled: '云端模型未启用，仅显示本地可用性判定',
+  timeout: '视觉模型超时，仅显示本地可用性判定',
+  blocked: '画面不可用，未调用模型',
+};
+
+const VIS_USABILITY_TEXT = {
+  usable: '可用', blocked: '不可用（疑似遮挡 / 全黑）', overexposed: '不可用（过曝）',
+  blurred: '不可用（模糊）', unknown: '无法判定',
+};
+
+function visTagClass(o) {
+  if (o === 'ok') return 'tag tag-ok';
+  if (o === 'blocked' || o === 'model_unavailable' || o === 'parse_failed') return 'tag tag-err';
+  if (o === 'low_score' || o === 'unknown' || o === 'timeout' || o === 'cloud_disabled') return 'tag tag-warn';
+  return 'tag';
+}
+
+function visScoreText(rec) {
+  if (rec.score == null) return '—';
+  return Number(rec.score).toFixed(2) + '（模型自报 · 未校准）';
+}
+
+function renderVisionRecord(rec) {
+  if (!rec) return;
+  VIS.last = rec;
+  if (els.visTag) { els.visTag.textContent = VIS_OUTCOME_TEXT[rec.outcome] || rec.outcome; els.visTag.className = visTagClass(rec.outcome); }
+  if (els.visUsability) els.visUsability.textContent = (VIS_USABILITY_TEXT[rec.usability] || rec.usability || '—') + (rec.usability_reason ? ' · ' + rec.usability_reason : '');
+  if (els.visScene) els.visScene.textContent = rec.scene || '无法判断';
+  if (els.visLabel) els.visLabel.textContent = rec.model_label || '—';
+  if (els.visScore) els.visScore.textContent = visScoreText(rec);
+  if (els.visState) {
+    let s = VIS_OUTCOME_TEXT[rec.outcome] || rec.outcome;
+    if (rec.outcome === 'blocked' && rec.usability_reason) s += '：' + rec.usability_reason;
+    if (rec.human_label && rec.human_label.label) s += ' ｜ 人工纠正：' + rec.human_label.label;
+    els.visState.textContent = s;
+  }
+}
+
+function renderVisionList() {
+  if (!els.visList) return;
+  const list = VIS.records || [];
+  if (!list.length) { els.visList.innerHTML = '<li class="shot-row shot-row-empty">还没有识别记录</li>'; return; }
+  els.visList.innerHTML = list.slice().reverse().slice(0, 10).map((r) => {
+    const when = fmtTime(r.requested_at);
+    const o = VIS_OUTCOME_TEXT[r.outcome] || r.outcome;
+    const lab = r.model_label ? ' · ' + escHtml(r.model_label) : '';
+    const hum = r.human_label && r.human_label.label ? ' · 人工：' + escHtml(r.human_label.label) : '';
+    const cls = r.outcome === 'ok' ? 'is-ok'
+      : (r.outcome === 'blocked' || r.outcome === 'model_unavailable' || r.outcome === 'parse_failed') ? 'is-bad' : 'is-busy';
+    return `<li class="shot-row ${cls}"><span class="shot-when">${escHtml(when)}</span><span class="shot-st">${escHtml(o)}</span><span class="shot-meta">${escHtml(r.shot_id || '')}${lab}${hum}</span></li>`;
+  }).join('');
+}
+
+async function loadVisionConfig() {
+  try {
+    const j = await (await fetch('/api/vision/config')).json();
+    VIS.config = j;
+    if (els.visPriv) els.visPriv.textContent = j.enabled
+      ? '云端模型：已启用（抓拍帧会发给 ' + (j.model || 'glm-4v-flash') + '）'
+      : '云端模型：未启用（只做本地可用性判定，不上传画面）';
+  } catch (_) { if (els.visPriv) els.visPriv.textContent = '云端模型状态未知'; }
+}
+
+async function loadVisionRecords() {
+  try {
+    const j = await (await fetch('/api/vision/records')).json();
+    VIS.records = j.records || [];
+    renderVisionList();
+  } catch (_) { /* 忽略 */ }
+}
+
+function currentShotId() {
+  if (CAM.replay && CAM.replay.state === 'captured') return CAM.replay.shot_id;
+  if (CAM.shot && CAM.shot.state === 'captured') return CAM.shot.shot_id;
+  return null;
+}
+
+if (els.btnVisionInfer) els.btnVisionInfer.onclick = async () => {
+  const shotId = currentShotId();
+  if (!shotId) { if (els.visState) els.visState.textContent = '还没有可识别的已采集画面：先点「抓拍一帧」。'; return; }
+  els.btnVisionInfer.disabled = true;
+  if (els.visState) els.visState.textContent = '识别中…（本地指标 + 模型）';
+  try {
+    const d = await (await fetch('/api/vision/infer', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shot_id: shotId, trigger: CAM.replay ? 'replay' : 'ui' }),
+    })).json();
+    if (d.record) renderVisionRecord(d.record);
+    await loadVisionRecords();
+  } catch (e) {
+    if (els.visState) els.visState.textContent = '识别请求失败：' + e.message;
+  } finally { els.btnVisionInfer.disabled = false; }
+};
+
+if (els.btnVisionRecapture) els.btnVisionRecapture.onclick = () => { if (els.btnCamShot) els.btnCamShot.click(); };
+
+if (els.btnVisionCorrect) els.btnVisionCorrect.onclick = async () => {
+  if (!VIS.last || !VIS.last.inference_id) { if (els.visState) els.visState.textContent = '先识别一次，再提交纠正。'; return; }
+  const label = els.visHumanLabel ? els.visHumanLabel.value.trim() : '';
+  if (!label) { if (els.visState) els.visState.textContent = '请先填写人工纠正的内容。'; return; }
+  try {
+    const d = await (await fetch('/api/vision/correct', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inference_id: VIS.last.inference_id, human_label: label }),
+    })).json();
+    if (d.ok && d.record) { renderVisionRecord(d.record); if (els.visHumanLabel) els.visHumanLabel.value = ''; }
+    await loadVisionRecords();
+  } catch (e) { if (els.visState) els.visState.textContent = '纠正失败：' + e.message; }
+};
+
+loadVisionConfig();
+loadVisionRecords();
+setInterval(() => { if (S.page === 'cam') loadVisionRecords(); }, 6000);
 
 if (els.btnHelpAck) els.btnHelpAck.onclick = () => helpAction('ack');
 if (els.btnHelpCancel) els.btnHelpCancel.onclick = () => helpAction('cancel');

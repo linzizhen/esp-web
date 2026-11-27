@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-<link rel="stylesheet" href="/style.css?v=16" />
+<link rel="stylesheet" href="/style.css?v=17" />
 <script>
 /* 主题防闪烁：样式生效前先把用户选择写到 <html data-theme>，
    否则深色用户每次刷新都会看到一帧浅色底闪一下。
@@ -340,6 +340,39 @@
             <b>JPEG 到达服务端的时刻</b>，不是传感器曝光的瞬间（板端时间戳另存为 <code>board_ts</code>）。
             遮挡判定用的是<b>字节熵 + 帧大小</b>启发式：只能识别全黑 / 全白 / 纯色，
             <b>判不出「纸巾挡住但画面仍有纹理」</b>。<br>点下方任一条记录可以<b>回放那张历史图像</b>（用于真实采集不可用时练习）；回放会明确标注，<b>不会把旧图当成刚拍的结果</b>。
+          </p>
+        </section>
+
+        <!-- 第 8 周：视觉识别反馈。保底=本地可解释指标判可用性；拓展=真实模型 glm-4v-flash 场景粗分类。
+             未校准分数只作「模型自报把握」，绝不写成正确率；场景类别不换算坐标或人身安全判断。 -->
+        <section class="card" style="grid-column: 1 / -1">
+          <div class="card-head">
+            <h2>视觉识别 · 看到了什么，还有什么不能确定</h2>
+            <span id="visTag" class="tag">未识别</span>
+          </div>
+          <div class="collect-actions">
+            <button id="btnVisionInfer" class="btn btn-primary">对这张图做识别</button>
+            <button id="btnVisionRecapture" class="btn btn-ghost">重新采集</button>
+            <span id="visPriv" class="ctrl-note">云端模型状态读取中…</span>
+          </div>
+          <div id="visState" class="ctrl-note">先抓拍一张，再点「对这张图做识别」。</div>
+          <div class="obs-grid">
+            <div class="obs-cell"><span class="k">可用性判定</span><span class="v" id="visUsability">—</span></div>
+            <div class="obs-cell"><span class="k">场景粗分类</span><span class="v" id="visScene">—</span></div>
+            <div class="obs-cell"><span class="k">看到什么（模型）</span><span class="v" id="visLabel">—</span></div>
+            <div class="obs-cell"><span class="k">模型自报把握</span><span class="v" id="visScore">—</span></div>
+          </div>
+          <div class="collect-actions">
+            <input id="visHumanLabel" class="vis-input" placeholder="人工纠正：这张图其实是什么？" style="flex:1;min-width:220px" />
+            <button id="btnVisionCorrect" class="btn btn-ghost btn-xs">提交纠正</button>
+          </div>
+          <ol id="visList" class="shot-list"></ol>
+          <p class="hint">
+            <b>可用性 / 遮挡</b>由本地可解释指标判定（亮度 / 对比度 / 拉普拉斯方差 / 灰度级 / 字节熵），
+            <b>不是模型</b>——实测模型对纯黑图会幻觉成「有人物」且自报分数恒为 1。<br>
+            场景粗分类来自真实视觉模型 <code>glm-4v-flash</code>；其分数是<b>模型自报、未校准</b>，
+            只作参考，<b>不代表正确率</b>，也<b>不会</b>换算成坐标或人身安全判断。<br>
+            云端模型默认关闭：开启后才会把抓拍帧发往厂商；关闭时只做本地判定、不上传画面。
           </p>
         </section>
 
@@ -682,6 +715,6 @@
 
   <footer class="foot">所有数值均由 ESP32 真实上报；停采保留旧值并提示「未更新」，拔线 / 释放串口立即清空。</footer>
 </div>
-<script src="/app.js?v=50"></script>
+<script src="/app.js?v=51"></script>
 </body>
 </html>
