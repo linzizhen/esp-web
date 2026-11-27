@@ -293,6 +293,57 @@ static void wifi_reconnect_cb(void *arg)
     esp_wifi_connect();
 }
 
+/* ── NTP 补做（2026-11-27）───────────────────────────────────────────
+ * 现象：data/records.ndjson 全部 6036 条记录的 board_ts / board_iso / skew_ms
+ * 都是 null，`build_frame` 里 `if (t > 1700000000)` 那道闸门从来没成立过。
+ *
+ * 根因：time_sync() 只在 app_main 里 wifi_wait(15000) **成功之后**调用一次。
+ * 本次开机热点不在（实测 upload_skip 已累计 796258 帧 ≈ 22 小时没走 WiFi），
+ * 于是永远不对时；之后即使重连成功，也没有任何地方再调 time_sync()。
+ *
+ * 修法：拿到 IP（IP_EVENT_STA_GOT_IP）时补做一次。
+ * ★ 不能在事件处理函数里直接调 time_sync()：它最多轮询 30 × 500ms = 15 秒，
+ *   在 esp_event 事件循环里同步等，会连带堵死重连与下行命令处理。
+ *   所以拉起一个一次性任务去做，事件处理函数立刻返回。
+ */
+static void time_sync(void);           /* 定义在下方「SNTP 对时」一节 */
+
+static volatile bool s_ntp_resynced = false;
+
+static void ntp_resync_task(void *arg)
+{
+    (void)arg;
+    s_ntp_resynced = true;             /* 先置位：任务已拉起，别再来第二个 */
+    time_t now = 0;
+    time(&now);
+    if (now < 1700000000) {            /* 已经有效就什么都不做，省掉 15 秒空等 */
+        ESP_LOGI(TAG, "WiFi 晚于开机连上，补做一次 NTP 对时");
+        time_sync();
+        /* 这次没对成（NTP 不通/丢包）就放开标志：下次重连再试，不把板端时间永久钉死 */
+        now = 0;
+        time(&now);
+        if (now < 1700000000) {
+            s_ntp_resynced = false;
+            ESP_LOGW(TAG, "补做对时仍未成功，下次重连会再试");
+        }
+    }
+    /* ★ FreeRTOS 的任务函数返回 = 致命错误（`Task "ntp" should not return, Aborting now!`
+     *   → abort() → rst:0xc）。2026-11-27 第一版写了 `return;`，真机 90 秒重启 10 次、
+     *   一个 JSON 帧都没发出来。任务必须以 vTaskDelete(NULL) 自我删除，不能 return。 */
+    vTaskDelete(NULL);
+}
+
+/* 只在需要时拉起补做任务；重复调用是安全的（一次性标志） */
+static void ntp_resync_maybe(void)
+{
+    if (s_ntp_resynced) return;
+    s_ntp_resynced = true;             /* 抢占式置位，避免两次 GOT_IP 各拉一个任务 */
+    if (xTaskCreate(ntp_resync_task, "ntp", 4096, NULL, 3, NULL) != pdPASS) {
+        s_ntp_resynced = false;        /* 没拉起来就放开，下次重连再试 */
+        ESP_LOGW(TAG, "NTP 补做任务创建失败，板端时间可能一直无效");
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -328,6 +379,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_reconnect_delay_ms = 0;                 /* 连上就复位退避 */
         s_last_disc_log_us = 0;
         if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
+        ntp_resync_maybe();                       /* 开机没对成时，这里补做（不阻塞事件循环） */
     }
 }
 

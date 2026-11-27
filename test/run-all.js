@@ -73,6 +73,8 @@ const SUITES = [
   { name: 'fw-wifi-skip', file: 'firmware-wifi-skip-test.js', kind: 'unit' },
   { name: 'fw-upload-q',  file: 'firmware-upload-queue-test.js', kind: 'unit' },
   { name: 'fw-keepalive', file: 'firmware-keepalive-test.js', kind: 'unit' },
+  { name: 'fw-ntp',       file: 'firmware-ntp-resync-test.js', kind: 'unit' },
+  { name: 'board-time',  file: 'board-time-test.js', kind: 'integration' },
   { name: 'voice-hero',   file: 'voice-hero-contract-test.js', kind: 'unit' },
   { name: 'voice-asr',    file: 'voice-asr-test.js',    kind: 'integration' },
   { name: 'voice-asr-fb', file: 'voice-asr-fallback-test.js', kind: 'integration' },
