@@ -17,6 +17,19 @@
   "storageMaxMb": 32,
   "stalePolicy": "keep",
   "expectedDeviceId": "S3EYE-GROUP01",
+  "visionEnabled": false,
+  "visionModel": "glm-4v-flash",
+  "visionLowScore": 0.4,
+  "visionTimeoutMs": 8000,
+  "visionKeep": 50,
+  "visionThresholds": {
+    "darkLuma": 8,
+    "brightLuma": 247,
+    "maxGrayLevels": 3,
+    "minEntropy": 2.0,
+    "blurLaplacian": 3.0,
+    "softLaplacian": 15.0
+  },
   "fieldUnits": {
     "temp_c": "°C",
     "temperature": "°C",

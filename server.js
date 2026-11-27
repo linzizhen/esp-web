@@ -23,6 +23,9 @@ const { createVoskAsr } = require('./lib/voice-vosk-asr.js');
 /* 第 7 周：按需采集的采集记录与状态机。放在 lib/ 里是因为它只有状态与字节，
  * 不碰 HTTP 也不碰串口，能单独做单元测试（见 test/snapshot-store-test.js）。 */
 const { createSnapshotStore, assessFrame } = require('./lib/snapshot-store.js');
+/* 第 8 周：视觉推理核心逻辑（保底本地判定 + 模型场景分类 + 三对应记录）。
+ * 纯逻辑、可注入 measure/client，单测见 test/vision-infer-test.js。 */
+const { createVisionInfer } = require('./lib/vision-infer.js');
 /* 本机离线识别有两条实现，都不联网、不上传，录音不出这台电脑：
  *   1) Vosk small-cn（首选）：Kaldi 系 DNN 模型，对远场/带噪的板载录音明显更稳
  *      实测同一段录音 Vosk 听出「喂喂喂听得到吗…」，Windows 自带只能扒出碎片。
@@ -1933,6 +1936,85 @@ function reloadNlConfig() {
   NL.replyMode = (process.env.NL_REPLY_MODE || f.nlReplyMode) === 'template' ? 'template' : 'llm';
 }
 reloadNlConfig();
+
+/* ------------------------------------------------------------------ */
+/* 视觉推理（第 8 周）：保底本地指标 + 拓展 glm-4v-flash 场景分类        */
+/*                                                                     */
+/* 设计见 docs/week8-vision-design.md。核心取舍：                       */
+/*   · 画面可用性 / 遮挡由本地可解释指标判，不交给模型（实测模型对纯黑  */
+/*     图会幻觉成「穿黑衣服的人」且 score 恒为 1）；                     */
+/*   · 模型只做场景粗分类，score 一律「未校准」；                         */
+/*   · 云端默认关闭（visionEnabled=false），关闭时绝不调用模型、不上传。 */
+/* ------------------------------------------------------------------ */
+const VISION_DIR = path.join(DATA_DIR, 'vision');
+const _vLocal = readNlFileCfg();
+const _vEnabledRaw = process.env.VISION_ENABLED != null
+  ? process.env.VISION_ENABLED
+  : (_vLocal.visionEnabled != null ? _vLocal.visionEnabled : config.visionEnabled);
+const VISION_ENABLED = _vEnabledRaw === true || ['1', 'true', 'on', 'yes'].includes(String(_vEnabledRaw).toLowerCase());
+const VISION_MODEL = process.env.VISION_MODEL || _vLocal.visionModel || config.visionModel || 'glm-4v-flash';
+const VISION_LOW_SCORE = Number(process.env.VISION_LOW_SCORE || _vLocal.visionLowScore || config.visionLowScore || 0.4);
+const VISION_TIMEOUT_MS = Number(process.env.VISION_TIMEOUT_MS || config.visionTimeoutMs || 8000);
+const VISION_KEEP = Math.max(1, Number(process.env.VISION_KEEP || config.visionKeep) || 50);
+const VISION_THRESHOLDS = Object.assign({}, config.visionThresholds || {}, _vLocal.visionThresholds || {});
+const VISION_ENDPOINT = process.env.VISION_ENDPOINT || _vLocal.visionEndpoint || NL.endpoint || null;
+const VISION_API_KEY = process.env.VISION_API_KEY || _vLocal.visionApiKey || NL.apiKey || null;
+const VISION_PY = process.env.VISION_PY || process.env.ASR_VOSK_PYTHON ||
+  path.join(ROOT, '..', '.asr-venv', 'Scripts', 'python.exe');
+
+/** 调本地 python 算可解释指标；失败返回 null（上层按 unknown 处理，绝不编造） */
+function visionMeasure(imagePath) {
+  return new Promise((resolve) => {
+    if (!imagePath || !fs.existsSync(imagePath)) return resolve(null);
+    const script = path.join(ROOT, 'scripts', 'vision', 'image-metrics.py');
+    const { execFile } = require('node:child_process');
+    execFile(VISION_PY, [script, imagePath], { timeout: 15000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return resolve(null);
+      try { const arr = JSON.parse(String(stdout)); resolve(arr && arr[0] ? arr[0] : null); }
+      catch (_) { resolve(null); }
+    });
+  });
+}
+
+/** 调真实视觉模型（OpenAI 兼容），返回 {status, text}；text 为模型正文 */
+async function visionModelClient({ model, imageB64 }) {
+  if (!VISION_ENDPOINT || !VISION_API_KEY) return { status: 0, text: '', error: 'not_configured' };
+  if (!imageB64) return { status: 0, text: '', error: 'no_image' };
+  const base = String(VISION_ENDPOINT).replace(/\/+$/, '').replace(/\/chat\/completions$/, '');
+  const body = {
+    model: model || VISION_MODEL,
+    temperature: 0.1,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + imageB64 } },
+        { type: 'text', text: '只输出 JSON：{"label":"一句话描述看到什么","scene":"室内/桌面/户外/无法判断","score":0到1之间你对可用性的把握}。不要输出 JSON 之外的任何文字。' },
+      ],
+    }],
+  };
+  const r = await fetch(base + '/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + VISION_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const raw = await r.text();
+  if (r.status !== 200) return { status: r.status, text: raw };
+  let content = raw;
+  try { content = JSON.parse(raw).choices[0].message.content; } catch (_) { /* 保持原文 */ }
+  return { status: 200, text: content };
+}
+
+const vision = createVisionInfer({
+  recordsFile: path.join(VISION_DIR, 'records.ndjson'),
+  keep: VISION_KEEP,
+  enabled: VISION_ENABLED,
+  lowScore: VISION_LOW_SCORE,
+  timeoutMs: VISION_TIMEOUT_MS,
+  modelVersion: VISION_MODEL,
+  thresholds: VISION_THRESHOLDS,
+  measureMetrics: visionMeasure,
+  modelClient: visionModelClient,
+});
 
 /* 密钥脱敏：只回前 3 + 后 4 位，任何接口不得返回完整 key */
 function maskKey(k) {
@@ -4196,6 +4278,46 @@ async function handleRequest(req, res) {
       inflight: snapshots.inFlight(),
       shots: snapshots.list(),
     });
+  }
+
+  /* ---- 第 8 周：视觉推理接口 ---- */
+  if (p === '/api/vision/config' && req.method === 'GET') {
+    return json(res, 200, Object.assign({ ok: true }, vision.config()));
+  }
+  if (p === '/api/vision/records' && req.method === 'GET') {
+    return json(res, 200, { ok: true, records: vision.list() });
+  }
+  if (p === '/api/vision/record' && req.method === 'GET') {
+    const id = (url.searchParams.get('inference_id') || '').trim();
+    const rec = vision.get(id);
+    if (!rec) return json(res, 404, { ok: false, error: 'inference_not_found' });
+    return json(res, 200, { ok: true, record: rec });
+  }
+  if (p === '/api/vision/infer' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const shotId = String(body.shot_id || '').trim();
+    if (!shotId) return json(res, 400, { ok: false, error: 'shot_id_required' });
+    const shot = snapshots.get(shotId);
+    if (!shot) return json(res, 404, { ok: false, error: 'shot_not_found' });
+    if (shot.state !== 'captured') {
+      return json(res, 409, { ok: false, error: 'shot_not_captured', shot_id: shotId, state: shot.state, reason: shot.reason || null });
+    }
+    const file = snapshots.fileFor(shotId);
+    if (!file || !fs.existsSync(file)) return json(res, 404, { ok: false, error: 'shot_file_missing' });
+    const imageB64 = fs.readFileSync(file).toString('base64');
+    const trig = ['ui', 'voice', 'help', 'replay'].includes(body.trigger) ? body.trigger : 'ui';
+    const rec = await vision.infer({ shotId, trigger: trig, imagePath: file, imageB64 });
+    // 只有真正的模型/解析错误才算接口失败；cloud_disabled / blocked / low_score 都是如实结果
+    const hardFail = rec.outcome === 'model_unavailable' || rec.outcome === 'parse_failed';
+    return json(res, hardFail ? 502 : 200, { ok: !hardFail, record: rec });
+  }
+  if (p === '/api/vision/correct' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const id = String(body.inference_id || '').trim();
+    if (!id) return json(res, 400, { ok: false, error: 'inference_id_required' });
+    const r = vision.correct(id, { human_label: body.human_label, human_scene: body.human_scene, note: body.note });
+    if (!r.ok) return json(res, r.error === 'not_found' ? 404 : 400, r);
+    return json(res, 200, r);
   }
 
   if (p === '/api/cam' && req.method === 'POST') {

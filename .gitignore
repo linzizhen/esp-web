@@ -27,6 +27,8 @@ data/.asr-tmp/
 # 绝不入库。上面 data/*.ndjson 只覆盖 data 根目录，管不到子目录（2026-11-19 漏过
 # 一次：两个 jpg 与 events.ndjson 出现在 git status 里，差点被 git add -A 带走）。
 data/snapshots/
+# 第 8 周视觉推理：推理记录会引用环境图像，同属用户资产，绝不入库。
+data/vision/
 
 # ---- 临时/调试文件 ----
 *.log
