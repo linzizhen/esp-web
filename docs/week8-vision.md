@@ -61,9 +61,11 @@
 
 - `config.visionEnabled` 默认 **false**；为 false 时 `/api/vision/infer` 返回 `cloud_disabled`，**一个字节都不发往云端**（单测断言「模型调用次数=0」）。
 - 开启方式（用户批准「允许上传、默认关闭、需要时开启」）：
-  - `config.local.json` 加 `"visionEnabled": true`（或 `"visionApiKey"/"visionEndpoint"` 覆盖），或
-  - 环境变量 `VISION_ENABLED=1`。
-- 开启后抓拍帧会发往智谱；`data/vision/` 已加入 `.gitignore`（推理记录引用环境图像，属用户资产）。
+  - `config.local.json` 加 `"visionEnabled": true` **并显式配置视觉端点与密钥** `"visionEndpoint"` / `"visionApiKey"`（视觉端点**不回落** NL 文本端点，避免把画面发到非预期厂商），或
+  - 环境变量 `VISION_ENABLED=1` + `VISION_ENDPOINT` + `VISION_API_KEY`。
+  - `/api/vision/config` 会回显 `endpoint_configured` 与 `endpoint_host`，未配置时如实为 false。
+- 开启后抓拍帧会发往该视觉端点；`data/vision/` 已加入 `.gitignore`（推理记录引用环境图像，属用户资产）。
+- 若本机缺少 Pillow / 指标脚本失败：记为 `metrics_unavailable`，**不调用模型、不上传**（保底层失效时不静默把画面交出去）。
 
 ## 六、接口
 
@@ -87,8 +89,8 @@
 
 ## 八、测试与文件
 
-- 新增测试：`test/vision-infer-test.js`（46）、`test/vision-api-test.js`（28，隔离实例）、`test/vision-ui-contract-test.js`（28）。
-- 全套：**43 个测试文件 / 1284 项断言全通过**。
+- 新增测试：`test/vision-infer-test.js`（50）、`test/vision-api-test.js`（30，隔离实例）、`test/vision-ui-contract-test.js`（29）。
+- 全套：**43 个测试文件 / 1291 项断言全通过**。
 - 新增/改动文件：`lib/vision-infer.js`、`server.js`（5 个 `/api/vision/*` 路由 + 指标适配 + 模型客户端）、`public/{app.js,index.html,style.css}`（识别卡）、`config.json`（vision 配置，默认关闭）、`.gitignore`（`data/vision/`）、`scripts/vision/image-metrics.py`（既有）、`test/manual/vision-live-check.js`。
 
 ## 九、未覆盖与残余风险（不掩盖）

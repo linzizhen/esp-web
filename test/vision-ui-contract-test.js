@@ -13,6 +13,7 @@ const path = require('node:path');
 const ROOT = path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
 const app = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
+const css = fs.readFileSync(path.join(ROOT, 'public', 'style.css'), 'utf8');
 
 let pass = 0, fail = 0;
 const ok = (c, m, extra = '') => {
@@ -37,6 +38,7 @@ console.log('\n— ③ 越界防护（当堂验证②）：不得出现坐标 / 
 ok(!/latitude|longitude/i.test(app) && !/latitude|longitude/i.test(html), '前端无 latitude/longitude 字段');
 ok(!/"lat"\s*:/.test(app) && !/"lng"\s*:/.test(app), '前端不构造 lat/lng');
 ok(/glm-4v-flash/.test(html), '页面写明真实模型名 glm-4v-flash');
+ok(/\.vis-input/.test(css), 'style.css 定义了 .vis-input（纠正输入框有真实样式）');
 
 console.log('\n— ④ 接口接线与分支 —');
 ok(/\/api\/vision\/infer/.test(app), '前端调用 /api/vision/infer');

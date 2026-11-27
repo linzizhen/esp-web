@@ -1957,8 +1957,16 @@ const VISION_LOW_SCORE = Number(process.env.VISION_LOW_SCORE || _vLocal.visionLo
 const VISION_TIMEOUT_MS = Number(process.env.VISION_TIMEOUT_MS || config.visionTimeoutMs || 8000);
 const VISION_KEEP = Math.max(1, Number(process.env.VISION_KEEP || config.visionKeep) || 50);
 const VISION_THRESHOLDS = Object.assign({}, config.visionThresholds || {}, _vLocal.visionThresholds || {});
-const VISION_ENDPOINT = process.env.VISION_ENDPOINT || _vLocal.visionEndpoint || NL.endpoint || null;
-const VISION_API_KEY = process.env.VISION_API_KEY || _vLocal.visionApiKey || NL.apiKey || null;
+/* 视觉端点 / 密钥独立，**不回落到 NL 的文本端点**：
+ * 只设 visionEnabled 却把画面发到 NL 的文本模型端点，既属「传给非预期厂商」的
+ * 隐私歧义，也必然 model_unavailable。要启用必须显式配 visionEndpoint/visionApiKey
+ * （环境变量 VISION_ENDPOINT / VISION_API_KEY 亦可）。 */
+const VISION_ENDPOINT = process.env.VISION_ENDPOINT || _vLocal.visionEndpoint || null;
+const VISION_API_KEY = process.env.VISION_API_KEY || _vLocal.visionApiKey || null;
+function visionEndpointHost() {
+  if (!VISION_ENDPOINT) return null;
+  try { return new URL(VISION_ENDPOINT).host; } catch (_) { return 'custom'; }
+}
 const VISION_PY = process.env.VISION_PY || process.env.ASR_VOSK_PYTHON ||
   path.join(ROOT, '..', '.asr-venv', 'Scripts', 'python.exe');
 
@@ -4282,7 +4290,11 @@ async function handleRequest(req, res) {
 
   /* ---- 第 8 周：视觉推理接口 ---- */
   if (p === '/api/vision/config' && req.method === 'GET') {
-    return json(res, 200, Object.assign({ ok: true }, vision.config()));
+    return json(res, 200, Object.assign({
+      ok: true,
+      endpoint_configured: !!(VISION_ENDPOINT && VISION_API_KEY),
+      endpoint_host: visionEndpointHost(),
+    }, vision.config()));
   }
   if (p === '/api/vision/records' && req.method === 'GET') {
     return json(res, 200, { ok: true, records: vision.list() });

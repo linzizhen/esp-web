@@ -99,6 +99,10 @@ function goodJpeg(n = 5000) {
   b[n - 2] = 0xFF; b[n - 1] = 0xD9;
   return b;
 }
+/* 真实可解码的噪声 JPEG（64x64，熵 7.86、拉普拉斯方差大、Pillow 能打开），
+ * 用于让服务端本地指标正常算出 usable —— 随机字节 Pillow 解不开，会走
+ * metrics_unavailable 分支，测不到 cloud_disabled。夹具无隐私内容。 */
+const NOISE_JPEG = fs.readFileSync(path.join(__dirname, '.fixture-noise.jpg'));
 let injectSeq = 5000;
 async function injectFrame(port, buf) {
   injectSeq++;
@@ -134,6 +138,7 @@ async function injectFrame(port, buf) {
     const cfg = await httpReq(port, 'GET', '/api/vision/config');
     ok(cfg.status === 200 && cfg.json && cfg.json.enabled === false, 'visionEnabled=false（默认关闭）', String(cfg.json && cfg.json.enabled));
     ok(cfg.json && cfg.json.model === 'glm-4v-flash', '模型名 glm-4v-flash', cfg.json && cfg.json.model);
+    ok(cfg.json && cfg.json.endpoint_configured === false, '未配置视觉端点时如实回报 endpoint_configured=false（不回落 NL）', String(cfg.json && cfg.json.endpoint_configured));
 
     const rec0 = await httpReq(port, 'GET', '/api/vision/records');
     ok(rec0.status === 200 && Array.isArray(rec0.json.records) && rec0.json.records.length === 0, '初始无推理记录');
@@ -147,7 +152,7 @@ async function injectFrame(port, buf) {
     console.log('\n— ③ 采集一张真实记录，再对它推理（cloud_disabled） —');
     const b = await httpReq(port, 'POST', '/api/cam', { action: 'shot', trigger: 'ui' });
     ok(b.status === 200, '抓拍命令被接受');
-    await injectFrame(port, goodJpeg());
+    await injectFrame(port, NOISE_JPEG);
     await sleep(400);
     const c = await httpReq(port, 'GET', '/api/cam');
     const shot = (c.json && c.json.shot) || {};
@@ -181,6 +186,11 @@ async function injectFrame(port, buf) {
     ok(list.status === 200 && list.json.records.length >= 1, '记录列表可读', String(list.json.records.length));
     const nfile = path.join(DATA_DIR, 'vision', 'records.ndjson');
     ok(fs.existsSync(nfile) && fs.statSync(nfile).size > 0, '推理记录落盘 DATA_DIR/vision/records.ndjson');
+    console.log('\n— ⑥ 未 captured 的 shot → 409 —');
+    const b3 = await httpReq(port, 'POST', '/api/cam', { action: 'shot', trigger: 'ui' });
+    const sid3 = (b3.json && b3.json.shot && b3.json.shot.shot_id) || '';
+    const pre = await httpReq(port, 'POST', '/api/vision/infer', { shot_id: sid3 });
+    ok(pre.status === 409 && pre.json.error === 'shot_not_captured', '未 captured 的 shot 推理 → 409', String(pre.status));
   } finally {
     cleanup();
     await sleep(100);

@@ -192,6 +192,22 @@ function mkInfer(over = {}) {
     ok(!('正确率' in obj) && !('accuracy' in obj), '记录里没有「正确率 / accuracy」字段');
   }
 
+  console.log('\n— ⑩ 指标不可用 / 分数缺失 / metrics 不含本机路径 —');
+  {
+    const mu = mkInfer({ measureMetrics: async () => null });
+    const r1 = await mu.vi.infer({ shotId: 'shot-20261127-101100-000-0011', trigger: 'ui', imagePath: 'x.jpg', imageB64: 'A' });
+    ok(r1.outcome === 'metrics_unavailable', '本地指标不可用 → metrics_unavailable', r1.outcome);
+    ok(mu.calls.model === 0, '★ 指标不可用时也不调用模型（不把画面交出去）', String(mu.calls.model));
+
+    const ns = mkInfer({ modelClient: async () => ({ status: 200, text: '{"label":"有东西","scene":"桌面"}' }) });
+    const r2 = await ns.vi.infer({ shotId: 'shot-20261127-101101-000-0012', trigger: 'ui', imagePath: 'x.jpg', imageB64: 'A' });
+    ok(r2.outcome === 'unknown', '有标签但缺分数 → unknown（不夸大为 ok）', r2.outcome);
+
+    const leak = mkInfer({ measureMetrics: async () => Object.assign({ path: 'C:\\secret\\x.jpg' }, M.sharp) });
+    const r3 = await leak.vi.infer({ shotId: 'shot-20261127-101102-000-0013', trigger: 'ui', imagePath: 'x.jpg', imageB64: 'A' });
+    ok(r3.metrics && r3.metrics.path === undefined, '★ 记录不保存本机绝对路径', JSON.stringify(r3.metrics));
+  }
+
   fs.rmSync(TMP, { recursive: true, force: true });
   console.log(`\n结果：${pass} 项通过，${fail} 项失败`);
   process.exit(fail ? 1 : 0);
