@@ -39,6 +39,14 @@ ok(!/latitude|longitude/i.test(app) && !/latitude|longitude/i.test(html), '前�
 ok(!/"lat"\s*:/.test(app) && !/"lng"\s*:/.test(app), '前端不构造 lat/lng');
 ok(/glm-4v-flash/.test(html), '页面写明真实模型名 glm-4v-flash');
 ok(/\.vis-input/.test(css), 'style.css 定义了 .vis-input（纠正输入框有真实样式）');
+ok(/vis-rec-list/.test(html), '记录用专用两行列表 .vis-rec-list');
+{
+  const i = app.indexOf('function renderVisionList');
+  const body = i >= 0 ? app.slice(i, i + 1400) : '';
+  ok(body && !/shot-st|shot-when/.test(body), '★ 视觉记录不再复用 .shot-st/.shot-when（避免长文案与 shot_id 重叠）');
+  ok(/vis-rec-main/.test(body) && /vis-rec-sub/.test(body), '记录分行：主状态 vis-rec-main + 次信息 vis-rec-sub');
+}
+ok(/\.vis-rec-sub/.test(css) && /\.vis-grid/.test(css), 'style.css 定义了 vis-grid / vis-rec-sub（层级与两行布局）');
 
 console.log('\n— ④ 接口接线与分支 —');
 ok(/\/api\/vision\/infer/.test(app), '前端调用 /api/vision/infer');

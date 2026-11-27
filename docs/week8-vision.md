@@ -81,7 +81,7 @@
 
 ## 七、怎么验证
 
-1. 刷新页面 `http://127.0.0.1:8080/#cam`（`app.js?v=51`），先点「抓拍一帧」拿到一张 captured。
+1. 刷新页面 `http://127.0.0.1:8080/#cam`（`app.js?v=52` / `style.css?v=18`），先点「抓拍一帧」拿到一张 captured。
 2. 点「对这张图做识别」：默认（云端关闭）显示「云端模型未启用，仅显示本地可用性判定」+ 可用性 + 未校准提示。
 3. 若要验真实模型：在 `config.local.json` 设 `visionEnabled:true` 后重启服务端，再点识别，会看到场景与模型标签（分数标「模型自报 · 未校准」）。
 4. 人工纠正：在输入框填「这张图其实是什么」→「提交纠正」，记录里并列显示人工与模型结果。
@@ -89,8 +89,8 @@
 
 ## 八、测试与文件
 
-- 新增测试：`test/vision-infer-test.js`（50）、`test/vision-api-test.js`（30，隔离实例）、`test/vision-ui-contract-test.js`（29）。
-- 全套：**43 个测试文件 / 1291 项断言全通过**。
+- 新增测试：`test/vision-infer-test.js`（50）、`test/vision-api-test.js`（30，隔离实例）、`test/vision-ui-contract-test.js`（33）。
+- 全套：**43 个测试文件 / 1295 项断言全通过**。
 - 新增/改动文件：`lib/vision-infer.js`、`server.js`（5 个 `/api/vision/*` 路由 + 指标适配 + 模型客户端）、`public/{app.js,index.html,style.css}`（识别卡）、`config.json`（vision 配置，默认关闭）、`.gitignore`（`data/vision/`）、`scripts/vision/image-metrics.py`（既有）、`test/manual/vision-live-check.js`。
 
 ## 九、未覆盖与残余风险（不掩盖）

@@ -58,7 +58,7 @@ const els = {
   visTag: $('visTag'), visState: $('visState'), visUsability: $('visUsability'),
   visScene: $('visScene'), visLabel: $('visLabel'), visScore: $('visScore'), visPriv: $('visPriv'),
   visHumanLabel: $('visHumanLabel'), btnVisionInfer: $('btnVisionInfer'),
-  btnVisionRecapture: $('btnVisionRecapture'), btnVisionCorrect: $('btnVisionCorrect'), visList: $('visList'),
+  btnVisionRecapture: $('btnVisionRecapture'), btnVisionCorrect: $('btnVisionCorrect'), visList: $('visList'), visCount: $('visCount'),
   helpChannel: $('helpChannel'), helpId: $('helpId'), helpSteps: $('helpSteps'),
   helpNote: $('helpNote'), helpEvidence: $('helpEvidence'),
   helpHistory: $('helpHistory'), helpHistoryCount: $('helpHistoryCount'),
@@ -1601,15 +1601,21 @@ function renderVisionRecord(rec) {
 function renderVisionList() {
   if (!els.visList) return;
   const list = VIS.records || [];
-  if (!list.length) { els.visList.innerHTML = '<li class="shot-row shot-row-empty">还没有识别记录</li>'; return; }
-  els.visList.innerHTML = list.slice().reverse().slice(0, 10).map((r) => {
+  if (els.visCount) els.visCount.textContent = list.length ? `${list.length} 条` : '';
+  if (!list.length) { els.visList.innerHTML = '<li class="vis-rec vis-rec-empty">还没有识别记录</li>'; return; }
+  els.visList.innerHTML = list.slice().reverse().slice(0, 12).map((r) => {
     const when = fmtTime(r.requested_at);
     const o = VIS_OUTCOME_TEXT[r.outcome] || r.outcome;
-    const lab = r.model_label ? ' · ' + escHtml(r.model_label) : '';
-    const hum = r.human_label && r.human_label.label ? ' · 人工：' + escHtml(r.human_label.label) : '';
     const cls = r.outcome === 'ok' ? 'is-ok'
       : (r.outcome === 'blocked' || r.outcome === 'model_unavailable' || r.outcome === 'parse_failed') ? 'is-bad' : 'is-busy';
-    return `<li class="shot-row ${cls}"><span class="shot-when">${escHtml(when)}</span><span class="shot-st">${escHtml(o)}</span><span class="shot-meta">${escHtml(r.shot_id || '')}${lab}${hum}</span></li>`;
+    const parts = [
+      `<span class="vis-rec-time">${escHtml(when)}</span>`,
+      `<span class="vis-rec-id">${escHtml(r.shot_id || '')}</span>`,
+    ];
+    if (r.scene && r.scene !== '无法判断') parts.push('场景：' + escHtml(r.scene));
+    if (r.model_label) parts.push('模型：' + escHtml(r.model_label));
+    if (r.human_label && r.human_label.label) parts.push('人工：' + escHtml(r.human_label.label));
+    return `<li class="vis-rec ${cls}"><div class="vis-rec-main">${escHtml(o)}</div><div class="vis-rec-sub">${parts.join(' · ')}</div></li>`;
   }).join('');
 }
 
