@@ -122,9 +122,11 @@ imu-monitor/                    # ← 本项目即一个自包含文件夹，所
 │   ├── audit-unused.js                         # 代码审计：未使用的函数 / 空 catch / 注释掉的死代码（只读）
 │   ├── audit-api.js                            # 代码审计：前后端接口交叉核对，找潜在 404（只读）
 │   ├── audit-dup.js                            # 代码审计：重复函数体 / ≥85% 相似函数（只读）
-│   └── asr/                                    # 识别引擎脚本（由 lib/ 的适配层调用）
-│       ├── asr-local.ps1                       # System.Speech 封装（★ 必须存成带 BOM 的 UTF-8）
-│       └── asr-vosk.py                         # Vosk / Kaldi 封装（输出 UTF-8 JSON，控制台乱码不影响结果）
+│   ├── asr/                                    # 识别引擎脚本（由 lib/ 的适配层调用）
+│   │   ├── asr-local.ps1                       # System.Speech 封装（★ 必须存成带 BOM 的 UTF-8）
+│   │   └── asr-vosk.py                         # Vosk / Kaldi 封装（输出 UTF-8 JSON，控制台乱码不影响结果）
+│   └── vision/                                 # 视觉指标 / 推理脚本（由 lib/ 的适配层调用）
+│       └── image-metrics.py                    # 本地可解释画面指标：拉普拉斯方差 / 亮度 / 对比度 / 字节熵
 ├── docs/                                       # 周次文档、评审记录与素材
 │   ├── vps-deploy.md                           # VPS 部署手册（Windows Server，含编译环境坑与排查表）
 │   ├── week1-sensing-web.md                    # 第 1 周：真实传感数据的采集、上送与验证（三方分工、单位与时间核对）

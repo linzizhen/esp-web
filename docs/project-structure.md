@@ -12,6 +12,7 @@
 | `public/` | 浏览器三件套：`index.html` / `style.css` / `app.js` | 构建产物、图片素材 |
 | `scripts/` | 运维与构建脚本（部署、烧录、WiFi、代码审计） | 产品运行时代码 |
 | `scripts/asr/` | 识别引擎脚本（PowerShell / Python），由 `lib/` 的适配层调用 | Node 代码 |
+| `scripts/vision/` | 视觉指标 / 推理脚本（Python），由 `lib/` 的适配层调用 | Node 代码 |
 | `test/` | 由 `test/run-all.js` 编排的自动化测试 | 需要真机 / 需要人工判断的脚本 |
 | `test/manual/` | 需真机或手工执行的取证、探针、验收脚本 | 断言不稳定的东西（不稳定就别进自动化） |
 | `docs/` | 周次文档、评审记录、取证报告（`.md` / `.txt`） | 图片与原型 HTML |
@@ -65,8 +66,12 @@
 **2026-11-19 分层整理**（21 个文件移动，全套 999 项测试通过）：
 
 - 根目录 3 个业务模块 → `lib/`（`voice-serial-rx.js` / `voice-local-asr.js` / `voice-vosk-asr.js`）。
-- 识别引擎脚本 → `scripts/asr/`（`asr-local.ps1` / `asr-vosk.py`）。
+- 识别引擎脚本 → `scripts/asr/`（`asr-local.ps1` / `asr-vosk.py`）；视觉指标脚本 → `scripts/vision/`（`image-metrics.py`）。
 - 12 个真机 / 手工脚本 → `test/manual/`，`run-all.js` 只保留 36 个自动化测试。
 - 2 张截图 + 2 个 UI 原型 → `docs/assets/`。
 - 清理：7 个 `test/.test-data*` 残留目录、2 个手工日志、243 KB 的 `flash_week3.log`（整理版证据在 `week3-flash-evidence.txt`）。
 - 未动：`data/`（636 MB 运行时数据）、`recordings/`（188 个 CSV）、根配置（`config*.json` / `package.json` / `start.bat`）。
+
+**2026-11-27 新增 `scripts/vision/`**（第 8 周前置）
+
+- 新增 `image-metrics.py`：本地可解释画面指标（拉普拉斯方差 / 亮度 / 对比度 / 字节熵），供 `lib/` 视觉适配层调用；不进编排器（需 Python + Pillow）。
